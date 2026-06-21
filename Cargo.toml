@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["ress", "ress-core"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Mateusz Wykurz <wykurz@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/wykurz/ress"
+edition = "2024"
+
+[workspace.dependencies]
+ress-core = { path = "ress-core" }
+anyhow = "1.0"
+bytes = "1.8"
+async-trait = "0.1"
+tokio = "1.41"
+tracing = "0.1"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[workspace.lints.rustdoc]
+all = { level = "deny", priority = -1 }
+missing_crate_level_docs = "allow"
+
+[profile.release]
+codegen-units = 8
+lto = "thin"
