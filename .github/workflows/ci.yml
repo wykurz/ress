@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# least-privilege token: jobs only check out and build/test the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+      with:
+        components: rustfmt, clippy
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    - name: Docs
+      run: cargo doc --no-deps --workspace
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
+      with:
+        tool: cargo-nextest
+    - name: Test (debug)
+      run: cargo nextest run --workspace
+    - name: Doctests (debug)
+      run: cargo test --doc --workspace
+
+  test-release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
+      with:
+        tool: cargo-nextest
+    - name: Test (release)
+      run: cargo nextest run --workspace --release
+    - name: Doctests (release)
+      run: cargo test --doc --workspace --release
