@@ -58,3 +58,22 @@ jobs:
       run: cargo nextest run --workspace --release
     - name: Doctests (release)
       run: cargo test --doc --workspace --release
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+    # The cargo jobs above never touch Nix, so a flake.lock bump (Dependabot opens
+    # grouped nix PRs) could break `nix build` or the dev shell while CI stays
+    # green. Determinate Nix's `nix flake check` only *evaluates* outputs (it skips
+    # the builds), so it covers cross-platform eval here -- including the
+    # darwin/aarch64 outputs this linux runner can't build -- while the explicit
+    # build + dev-shell steps catch build-level breakage on this system.
+    - name: Flake check (evaluate all systems)
+      run: nix flake check --all-systems -L
+    - name: Build the package
+      run: nix build -L .#default
+    - name: Build the dev shell
+      run: nix develop -L --command true

@@ -3,8 +3,27 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    # Bundle every cargo update into a single grouped PR instead of one per crate.
+    groups:
+      all-cargo:
+        patterns:
+          - "*"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    groups:
+      all-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      all-nix:
+        patterns:
+          - "*"
