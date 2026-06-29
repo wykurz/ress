@@ -72,7 +72,10 @@ jobs:
     # darwin/aarch64 outputs this linux runner can't build -- while the explicit
     # build + dev-shell steps catch build-level breakage on this system.
     - name: Flake check (evaluate all systems)
-      run: nix flake check --all-systems -L
+      # --no-update-lock-file makes CI fail (rather than silently regenerate the
+      # lock in the writable checkout) if flake.nix and flake.lock drift apart,
+      # e.g. an input was edited without committing the updated flake.lock.
+      run: nix flake check --all-systems -L --no-update-lock-file
     - name: Build the package
       run: nix build -L .#default
     - name: Build the dev shell
