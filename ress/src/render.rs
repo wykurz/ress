@@ -1,10 +1,10 @@
-//! blits a `ViewportRender` into a ratatui buffer, one display row per line,
+//! Blits a `ViewportRender` into a ratatui buffer, one display row per line,
 //! clamped to the render area's width.
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ress_core::document::ViewportRender;
-/// draws each display row at successive lines of `area`, clamped to its width;
+/// Draws each display row at successive lines of `area`, clamped to its width;
 /// rows beyond `area.height` are dropped.
 pub fn render_viewport(view: &ViewportRender, area: Rect, buf: &mut Buffer) {
     for (i, line) in view.rows.iter().enumerate() {

@@ -1,20 +1,20 @@
-//! command-line interface and logging setup.
+//! Command-line interface and logging setup.
 use clap::Parser;
-/// a fast pager for huge files.
+/// A fast pager for huge files.
 #[derive(Parser, Debug)]
 #[command(name = "ress", version, about = "a fast pager for huge files")]
 pub struct Cli {
-    /// file to view.
+    /// File to view.
     pub file: std::path::PathBuf,
-    /// write debug logs to this file.
+    /// Write debug logs to this file.
     #[arg(long)]
     pub log_file: Option<std::path::PathBuf>,
-    /// increase verbosity (-v info, -vv debug, -vvv trace).
+    /// Increase verbosity (-v info, -vv debug, -vvv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 }
 
-/// maps the `-v` count to a tracing level filter string.
+/// Maps the `-v` count to a tracing level filter string.
 pub fn level_str(verbose: u8) -> &'static str {
     match verbose {
         0 => "warn",
@@ -23,7 +23,7 @@ pub fn level_str(verbose: u8) -> &'static str {
         _ => "trace",
     }
 }
-/// initializes file logging when `--log-file` is set. Returns a guard that must
+/// Initializes file logging when `--log-file` is set. Returns a guard that must
 /// be kept alive for the non-blocking writer to flush. The TUI owns the screen,
 /// so logs never go to stdout/stderr.
 pub fn init_logging(

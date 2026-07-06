@@ -11,10 +11,12 @@ bytes.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile = "3.13"
+proptest.workspace = true
 
 [lints]
 workspace = true

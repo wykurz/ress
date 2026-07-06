@@ -1,18 +1,18 @@
-//! the byte-reading seam: `BlockSource` abstracts the file behind the cache,
+//! The byte-reading seam: `BlockSource` abstracts the file behind the cache,
 //! so a future io_uring backend is a drop-in replacement for `PreadSource`.
 use bytes::Bytes;
-/// reads raw bytes from a fixed, seekable source.
+/// Reads raw bytes from a fixed, seekable source.
 #[async_trait::async_trait]
 pub trait BlockSource: Send + Sync {
-    /// total size of the source in bytes.
+    /// Total size of the source in bytes.
     fn size(&self) -> u64;
-    /// reads up to `len` bytes starting at `offset`; returns fewer bytes near
+    /// Reads up to `len` bytes starting at `offset`; returns fewer bytes near
     /// EOF and an empty buffer when `offset >= size`.
     async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<Bytes>;
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
-/// an in-memory `BlockSource` for tests: counts reads and can inject latency
+/// An in-memory `BlockSource` for tests: counts reads and can inject latency
 /// to simulate a slow network filesystem.
 pub struct MockSource {
     data: Bytes,
@@ -27,12 +27,12 @@ impl MockSource {
             latency: std::time::Duration::ZERO,
         }
     }
-    /// adds a fixed per-read delay (simulated network-FS latency).
+    /// Adds a fixed per-read delay (simulated network-FS latency).
     pub fn with_latency(mut self, latency: std::time::Duration) -> Self {
         self.latency = latency;
         self
     }
-    /// number of `read_block` calls so far.
+    /// Number of `read_block` calls so far.
     pub fn read_count(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
     }
@@ -55,7 +55,7 @@ impl BlockSource for MockSource {
 }
 
 use std::sync::Arc;
-/// a `BlockSource` backed by a real file using positioned reads (`pread`),
+/// A `BlockSource` backed by a real file using positioned reads (`pread`),
 /// so concurrent reads never contend a shared file offset. Blocking reads run
 /// on tokio's blocking pool; an io_uring backend can replace this later.
 pub struct PreadSource {

@@ -21,4 +21,5 @@ Prefer `just` over direct `cargo`:
 ## Architecture
 
 `ress-core` is the headless engine (no terminal deps), `ress` is the thin TUI
-binary. See `docs/` for the design and current plan.
+binary. The design spec and phase plans live under `.claude/superpowers/`
+(`specs/`, `plans/`) — gitignored session artifacts; save new specs/plans there.
