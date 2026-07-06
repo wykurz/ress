@@ -16,6 +16,8 @@ bytes = "1.8"
 async-trait = "0.1"
 tokio = "1.41"
 tracing = "0.1"
+unicode-width = "0.2"
+proptest = "1.6"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

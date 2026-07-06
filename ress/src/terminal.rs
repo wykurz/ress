@@ -1,9 +1,9 @@
-//! terminal setup/teardown. `Term` enters the alternate screen + raw mode on
+//! Terminal setup/teardown. `Term` enters the alternate screen + raw mode on
 //! construction and restores the terminal on drop, so a normal exit, an error,
 //! or a panic never leaves the user's shell wrecked.
 use ratatui::backend::CrosstermBackend;
 use std::io::Stdout;
-/// a ratatui terminal that restores cooked mode + the main screen on drop.
+/// A ratatui terminal that restores cooked mode + the main screen on drop.
 pub struct Term {
     inner: ratatui::Terminal<CrosstermBackend<Stdout>>,
 }
@@ -27,12 +27,13 @@ impl Term {
         crossterm::execute!(
             stdout,
             crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
             crossterm::cursor::Hide
         )?;
         let inner = ratatui::Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(inner)
     }
-    /// access the underlying ratatui terminal for drawing.
+    /// Access the underlying ratatui terminal for drawing.
     pub fn inner_mut(&mut self) -> &mut ratatui::Terminal<CrosstermBackend<Stdout>> {
         &mut self.inner
     }
@@ -42,16 +43,17 @@ impl Drop for Term {
         let _ = restore();
     }
 }
-/// undoes `Term::new` terminal changes; safe to call more than once.
+/// Undoes `Term::new` terminal changes; safe to call more than once.
 fn restore() -> std::io::Result<()> {
     crossterm::execute!(
         std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
     crossterm::terminal::disable_raw_mode()
 }
-/// chains a terminal-restoring hook before the previous panic hook so a panic
+/// Chains a terminal-restoring hook before the previous panic hook so a panic
 /// prints normally instead of into a raw-mode alternate screen.
 fn install_panic_hook() {
     let prev = std::panic::take_hook();

@@ -2,5 +2,5 @@
 /result
 .direnv/
 *.log
-# session artifacts (specs/plans) — not committed, mirrors rcp
-docs/superpowers/
+# claude working files incl. session specs/plans — not committed
+.claude/
