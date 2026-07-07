@@ -18,6 +18,7 @@ tokio = "1.41"
 tracing = "0.1"
 unicode-width = "0.2"
 proptest = "1.6"
+lru = "0.12"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

@@ -3,12 +3,23 @@ mod cli;
 mod render;
 mod terminal;
 use clap::Parser;
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     let _guard = cli::init_logging(cli.log_file.as_deref(), cli.verbose)?;
     let source = std::sync::Arc::new(ress_core::source::PreadSource::open(&cli.file)?);
-    let document = ress_core::document::Document::new(source, ress_core::Config::default());
+    let config = ress_core::Config {
+        cache_bytes: (cli.cache_mib as usize) << 20,
+        prefetch_depth: cli.prefetch_depth,
+        ..ress_core::Config::default()
+    };
+    let document = ress_core::document::Document::new(source, config);
     tracing::info!("opened {} ({} bytes)", cli.file.display(), document.size());
-    app::run(document).await
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(app::run(document));
+    // a wedged blocking read on a dead network mount must never hold the
+    // process hostage after quit; abandon outstanding background fills.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(200));
+    result
 }
