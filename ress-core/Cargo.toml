@@ -9,7 +9,8 @@ repository.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+lru.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
 tracing.workspace = true
 unicode-width.workspace = true
 

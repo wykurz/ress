@@ -12,6 +12,12 @@ pub struct Cli {
     /// Increase verbosity (-v info, -vv debug, -vvv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+    /// Cache size for file blocks, in MiB.
+    #[arg(long, default_value_t = 256)]
+    pub cache_mib: u32,
+    /// Blocks to prefetch ahead of the viewport (0 disables).
+    #[arg(long, default_value_t = 8)]
+    pub prefetch_depth: usize,
 }
 
 /// Maps the `-v` count to a tracing level filter string.
@@ -71,5 +77,18 @@ mod tests {
         assert_eq!(level_str(1), "info");
         assert_eq!(level_str(2), "debug");
         assert_eq!(level_str(9), "trace");
+    }
+    #[test]
+    fn parses_cache_and_prefetch_flags() {
+        let cli = Cli::try_parse_from(["ress", "--cache-mib", "64", "--prefetch-depth", "2", "f"])
+            .unwrap();
+        assert_eq!(cli.cache_mib, 64);
+        assert_eq!(cli.prefetch_depth, 2);
+    }
+    #[test]
+    fn cache_and_prefetch_have_defaults() {
+        let cli = Cli::try_parse_from(["ress", "f"]).unwrap();
+        assert_eq!(cli.cache_mib, 256);
+        assert_eq!(cli.prefetch_depth, 8);
     }
 }

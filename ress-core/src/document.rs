@@ -17,6 +17,14 @@ impl Anchor {
     pub fn offset(self) -> u64 {
         self.0
     }
+    /// Crate-internal constructor for tests that compute offsets directly
+    /// (the public invariant still holds: callers pass line starts). Only
+    /// tests need this today, hence `cfg(test)` rather than a permanent
+    /// `pub(crate)` surface with no production caller.
+    #[cfg(test)]
+    pub(crate) fn at(offset: u64) -> Anchor {
+        Anchor(offset)
+    }
 }
 /// Upper bound on the horizontal scroll offset in display columns. `HScroll`
 /// clamps to it on construction, so larger offsets are unrepresentable and the
@@ -56,18 +64,34 @@ pub struct ViewportRender {
 }
 /// A read-only view over a file's bytes.
 pub struct Document {
-    source: Arc<dyn BlockSource>,
+    cache: Arc<crate::cache::BlockCache>,
     size: u64,
     config: Config,
+    prefetcher: crate::prefetch::Prefetcher,
 }
 impl Document {
     pub fn new(source: Arc<dyn BlockSource>, config: Config) -> Self {
         let size = source.size();
-        Self {
+        let cache = Arc::new(crate::cache::BlockCache::new(
             source,
+            config.block_size,
+            config.cache_bytes,
+        ));
+        let prefetcher = crate::prefetch::Prefetcher::new(cache.clone(), config.prefetch_depth);
+        Self {
+            cache,
             size,
             config,
+            prefetcher,
         }
+    }
+    /// The shared cache, for the prefetcher.
+    pub(crate) fn cache(&self) -> &Arc<crate::cache::BlockCache> {
+        &self.cache
+    }
+    /// Awaits outstanding prefetch fills; deterministic tests only.
+    pub async fn prefetch_settle(&self) {
+        self.prefetcher.settle().await
     }
     pub fn size(&self) -> u64 {
         self.size
@@ -85,6 +109,7 @@ impl Document {
         cols: usize,
         hscroll: HScroll,
     ) -> anyhow::Result<ViewportRender> {
+        self.prefetcher.note_viewport(top);
         // include the horizontal offset so scrolling right into a long line reads
         // far enough to find the window's bytes instead of rendering a blank row;
         // `HScroll` is capped on construction, so the budget stays bounded.
@@ -93,22 +118,8 @@ impl Document {
             .config
             .block_size
             .max(rows.saturating_mul(span).saturating_mul(4));
-        let mut buf: Vec<u8> = Vec::new();
-        let mut pos = top.offset();
-        let mut newlines = 0usize;
-        while newlines < rows && pos < self.size && buf.len() < scan_budget {
-            let block = self.source.read_block(pos, self.config.block_size).await?;
-            if block.is_empty() {
-                break;
-            }
-            pos += block.len() as u64;
-            newlines += bytecount_newlines(&block);
-            buf.extend_from_slice(&block);
-        }
-        // nothing more to show once we hit EOF or exhaust the scan budget; a line
-        // longer than the budget is rendered chopped and truncates the screen
-        // (full long-line handling lands with wrap/navigation in a later plan).
-        let stop = pos >= self.size || buf.len() >= scan_budget;
+        let (buf, stop) =
+            crate::scan::fill_lines(self.cache(), top.offset(), rows, scan_budget).await?;
         let mut out = Vec::with_capacity(rows);
         let mut line_start = 0usize;
         for i in 0..buf.len() {
@@ -147,103 +158,58 @@ impl Document {
             }
         }
     }
-    /// Finds the start of the `n`-th line after `start` (a line start), stopping at
-    /// the last content line rather than moving past EOF.
+    /// Finds the start of the `n`-th line after `start`, clamped at the furthest
+    /// line start the budgeted scan saw (EOF or budget — never past EOF).
     async fn scroll_down(&self, start: u64, n: usize) -> anyhow::Result<Anchor> {
-        let mut pos = start;
-        let mut last_line_start = start;
-        let mut found = 0usize;
-        while found < n && pos < self.size {
-            let block = self.source.read_block(pos, self.config.block_size).await?;
-            if block.is_empty() {
-                break;
-            }
-            for (i, &b) in block.iter().enumerate() {
-                if b == b'\n' {
-                    let ls = pos + i as u64 + 1;
-                    if ls >= self.size {
-                        return Ok(Anchor(last_line_start));
-                    }
-                    last_line_start = ls;
-                    found += 1;
-                    if found == n {
-                        return Ok(Anchor(ls));
-                    }
-                }
-            }
-            pos += block.len() as u64;
+        match crate::scan::nth_line_start_after(self.cache(), start, n, self.config.nav_scan_budget)
+            .await?
+        {
+            crate::scan::Forward::Found { start } => Ok(Anchor(start)),
+            crate::scan::Forward::Eof { last_start } => Ok(Anchor(last_start)),
+            crate::scan::Forward::Budget { last_start } => Ok(Anchor(last_start)),
         }
-        Ok(Anchor(last_line_start))
     }
-    /// Finds the start of the `n`-th line before `start` (a line start), clamped
-    /// at 0. Scans backward once, collecting newline offsets, so moving up a
-    /// screenful of lines costs a single block read rather than one read per line
-    /// — re-reading the same block per line would defeat the high-latency-FS goal.
+    /// Finds the start of the `n`-th line before `start`, clamped at 0; if the
+    /// budget runs out first the anchor stays put (a pending-aware upgrade is
+    /// planned with the Resolution work).
     async fn scroll_up(&self, start: u64, n: usize) -> anyhow::Result<Anchor> {
         if start == 0 || n == 0 {
             return Ok(Anchor(start));
         }
-        let bs = self.config.block_size as u64;
-        // the '\n' at start-1 terminates the line above `start`; count line starts
-        // by the newlines strictly before it, taking the n-th one from the right.
-        let mut hi = start - 1;
-        let mut found = 0usize;
-        loop {
-            if hi == 0 {
-                return Ok(Anchor::TOP);
-            }
-            let lo = hi.saturating_sub(bs);
-            let len = (hi - lo) as usize;
-            let block = self.source.read_block(lo, len).await?;
-            let block = &block[..len.min(block.len())];
-            for (idx, &b) in block.iter().enumerate().rev() {
-                if b == b'\n' {
-                    found += 1;
-                    if found == n {
-                        return Ok(Anchor(lo + idx as u64 + 1));
-                    }
-                }
-            }
-            if lo == 0 {
-                return Ok(Anchor::TOP);
-            }
-            hi = lo;
+        match crate::scan::nth_newline_before(self.cache(), start, n, self.config.nav_scan_budget)
+            .await?
+        {
+            // bind as `s` so the clamp arm below can still return the parameter.
+            crate::scan::Backward::Found { start: s } => Ok(Anchor(s)),
+            crate::scan::Backward::Top => Ok(Anchor::TOP),
+            crate::scan::Backward::Budget => Ok(Anchor(start)),
         }
     }
-    /// Given an offset `pos` (> 0), returns the start of the line ending just
-    /// before `pos` — the byte after the last '\n' strictly before `pos`, or 0
-    /// if there is none. `pos` need not itself be a line start.
-    async fn prev_line_start(&self, pos: u64) -> anyhow::Result<u64> {
-        let search_end = pos - 1;
-        if search_end == 0 {
-            return Ok(0);
-        }
-        let bs = self.config.block_size as u64;
-        let mut hi = search_end;
-        loop {
-            let lo = hi.saturating_sub(bs);
-            let len = (hi - lo) as usize;
-            let block = self.source.read_block(lo, len).await?;
-            let block = &block[..len.min(block.len())];
-            if let Some(rel) = block.iter().rposition(|&b| b == b'\n') {
-                return Ok(lo + rel as u64 + 1);
-            }
-            if lo == 0 {
-                return Ok(0);
-            }
-            hi = lo;
+    /// The start of the line ending just before `pos` (0 when none), or `None`
+    /// when the answer is unknowable within the navigation budget — callers
+    /// stay put rather than land off a line start.
+    async fn prev_line_start(&self, pos: u64) -> anyhow::Result<Option<u64>> {
+        match crate::scan::nth_newline_before(self.cache(), pos, 1, self.config.nav_scan_budget)
+            .await?
+        {
+            crate::scan::Backward::Found { start } => Ok(Some(start)),
+            crate::scan::Backward::Top => Ok(Some(0)),
+            crate::scan::Backward::Budget => Ok(None),
         }
     }
     /// The top of the file — always answerable.
     pub fn goto_top(&self) -> Anchor {
         Anchor::TOP
     }
-    /// The anchor that puts the file's final content line on the bottom row.
+    /// The anchor that puts the file's final content line on the bottom row;
+    /// stays at the top if the tail cannot be found within the scan budget.
     pub async fn goto_end(&self, rows: usize) -> anyhow::Result<Anchor> {
         if self.size == 0 {
             return Ok(Anchor::TOP);
         }
-        let last = self.last_line_start().await?;
+        let Some(last) = self.last_line_start().await? else {
+            return Ok(Anchor::TOP);
+        };
         if rows <= 1 {
             return Ok(Anchor(last));
         }
@@ -257,55 +223,73 @@ impl Document {
             return Ok(Anchor::TOP);
         }
         if pct >= 100 {
-            return Ok(Anchor(self.last_line_start().await?));
+            let Some(last) = self.last_line_start().await? else {
+                return Ok(Anchor::TOP);
+            };
+            return Ok(Anchor(last));
         }
         let target = percent_offset(self.size, pct);
         let start = self.line_start_at_or_after(target).await?;
         Ok(Anchor(start))
     }
-    /// The start offset of the file's final content line (ignoring one trailing '\n').
-    async fn last_line_start(&self) -> anyhow::Result<u64> {
+    /// The start offset of the file's final content line, when it can be found
+    /// within the navigation budget.
+    async fn last_line_start(&self) -> anyhow::Result<Option<u64>> {
         if self.size == 0 {
-            return Ok(0);
+            return Ok(Some(0));
         }
         self.prev_line_start(self.size).await
     }
-    /// The next line start at or after `offset` (offset 0, or just past a '\n').
+    /// The next line start at or after `offset` (0, or just past a newline),
+    /// falling back to the top if the snap cannot resolve within budget.
     async fn line_start_at_or_after(&self, offset: u64) -> anyhow::Result<u64> {
         if offset == 0 {
             return Ok(0);
         }
-        let prev = self.source.read_block(offset - 1, 1).await?;
-        if prev.first() == Some(&b'\n') {
+        let bs = self.cache().block_size() as u64;
+        let prev = self.cache().block((offset - 1) / bs).await?;
+        let rel = ((offset - 1) % bs) as usize;
+        if prev.get(rel) == Some(&b'\n') {
             return Ok(offset);
         }
-        let mut pos = offset;
-        while pos < self.size {
-            let block = self.source.read_block(pos, self.config.block_size).await?;
-            if block.is_empty() {
-                break;
-            }
-            if let Some(rel) = block.iter().position(|&b| b == b'\n') {
-                let start = pos + rel as u64 + 1;
-                // a '\n' as the file's final byte snaps to an EOF offset (a phantom
-                // empty line that renders blank); clamp to the last content line.
-                if start >= self.size {
-                    return self.last_line_start().await;
+        match crate::scan::nth_line_start_after(
+            self.cache(),
+            offset,
+            1,
+            self.config.nav_scan_budget,
+        )
+        .await?
+        {
+            crate::scan::Forward::Found { start } => Ok(start),
+            // no line start at-or-after the target within reach (Eof), or the
+            // next one is past the interactive budget (Budget): either way the
+            // honest answer is the line containing `offset`, found by snapping
+            // backward from the target — never a teleport to EOF or a scan
+            // from EOF that needs more budget than one from the target.
+            crate::scan::Forward::Eof { .. } | crate::scan::Forward::Budget { .. } => {
+                match crate::scan::nth_newline_before(
+                    self.cache(),
+                    offset,
+                    1,
+                    self.config.nav_scan_budget,
+                )
+                .await?
+                {
+                    crate::scan::Backward::Found { start } => Ok(start),
+                    crate::scan::Backward::Top => Ok(0),
+                    // both directions exhausted: one giant line surrounds the
+                    // target; resolving it interactively is the planned
+                    // Resolution (pending) case — until then, land at the top.
+                    crate::scan::Backward::Budget => Ok(0),
                 }
-                return Ok(start);
             }
-            pos += block.len() as u64;
         }
-        self.last_line_start().await
     }
 }
 /// Byte offset `pct`% into `size` bytes, computed in u128 so huge (sparse)
 /// file sizes near `u64::MAX` can't overflow the multiplication.
 fn percent_offset(size: u64, pct: u64) -> u64 {
     (size as u128 * pct as u128 / 100) as u64
-}
-fn bytecount_newlines(b: &[u8]) -> usize {
-    b.iter().filter(|&&c| c == b'\n').count()
 }
 
 #[cfg(test)]
@@ -318,9 +302,18 @@ mod tests {
             src,
             Config {
                 block_size,
+                prefetch_depth: 0,
                 ..Config::default()
             },
         )
+    }
+    #[test]
+    fn cache_accessor_exposes_the_shared_block_cache() {
+        // the prefetcher (a later plan) reads blocks through this accessor;
+        // it must see the same source the document itself reads through.
+        let d = doc(b"a\nb\nc\n", 4);
+        assert_eq!(d.cache().block_size(), 4);
+        assert_eq!(d.cache().size(), d.size());
     }
     #[tokio::test]
     async fn returns_first_screen() {
@@ -386,6 +379,7 @@ mod tests {
             src.clone(),
             Config {
                 block_size: 16,
+                prefetch_depth: 0,
                 ..Config::default()
             },
         );
@@ -423,6 +417,7 @@ mod tests {
             src,
             Config {
                 block_size: 64,
+                prefetch_depth: 0,
                 ..Config::default()
             },
         );
@@ -442,6 +437,7 @@ mod tests {
             src.clone(),
             Config {
                 block_size: 4096,
+                prefetch_depth: 0,
                 ..Config::default()
             },
         );
@@ -507,7 +503,13 @@ mod tests {
             data.extend_from_slice(b"x\n");
         }
         let src = Arc::new(MockSource::new(data));
-        let d = Document::new(src.clone(), Config::default());
+        let d = Document::new(
+            src.clone(),
+            Config {
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
         let top = d.scroll_lines(Anchor(198), -40).await.unwrap();
         assert_eq!(top, Anchor(118));
         assert!(
@@ -524,6 +526,35 @@ mod tests {
         assert_eq!(d.scroll_lines(Anchor::TOP, -5).await.unwrap(), Anchor::TOP);
         assert_eq!(d.goto_end(3).await.unwrap(), Anchor::TOP);
         assert_eq!(d.goto_percent(50).await.unwrap(), Anchor::TOP);
+    }
+    #[tokio::test]
+    async fn scrolling_back_through_cached_blocks_reads_nothing() {
+        // scroll forward through several blocks, then back: the return trip must
+        // be served entirely from cache (this is the pager's whole thesis).
+        let mut data = Vec::new();
+        for i in 0..2000u32 {
+            data.extend_from_slice(format!("line {i:04}\n").as_bytes());
+        }
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src.clone(),
+            Config {
+                block_size: 1024,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        let mut top = Anchor::TOP;
+        for _ in 0..10 {
+            top = d.scroll_lines(top, 50).await.unwrap();
+            let _ = d.viewport(top, 40, 80, HScroll::ZERO).await.unwrap();
+        }
+        let cold = src.read_count();
+        for _ in 0..10 {
+            top = d.scroll_lines(top, -50).await.unwrap();
+            let _ = d.viewport(top, 40, 80, HScroll::ZERO).await.unwrap();
+        }
+        assert_eq!(src.read_count(), cold, "return trip issued cold reads");
     }
     #[tokio::test]
     async fn scroll_zero_is_identity() {
@@ -607,6 +638,46 @@ mod tests {
         let a = d.goto_percent(75).await.unwrap();
         assert_eq!(a, Anchor(2));
     }
+    #[tokio::test]
+    async fn budgeted_percent_jump_lands_in_the_target_line() {
+        // the next newline after the percent target is beyond the budget; snap
+        // backward to the line containing the target instead of seeking EOF.
+        let mut data = vec![b'a'; 10000];
+        data.push(b'\n');
+        data.extend_from_slice(&[b'b'; 10000]);
+        data.push(b'\n');
+        data.extend_from_slice(b"tail");
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        assert_eq!(d.goto_percent(51).await.unwrap(), Anchor(10001));
+    }
+    #[tokio::test]
+    async fn percent_into_a_long_final_line_snaps_to_its_start() {
+        // the final line is longer than the nav budget measured from EOF, but
+        // its start is within budget of the percent target; the jump must land
+        // there, not fall back to the top.
+        let mut data = b"aaa\n".to_vec();
+        data.extend_from_slice(&[b'b'; 400]);
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        assert_eq!(d.goto_percent(50).await.unwrap(), Anchor(4));
+    }
 }
 
 #[cfg(test)]
@@ -638,7 +709,7 @@ mod props {
         ) {
             let doc = Document::new(
                 std::sync::Arc::new(MockSource::new(data.clone())),
-                Config { block_size, ..Config::default() },
+                Config { block_size, prefetch_depth: 0, ..Config::default() },
             );
             rt().block_on(async {
                 let a = doc.scroll_lines(Anchor::TOP, down).await.unwrap();
@@ -667,7 +738,7 @@ mod props {
             let src = std::sync::Arc::new(MockSource::new(vec![b'x'; len]));
             let doc = Document::new(
                 src.clone(),
-                Config { block_size, ..Config::default() },
+                Config { block_size, prefetch_depth: 0, ..Config::default() },
             );
             rt().block_on(async {
                 let _ = doc.viewport(Anchor::TOP, rows, cols, HScroll::new(hscroll)).await.unwrap();
