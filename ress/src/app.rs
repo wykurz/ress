@@ -50,9 +50,17 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.pending_g {
             self.pending_g = false;
-            if let (KeyCode::Char('g'), false) = (key.code, ctrl) {
-                self.count = None;
-                return Action::Nav(Nav::Top);
+            match (key.code, ctrl) {
+                (KeyCode::Char('g'), false) => {
+                    self.count = None;
+                    return Action::Nav(Nav::Top);
+                }
+                // helix-style goto-end, alias of G.
+                (KeyCode::Char('e'), false) => {
+                    self.count = None;
+                    return Action::Nav(Nav::Bottom);
+                }
+                _ => {}
             }
         }
         match (key.code, ctrl) {
@@ -71,11 +79,12 @@ impl App {
             (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
                 Action::Nav(Nav::Lines(-self.take_count_i64()))
             }
-            (KeyCode::Char('d'), true) => {
+            // bare d/u match less and zellij; a pager has no delete/undo to clash with.
+            (KeyCode::Char('d'), _) => {
                 self.count = None;
                 Action::Nav(Nav::HalfPage(1))
             }
-            (KeyCode::Char('u'), true) => {
+            (KeyCode::Char('u'), _) => {
                 self.count = None;
                 Action::Nav(Nav::HalfPage(-1))
             }
@@ -246,6 +255,12 @@ mod tests {
         assert_eq!(app.handle_key(key('g')), Action::Nav(Nav::Top));
     }
     #[test]
+    fn ge_goes_to_bottom() {
+        let mut app = App::new();
+        assert_eq!(app.handle_key(key('g')), Action::None);
+        assert_eq!(app.handle_key(key('e')), Action::Nav(Nav::Bottom));
+    }
+    #[test]
     fn g_then_other_key_cancels() {
         let mut app = App::new();
         app.handle_key(key('g'));
@@ -271,6 +286,20 @@ mod tests {
         assert_eq!(
             App::new().handle_key(ctrl('d')),
             Action::Nav(Nav::HalfPage(1))
+        );
+    }
+    #[test]
+    fn bare_d_half_page_down() {
+        assert_eq!(
+            App::new().handle_key(key('d')),
+            Action::Nav(Nav::HalfPage(1))
+        );
+    }
+    #[test]
+    fn bare_u_half_page_up() {
+        assert_eq!(
+            App::new().handle_key(key('u')),
+            Action::Nav(Nav::HalfPage(-1))
         );
     }
     #[test]
