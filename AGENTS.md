@@ -18,8 +18,16 @@ Prefer `just` over direct `cargo`:
 - **Error chains:** never use `anyhow::Error::msg()` — it destroys the chain.
 - Follow `CONVENTIONS.md` for comment/import/version style.
 
-## Architecture
+## Architecture & documentation
 
 `ress-core` is the headless engine (no terminal deps), `ress` is the thin TUI
-binary. The design spec and phase plans live under `.claude/superpowers/`
-(`specs/`, `plans/`) — gitignored session artifacts; save new specs/plans there.
+binary. Durable design docs live in `docs/` (start with
+`docs/architecture.md`); session-scoped specs and phase plans live under
+`.claude/superpowers/` (`specs/`, `plans/`) — gitignored artifacts; save new
+specs/plans there, never in `docs/`.
+
+**Keep documentation current:** a change that alters user-facing behavior
+(keymap, flags) must update `README.md`, and a change that alters an
+architecture-level decision (cache policy, budget semantics, navigation
+invariants, concurrency rules) must update the relevant `docs/*.md` — in the
+same PR as the code.
