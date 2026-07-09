@@ -39,9 +39,37 @@ struct State {
     // one watch channel per block being fetched; waiters clone the receiver.
     in_flight: HashMap<u64, tokio::sync::watch::Receiver<Option<Result<Bytes, SharedError>>>>,
 }
+/// Removes a fetcher's `in_flight` registration if the fetching future is
+/// dropped mid-read — e.g. an aborted scan — instead of completing
+/// normally. A waiter on the same block self-heals on the dropped watch
+/// channel, but a block that is never requested again would otherwise
+/// leak its entry forever. The normal path disarms the guard before it
+/// removes the entry itself under the publish lock, so `drop` is then a
+/// no-op.
+struct InFlightGuard<'a> {
+    cache: &'a BlockCache,
+    idx: u64,
+    rx: tokio::sync::watch::Receiver<Option<Result<Bytes, SharedError>>>,
+    armed: bool,
+}
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut st = self.cache.state.lock().unwrap();
+            if st
+                .in_flight
+                .get(&self.idx)
+                .is_some_and(|cur| cur.same_channel(&self.rx))
+            {
+                st.in_flight.remove(&self.idx);
+            }
+        }
+    }
+}
 impl BlockCache {
     /// Creates a cache holding at most `capacity_bytes` of block data (rounded
-    /// down to whole blocks, minimum two), split 1:3 probationary:protected.
+    /// down to whole blocks, minimum two), split 1:3 probationary:protected; a
+    /// zero block size is treated as one byte.
     pub fn new(source: Arc<dyn BlockSource>, block_size: usize, capacity_bytes: usize) -> Self {
         // cap the block count: `lru` preallocates its map eagerly, so a tiny
         // block size against a large byte capacity must not allocate millions
@@ -52,7 +80,7 @@ impl BlockCache {
         let prot = NonZeroUsize::new((blocks - prob.get()).max(1)).unwrap();
         Self {
             source,
-            block_size,
+            block_size: block_size.max(1),
             state: Mutex::new(State {
                 probation: lru::LruCache::new(prob),
                 protected: lru::LruCache::new(prot),
@@ -105,8 +133,17 @@ impl BlockCache {
                 }
             };
             if let Some(tx) = fetch_tx {
+                // a guard against leaking this registration if the future is
+                // aborted at the read below; disarmed once the read returns.
+                let mut guard = InFlightGuard {
+                    cache: self,
+                    idx,
+                    rx: wait_rx.clone(),
+                    armed: true,
+                };
                 let offset = idx * self.block_size as u64;
                 let res = self.source.read_block(offset, self.block_size).await;
+                guard.armed = false;
                 let mut st = self.state.lock().unwrap();
                 st.in_flight.remove(&idx);
                 return match res {
@@ -186,6 +223,11 @@ impl BlockCache {
         // second touch promotes.
         Self::insert_protected(st, idx, b.clone());
         Some(b)
+    }
+    /// Number of in-flight registrations; leak detection in tests.
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.state.lock().unwrap().in_flight.len()
     }
 }
 
@@ -352,6 +394,15 @@ mod tests {
         assert_eq!(&c.block(3).await.unwrap()[..], b"3");
     }
     #[tokio::test]
+    async fn zero_block_size_is_sanitized() {
+        // a zero block size would divide-by-zero in the scanners; the cache
+        // stores at least one byte per block.
+        let src = Arc::new(MockSource::new(Bytes::from_static(b"0123")));
+        let c = BlockCache::new(src, 0, 16);
+        assert_eq!(c.block_size(), 1);
+        assert_eq!(&c.block(2).await.unwrap()[..], b"2");
+    }
+    #[tokio::test]
     async fn read_errors_propagate_with_context() {
         struct Failing;
         #[async_trait::async_trait]
@@ -387,6 +438,29 @@ mod tests {
             .expect("second caller wedged on a cancelled fetcher")
             .unwrap();
         assert_eq!(&bytes[..], b"0123");
+    }
+    #[tokio::test]
+    async fn aborted_fetcher_does_not_leak_its_registration() {
+        // cancelling a scan mid-cold-read must clean the in-flight entry even
+        // if that block is never requested again.
+        let src = Arc::new(
+            MockSource::new(Bytes::from_static(b"0123456789"))
+                .with_latency(std::time::Duration::from_millis(50)),
+        );
+        let c = Arc::new(BlockCache::new(src, 4, 64));
+        let fetcher = tokio::spawn({
+            let c = c.clone();
+            async move { c.block(0).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(c.in_flight_len(), 1, "fetch should be registered");
+        fetcher.abort();
+        let _ = fetcher.await;
+        assert_eq!(
+            c.in_flight_len(),
+            0,
+            "aborted fetch left a stale in-flight registration"
+        );
     }
     #[tokio::test]
     async fn concurrent_waiters_all_observe_the_same_error() {
