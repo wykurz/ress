@@ -8,7 +8,13 @@ use unicode_width::UnicodeWidthChar;
 /// next `tab_stop`; wide chars occupy two columns; C0/DEL control bytes render as
 /// caret notation (`^[`); invalid UTF-8 becomes the replacement char. A wide char
 /// straddling either window edge renders as a single blank for its visible half.
+/// An empty window (`cols == 0`) yields an empty string.
 pub fn layout_row(raw: &[u8], tab_stop: usize, hscroll: usize, cols: usize) -> String {
+    if cols == 0 {
+        // with hscroll == end every straddle test degenerates: a wide char
+        // crossing the window would emit its blank half into zero columns.
+        return String::new();
+    }
     let tab_stop = tab_stop.max(1);
     let end = hscroll.saturating_add(cols);
     let cow = String::from_utf8_lossy(raw);
@@ -151,6 +157,13 @@ mod tests {
         // a tab can advance col past the window end before a width-0 mark is
         // seen; the phantom cell must fall through to the break, not render.
         assert_eq!(layout_row("\t\u{301}".as_bytes(), 8, 0, 3), "   ");
+    }
+    #[test]
+    fn empty_window_emits_nothing() {
+        // a wide char straddling an empty window (hscroll == end) "straddles"
+        // both edges at once; its blank half must not appear in zero columns.
+        assert_eq!(layout_row("世".as_bytes(), 8, 1, 0), "");
+        assert_eq!(layout_row(b"abc", 8, 0, 0), "");
     }
     #[test]
     fn windows_far_into_a_long_line() {
