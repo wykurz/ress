@@ -12,6 +12,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # proptest seeds are random per run; more cases per property raises the odds
+  # a bad seed fires on the PR run instead of after the merge (props run in
+  # microseconds, so 16x the default 256 is still negligible).
+  PROPTEST_CASES: 4096
 
 jobs:
   lint:
