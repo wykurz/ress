@@ -1,9 +1,10 @@
 //! The headless ress engine: file I/O and the document/viewport model.
-pub mod cache;
+pub(crate) mod cache;
 pub mod document;
-pub mod line;
-pub mod prefetch;
-pub mod scan;
+pub(crate) mod line;
+pub(crate) mod prefetch;
+pub mod resolve;
+pub(crate) mod scan;
 pub mod source;
 /// Tunable engine parameters. Defaults target high-latency network filesystems.
 #[derive(Debug, Clone)]
@@ -14,8 +15,8 @@ pub struct Config {
     pub tab_stop: usize,
     /// Total bytes of file data the shared block cache may hold.
     pub cache_bytes: usize,
-    /// Byte budget for one navigation scan (scroll/goto); exhaustion clamps
-    /// (forward) or stays put (backward) instead of reading without limit.
+    /// Byte budget for one interactive navigation scan (scroll/goto); an
+    /// operation needing more continues as a pending background scan.
     pub nav_scan_budget: usize,
     /// Blocks to keep warm ahead of the viewport in the scroll direction.
     pub prefetch_depth: usize,

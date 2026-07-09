@@ -86,7 +86,8 @@ impl Prefetcher {
         }
     }
     /// Awaits all outstanding fills; used by tests for determinism.
-    pub async fn settle(&self) {
+    #[cfg(test)]
+    pub(crate) async fn settle(&self) {
         let tasks = {
             let mut st = self.state.lock().unwrap();
             std::mem::take(&mut st.tasks)

@@ -12,18 +12,27 @@ pub enum Forward {
     Found { start: u64 },
     /// EOF first; `last_start` is the furthest line start seen (>= `from`).
     Eof { last_start: u64 },
-    /// Budget first; `last_start` is the furthest line start seen (>= `from`).
-    Budget { last_start: u64 },
+    /// Budget first; `last_start` is the furthest line start seen (>= `from`),
+    /// `resume` the next unread offset, `found` the newlines counted so far —
+    /// a follow-up scan for `n - found` from `resume` continues seamlessly.
+    Budget {
+        last_start: u64,
+        resume: u64,
+        found: usize,
+    },
 }
 /// Outcome of a backward scan for a newline.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Backward {
-    /// The byte just after the n-th newline strictly before `pos`.
+    /// The byte just after the n-th newline in the search window `[0, pos-1)`
+    /// — the byte at `pos - 1` itself is deliberately excluded (it is the
+    /// newline that makes a line-start `pos` a line start).
     Found { start: u64 },
-    /// Fewer than `n` newlines exist above; the line start is offset 0.
+    /// Fewer than `n` newlines exist in the window; the line start is 0.
     Top,
-    /// Budget exhausted before finding the n-th newline.
-    Budget,
+    /// Budget exhausted; `resume` is the exclusive upper bound of the
+    /// unsearched region and `found` the newlines counted so far.
+    Budget { resume: u64, found: usize },
 }
 /// Returns the start of the `n`-th line after line-start `from`, never at or
 /// past EOF (an EOF-adjacent trailing newline reports the previous start).
@@ -69,7 +78,11 @@ pub async fn nth_line_start_after(
     } else if pos >= size {
         Ok(Forward::Eof { last_start })
     } else {
-        Ok(Forward::Budget { last_start })
+        Ok(Forward::Budget {
+            last_start,
+            resume: pos,
+            found,
+        })
     }
 }
 /// Returns the byte after the `n`-th newline strictly before `pos` (searching
@@ -93,6 +106,9 @@ pub async fn nth_newline_before(
         let block = cache.block(idx).await?;
         let take = ((hi - lo) as usize).min(block.len());
         let slice = &block[..take];
+        if slice.is_empty() {
+            break;
+        }
         for (i, &b) in slice.iter().enumerate().rev() {
             if b == b'\n' {
                 found += 1;
@@ -109,7 +125,7 @@ pub async fn nth_newline_before(
     if hi == 0 {
         Ok(Backward::Top)
     } else {
-        Ok(Backward::Budget)
+        Ok(Backward::Budget { resume: hi, found })
     }
 }
 /// Collects bytes from `from` up to and including the `rows`-th newline, EOF,
@@ -179,11 +195,20 @@ mod tests {
     }
     #[tokio::test]
     async fn forward_budget_stops_the_scan() {
-        // one giant line, tiny budget: no line start found, budget reported.
+        // one giant line, tiny budget: no line start found, budget reported
+        // with an exact resume cursor.
         let data: &'static [u8] = Box::leak(vec![b'x'; 4096].into_boxed_slice());
         let c = cache(data, 16);
         match nth_line_start_after(&c, 0, 1, 64).await.unwrap() {
-            Forward::Budget { last_start } => assert_eq!(last_start, 0),
+            Forward::Budget {
+                last_start,
+                resume,
+                found,
+            } => {
+                assert_eq!(last_start, 0);
+                assert_eq!(resume, 64);
+                assert_eq!(found, 0);
+            }
             other => panic!("expected Budget, got {other:?}"),
         }
     }
@@ -212,7 +237,10 @@ mod tests {
         let data: &'static [u8] = Box::leak(vec![b'x'; 4096].into_boxed_slice());
         let c = cache(data, 16);
         match nth_newline_before(&c, 4096, 1, 64).await.unwrap() {
-            Backward::Budget => {}
+            Backward::Budget { resume, found } => {
+                assert_eq!(resume, 4016);
+                assert_eq!(found, 0);
+            }
             other => panic!("expected Budget, got {other:?}"),
         }
     }

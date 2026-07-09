@@ -40,11 +40,18 @@ reach ahead of it.
 
 ## The event loop
 
-The binary runs a tokio event loop over crossterm's async event stream. Key
-presses resolve through the pure `handle_key` state machine into `Nav`
-intents; the loop applies an intent by calling `Document`, then redraws.
-Terminal state (alternate screen, raw mode, mouse capture) is owned by a
-guard that restores it on every exit path, including panics.
+The binary runs a `tokio::select!` loop over three sources: crossterm's
+async event stream, the completion of a pending navigation scan, and a
+repaint tick (active only while something is pending) that keeps the
+progress indicator fresh. Key presses resolve through the pure `handle_key`
+state machine into `Nav` intents; an intent that resolves within its budget
+applies immediately, and one that cannot becomes the pending operation —
+the viewport stays put, a transient bottom-row indicator shows progress,
+`Esc` cancels, any new motion supersedes, quitting aborts, and a resize
+restarts the pending jump against the new dimensions (a `G` in flight must
+not finish positioned for the old screen height). Terminal state (alternate
+screen, raw mode, mouse capture) is owned by a guard that restores it on
+every exit path, including panics.
 
 Runtime shutdown is bounded: once the event loop returns, the runtime is
 shut down with a timeout, so **background** reads wedged on a dead network
@@ -108,9 +115,10 @@ The architecture keeps planned features additive rather than invasive:
 - **Background analysis** (line index, search, syntax) is designed as
   streaming analyzers fed by a single shared scan through the same block
   cache, so the file is read once no matter how many analyzers run.
-- **Pending navigation** (a jump that cannot resolve within its interactive
-  budget) currently degrades to a safe anchor — clamping, staying put, or
-  falling back to the top, per operation (see
-  [budgeted scanning](budgeted_scanning.md)); the planned `Resolution`
-  mechanism upgrades these into live-progress, cancellable operations
-  without changing the navigation API's shape.
+- **Pending navigation** exists: `Resolution { Ready, Pending }` is how
+  every navigation result is expressed, and budget-exhausted jumps continue
+  as cancellable background scans with live progress (see
+  [budgeted scanning](budgeted_scanning.md)). The `Exhausted` variant — for
+  "no such answer", e.g. a go-to-line beyond the file — arrives with the
+  line index. Making *reads themselves* pending (a cold viewport block on a
+  wedged mount still holds the loop) is the remaining step.

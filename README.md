@@ -12,8 +12,9 @@ is Unix-only). Early development.
 Why not just `less`? `less` issues small synchronous reads (painful on
 high-latency filesystems) and can stall building its line map. `ress` paints
 the first screen instantly regardless of file size, reads through a shared
-prefetching block cache, and strictly bounds the read work any keypress can
-trigger — no motion ever scans an unbounded amount of data.
+prefetching block cache, and strictly bounds the read work of every
+interactive attempt — a motion that needs more scanning continues as a
+visible, cancellable background operation instead of blocking the UI.
 
 Opening a multi-gigabyte file shows the first screen in milliseconds; paging
 back through recently viewed content issues no reads at all, for as much
@@ -51,8 +52,13 @@ the philosophy). Counts prefix motions: `12j` moves twelve lines.
 | `h` / `l` / `←` / `→` | horizontal scroll (long lines are chopped) |
 | mouse wheel | scroll three lines |
 | `Ctrl-l` | force redraw |
-| `Esc` | cancel a pending count or chord |
+| `Esc` | cancel a pending operation, count, or chord |
 | `q` / `Ctrl-c` | quit |
+
+Jumps that need more scanning than the interactive budget (for example `G`
+into a file whose tail is one giant line, or a very large count) continue in
+the background: the viewport stays put, a transient bottom-row indicator
+shows progress, `Esc` cancels, and any new motion supersedes the scan.
 
 Reserved for upcoming features: `/` `?` `n` `N` (search), `:` and `<count>G`
 (go to line — today a count before `G` is ignored and `G` jumps to the end),

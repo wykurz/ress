@@ -3,12 +3,14 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use futures::StreamExt;
 use ress_core::document::{Anchor, Document, HScroll};
+use ress_core::resolve::{PendingNav, Resolution};
 /// What the loop should do after handling an input event.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Quit,
     Nav(Nav),
     Redraw,
+    Cancel,
     None,
 }
 /// A navigation intent; the async loop turns it into `Document` calls.
@@ -118,81 +120,176 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.count = None;
                 self.pending_g = false;
-                Action::None
+                Action::Cancel
             }
             _ => Action::None,
         }
     }
 }
-/// Draws the current screen: compute the viewport for the terminal size, then
-/// blit it. Viewport I/O happens before `draw` because the draw closure is sync.
+/// Draws the current screen: compute the viewport for the terminal size, blit
+/// it, and overlay the transient progress row on the bottom line while a scan
+/// is pending. Viewport I/O happens before `draw` because the draw closure is
+/// sync.
 async fn draw(
     term: &mut crate::terminal::Term,
     doc: &Document,
     app: &App,
+    pending: Option<&PendingNav>,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()> {
     let view = doc
         .viewport(app.top, rows as usize, cols as usize, app.hscroll)
         .await?;
-    term.inner_mut()
-        .draw(|f| crate::render::render_viewport(&view, f.area(), f.buffer_mut()))?;
+    let indicator = pending.map(|p| {
+        let prog = *p.progress.borrow();
+        (p.label, prog.percent())
+    });
+    term.inner_mut().draw(|f| {
+        crate::render::render_viewport(&view, f.area(), f.buffer_mut());
+        if let Some((label, pct)) = indicator {
+            crate::render::render_progress_row(label, pct, f.area(), f.buffer_mut());
+        }
+    })?;
     Ok(())
 }
-/// Applies a navigation intent, updating the anchor or horizontal offset.
-async fn apply_nav(doc: &Document, app: &mut App, nav: Nav, rows: u16) -> anyhow::Result<()> {
+/// Applies a navigation intent. A pending operation is superseded by any new
+/// motion; an intent that cannot resolve within the interactive budget
+/// becomes the new pending operation.
+async fn apply_nav(
+    doc: &Document,
+    app: &mut App,
+    pending: &mut Option<(Nav, PendingNav)>,
+    nav: Nav,
+    rows: u16,
+) -> anyhow::Result<()> {
+    if let Some((_, p)) = pending.take() {
+        p.cancel();
+    }
     let page = rows.max(1) as i64;
-    match nav {
-        Nav::Lines(n) => app.top = doc.scroll_lines(app.top, n).await?,
-        Nav::HalfPage(d) => {
-            app.top = doc
-                .scroll_lines(app.top, d as i64 * (page / 2).max(1))
-                .await?
+    let resolution = match nav {
+        Nav::Lines(n) => Some(doc.scroll_lines(app.top, n).await?),
+        Nav::HalfPage(d) => Some(
+            doc.scroll_lines(app.top, d as i64 * (page / 2).max(1))
+                .await?,
+        ),
+        Nav::Page(d) => Some(doc.scroll_lines(app.top, d as i64 * page).await?),
+        Nav::Top => {
+            app.top = doc.goto_top();
+            None
         }
-        Nav::Page(d) => app.top = doc.scroll_lines(app.top, d as i64 * page).await?,
-        Nav::Top => app.top = doc.goto_top(),
-        Nav::Bottom => app.top = doc.goto_end(rows as usize).await?,
-        Nav::Percent(p) => app.top = doc.goto_percent(p).await?,
-        Nav::Horizontal(n) => app.hscroll = app.hscroll.shift(n),
+        Nav::Bottom => Some(doc.goto_end(rows as usize).await?),
+        Nav::Percent(p) => Some(doc.goto_percent(p).await?),
+        Nav::Horizontal(n) => {
+            app.hscroll = app.hscroll.shift(n);
+            None
+        }
+    };
+    match resolution {
+        Some(Resolution::Ready(a)) => app.top = a,
+        Some(Resolution::Pending(p)) => *pending = Some((nav, p)),
+        None => {}
     }
     Ok(())
 }
-/// Runs the event loop until the user quits.
+/// Runs the event loop until the user quits. Pending navigation resolves in
+/// the background: a tick keeps the progress row fresh, completion moves the
+/// anchor, Esc cancels, and any new motion supersedes.
 pub async fn run(doc: Document) -> anyhow::Result<()> {
     let mut term = crate::terminal::Term::new()?;
     let mut app = App::new();
+    let mut pending: Option<(Nav, PendingNav)> = None;
     let (mut cols, mut rows) = crossterm::terminal::size()?;
-    draw(&mut term, &doc, &app, cols, rows).await?;
+    draw(
+        &mut term,
+        &doc,
+        &app,
+        pending.as_ref().map(|(_, p)| p),
+        cols,
+        rows,
+    )
+    .await?;
     let mut events = crossterm::event::EventStream::new();
-    while let Some(event) = events.next().await {
-        match event? {
-            Event::Key(key) => match app.handle_key(key) {
-                Action::Quit => break,
-                Action::Nav(nav) => {
-                    apply_nav(&doc, &mut app, nav, rows).await?;
-                    draw(&mut term, &doc, &app, cols, rows).await?;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            done = async { (&mut pending.as_mut().unwrap().1.handle).await }, if pending.is_some() => {
+                pending = None;
+                // an aborted or failed scan leaves the anchor where it was;
+                // failures are logged so they stay diagnosable even before
+                // the status line exists.
+                match done {
+                    Ok(Ok(anchor)) => app.top = anchor,
+                    Ok(Err(e)) => tracing::warn!("background scan failed: {e:#}"),
+                    Err(e) if e.is_cancelled() => {}
+                    Err(e) => tracing::warn!("background scan panicked: {e:?}"),
                 }
-                Action::Redraw => draw(&mut term, &doc, &app, cols, rows).await?,
-                Action::None => {}
-            },
-            Event::Mouse(m) => {
-                let nav = match m.kind {
-                    MouseEventKind::ScrollDown => Some(Nav::Lines(3)),
-                    MouseEventKind::ScrollUp => Some(Nav::Lines(-3)),
-                    _ => None,
+                draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+            }
+            _ = tick.tick(), if pending.is_some() => {
+                draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+            }
+            ev = events.next() => {
+                let Some(ev) = ev else {
+                    // the input stream ended: cancel any live scan before
+                    // leaving the loop.
+                    if let Some((_, p)) = pending.take() {
+                        p.cancel();
+                    }
+                    break;
                 };
-                if let Some(nav) = nav {
-                    apply_nav(&doc, &mut app, nav, rows).await?;
-                    draw(&mut term, &doc, &app, cols, rows).await?;
+                // error returns via `?` below can still drop a live pending
+                // scan without cancelling it; the detached task is bounded by
+                // the runtime's shutdown timeout in main.
+                match ev? {
+                    Event::Key(key) => match app.handle_key(key) {
+                        Action::Quit => {
+                            if let Some((_, p)) = pending.take() {
+                                p.cancel();
+                            }
+                            break;
+                        }
+                        Action::Nav(nav) => {
+                            apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                        }
+                        Action::Cancel => {
+                            if let Some((_, p)) = pending.take() {
+                                p.cancel();
+                            }
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                        }
+                        Action::Redraw => draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?,
+                        Action::None => {}
+                    },
+                    Event::Mouse(m) => {
+                        let nav = match m.kind {
+                            MouseEventKind::ScrollDown => Some(Nav::Lines(3)),
+                            MouseEventKind::ScrollUp => Some(Nav::Lines(-3)),
+                            _ => None,
+                        };
+                        if let Some(nav) = nav {
+                            apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                        }
+                    }
+                    Event::Resize(c, r) => {
+                        cols = c;
+                        rows = r;
+                        // any pending operation restarts against the new
+                        // dimensions: row-dependent jumps (G) captured the old
+                        // height, and restarting the rest from the unmoved
+                        // anchor is harmless and simpler than classifying.
+                        if let Some((nav, p)) = pending.take() {
+                            p.cancel();
+                            apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
+                        }
+                        draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                    }
+                    _ => {}
                 }
             }
-            Event::Resize(c, r) => {
-                cols = c;
-                rows = r;
-                draw(&mut term, &doc, &app, cols, rows).await?;
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -323,9 +420,16 @@ mod tests {
         app.handle_key(key('9'));
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            Action::None
+            Action::Cancel
         );
         assert_eq!(app.handle_key(key('j')), Action::Nav(Nav::Lines(1)));
+    }
+    #[test]
+    fn esc_requests_cancel() {
+        assert_eq!(
+            App::new().handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Cancel
+        );
     }
     #[test]
     fn other_keys_do_nothing() {
@@ -335,14 +439,18 @@ mod tests {
     async fn apply_nav_page_advances_full_screen() {
         let doc = nav_doc();
         let mut app = App::new();
-        apply_nav(&doc, &mut app, Nav::Page(1), 10).await.unwrap();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Page(1), 10)
+            .await
+            .unwrap();
         assert_eq!(app.top.offset(), 20);
     }
     #[tokio::test]
     async fn apply_nav_half_page_advances_half_screen() {
         let doc = nav_doc();
         let mut app = App::new();
-        apply_nav(&doc, &mut app, Nav::HalfPage(1), 10)
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::HalfPage(1), 10)
             .await
             .unwrap();
         assert_eq!(app.top.offset(), 10);
@@ -351,18 +459,22 @@ mod tests {
     async fn apply_nav_bottom_puts_last_line_on_bottom_row() {
         let doc = nav_doc();
         let mut app = App::new();
-        apply_nav(&doc, &mut app, Nav::Bottom, 10).await.unwrap();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Bottom, 10)
+            .await
+            .unwrap();
         assert_eq!(app.top.offset(), 20);
     }
     #[tokio::test]
     async fn apply_nav_horizontal_clamps_at_zero() {
         let doc = nav_doc();
         let mut app = App::new();
-        apply_nav(&doc, &mut app, Nav::Horizontal(5), 10)
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Horizontal(5), 10)
             .await
             .unwrap();
         assert_eq!(app.hscroll.columns(), 5);
-        apply_nav(&doc, &mut app, Nav::Horizontal(-99), 10)
+        apply_nav(&doc, &mut app, &mut pending, Nav::Horizontal(-99), 10)
             .await
             .unwrap();
         assert_eq!(app.hscroll.columns(), 0);
@@ -373,16 +485,54 @@ mod tests {
         // wrap to 0 (release); a max-count scroll back down still clamps at zero.
         let doc = nav_doc();
         let mut app = App::new();
-        apply_nav(&doc, &mut app, Nav::Horizontal(i64::MAX), 10)
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Horizontal(i64::MAX), 10)
             .await
             .unwrap();
-        apply_nav(&doc, &mut app, Nav::Horizontal(i64::MAX), 10)
+        apply_nav(&doc, &mut app, &mut pending, Nav::Horizontal(i64::MAX), 10)
             .await
             .unwrap();
         assert_eq!(app.hscroll.columns(), MAX_HSCROLL);
-        apply_nav(&doc, &mut app, Nav::Horizontal(i64::MIN), 10)
+        apply_nav(&doc, &mut app, &mut pending, Nav::Horizontal(i64::MIN), 10)
             .await
             .unwrap();
         assert_eq!(app.hscroll.columns(), 0);
+    }
+    #[tokio::test]
+    async fn new_motion_supersedes_a_pending_operation() {
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(b"y\n");
+        }
+        data.extend_from_slice(&[b'x'; 8192]);
+        let src = std::sync::Arc::new(ress_core::source::MockSource::new(data));
+        let doc = Document::new(
+            src,
+            ress_core::Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..ress_core::Config::default()
+            },
+        );
+        let mut app = App::new();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Percent(90), 10)
+            .await
+            .unwrap();
+        assert!(pending.is_some(), "expected the percent jump to pend");
+        assert!(
+            matches!(pending, Some((Nav::Percent(90), _))),
+            "slot must carry the originating intent"
+        );
+        assert_eq!(app.top, Anchor::TOP, "anchor must not move while pending");
+        apply_nav(&doc, &mut app, &mut pending, Nav::Lines(1), 10)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_none(),
+            "new motion must supersede the pending op"
+        );
+        assert_eq!(app.top.offset(), 2);
     }
 }
