@@ -12,12 +12,16 @@ fn main() -> anyhow::Result<()> {
         prefetch_depth: cli.prefetch_depth,
         ..ress_core::Config::default()
     };
-    let document = ress_core::document::Document::new(source, config);
-    tracing::info!("opened {} ({} bytes)", cli.file.display(), document.size());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(app::run(document));
+    let result = runtime.block_on(async {
+        // the document spawns its background indexer at construction, so
+        // it must be built inside the runtime.
+        let document = ress_core::document::Document::new(source, config);
+        tracing::info!("opened {} ({} bytes)", cli.file.display(), document.size());
+        app::run(document).await
+    });
     // a wedged blocking read on a dead network mount must never hold the
     // process hostage after quit; abandon outstanding background fills.
     runtime.shutdown_timeout(std::time::Duration::from_millis(200));

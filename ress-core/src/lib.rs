@@ -1,10 +1,12 @@
 //! The headless ress engine: file I/O and the document/viewport model.
 pub(crate) mod cache;
 pub mod document;
+pub(crate) mod index;
 pub(crate) mod line;
 pub(crate) mod prefetch;
 pub mod resolve;
 pub(crate) mod scan;
+pub(crate) mod schedule;
 pub mod source;
 /// Tunable engine parameters. Defaults target high-latency network filesystems.
 #[derive(Debug, Clone)]

@@ -69,8 +69,11 @@ pub struct Document {
     size: u64,
     config: Config,
     prefetcher: crate::prefetch::Prefetcher,
+    scheduler: crate::schedule::ScanScheduler,
 }
 impl Document {
+    /// Must be called within a tokio runtime: construction spawns the
+    /// background index scan.
     pub fn new(source: Arc<dyn BlockSource>, config: Config) -> Self {
         let size = source.size();
         let cache = Arc::new(crate::cache::BlockCache::new(
@@ -79,11 +82,13 @@ impl Document {
             config.cache_bytes,
         ));
         let prefetcher = crate::prefetch::Prefetcher::new(cache.clone(), config.prefetch_depth);
+        let scheduler = crate::schedule::ScanScheduler::spawn(cache.clone());
         Self {
             cache,
             size,
             config,
             prefetcher,
+            scheduler,
         }
     }
     /// The shared cache, for the prefetcher.
@@ -290,6 +295,140 @@ impl Document {
             }
         }
     }
+    /// Jumps to 1-based line `n` (`0` is treated as `1`), landing on its
+    /// start; a line past the end clamps to the last real line. Answers
+    /// come from the background line index: a query beyond its frontier
+    /// pends on index progress, then walks the at-most-1023-line tail from
+    /// the nearest checkpoint with a budgeted forward scan.
+    pub async fn goto_line(&self, n: u64) -> anyhow::Result<Resolution> {
+        let line0 = n.saturating_sub(1);
+        let budget = self.config.nav_scan_budget;
+        let (covered, clamp0, cp) = {
+            let ix = self.scheduler.index().lock().unwrap();
+            let covered = ix.newlines() >= line0;
+            let clamp0 = ix.total_lines().map(|t| t.saturating_sub(1));
+            (
+                covered,
+                clamp0,
+                ix.nearest_checkpoint(line0.min(ix.newlines())),
+            )
+        };
+        if covered {
+            let (line0, cp) = if cp.0 >= self.size {
+                // the queried start sits at EOF — a trailing newline's
+                // phantom line, not a line; the real last line is the one
+                // before it (ERRATUM 4a#3).
+                let prev = line0.saturating_sub(1);
+                let cp = self
+                    .scheduler
+                    .index()
+                    .lock()
+                    .unwrap()
+                    .nearest_checkpoint(prev);
+                (prev, cp)
+            } else {
+                (line0, cp)
+            };
+            return self.walk_to_line(line0, cp, budget).await;
+        }
+        if let Some(clamp0) = clamp0 {
+            // the scan is done and the line does not exist: vim clamps to
+            // the last real line (an empty file has none — the top).
+            if self.size == 0 {
+                return Ok(Resolution::Ready(Anchor::TOP));
+            }
+            let cp = self
+                .scheduler
+                .index()
+                .lock()
+                .unwrap()
+                .nearest_checkpoint(clamp0);
+            return self.walk_to_line(clamp0, cp, budget).await;
+        }
+        let cache = self.cache.clone();
+        let index = self.scheduler.index().clone();
+        let mut frontier = self.scheduler.frontier();
+        let size = self.size;
+        let seed = frontier.borrow().processed_up_to;
+        Ok(Resolution::Pending(spawn_pending(
+            "jumping to line",
+            size,
+            seed,
+            move |tx| async move {
+                let (line0, cp) = loop {
+                    let snapshot = {
+                        let ix = index.lock().unwrap();
+                        if ix.newlines() >= line0 {
+                            Some((line0, ix.nearest_checkpoint(line0)))
+                        } else if let Some(t) = ix.total_lines() {
+                            let clamp0 = t.saturating_sub(1);
+                            Some((clamp0, ix.nearest_checkpoint(clamp0)))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(found) = snapshot {
+                        break found;
+                    }
+                    frontier
+                        .changed()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("index scan ended unexpectedly"))?;
+                    let f = *frontier.borrow();
+                    let _ = tx.send(crate::resolve::Progress {
+                        scanned: f.processed_up_to,
+                        span: size,
+                    });
+                };
+                if size == 0 {
+                    return Ok(Anchor::TOP);
+                }
+                let (line0, cp) = if cp.0 >= size {
+                    // the queried start sits at EOF — a trailing newline's
+                    // phantom line, not a line; the real last line is the
+                    // one before it (ERRATUM 4a#3).
+                    let prev = line0.saturating_sub(1);
+                    (prev, index.lock().unwrap().nearest_checkpoint(prev))
+                } else {
+                    (line0, cp)
+                };
+                let (cp_off, cp_line0) = cp;
+                let scan =
+                    crate::scan::ForwardScan::new(cp_off, (line0 - cp_line0) as usize, budget);
+                // the tail walk is its own phase, like goto_end's walk-up.
+                let span2 = size - cp_off;
+                scan.complete(&cache, tx, span2).await.map(Anchor)
+            },
+        )))
+    }
+    /// The covered-index tail walk: one interactive step, then the
+    /// standard pending continuation when the budget runs out first.
+    async fn walk_to_line(
+        &self,
+        line0: u64,
+        cp: (u64, u64),
+        budget: usize,
+    ) -> anyhow::Result<Resolution> {
+        if self.size == 0 {
+            return Ok(Resolution::Ready(Anchor::TOP));
+        }
+        let (cp_off, cp_line0) = cp;
+        let mut scan = crate::scan::ForwardScan::new(cp_off, (line0 - cp_line0) as usize, budget);
+        match scan.step(self.cache()).await? {
+            crate::scan::FwdStep::Found(s) => Ok(Resolution::Ready(Anchor(s))),
+            crate::scan::FwdStep::Eof(clamp) => Ok(Resolution::Ready(Anchor(clamp))),
+            crate::scan::FwdStep::More => {
+                let cache = self.cache.clone();
+                let span = self.size - cp_off;
+                Ok(Resolution::Pending(spawn_pending(
+                    "jumping to line",
+                    span,
+                    scan.scanned(),
+                    move |tx| async move { scan.complete(&cache, tx, span).await.map(Anchor) },
+                )))
+            }
+        }
+    }
 }
 /// Spawns a pending-navigation task with a fresh progress channel.
 fn spawn_pending<F, Fut>(
@@ -330,8 +469,8 @@ mod tests {
             },
         )
     }
-    #[test]
-    fn cache_accessor_exposes_the_shared_block_cache() {
+    #[tokio::test]
+    async fn cache_accessor_exposes_the_shared_block_cache() {
         // the prefetcher (a later plan) reads blocks through this accessor;
         // it must see the same source the document itself reads through.
         let d = doc(b"a\nb\nc\n", 4);
@@ -640,6 +779,14 @@ mod tests {
     async fn goto_percent_zero_is_top() {
         let d = doc(b"a\nb\nc\n", 1 << 20);
         assert_eq!(d.goto_percent(0).await.unwrap().ready(), Anchor::TOP);
+    }
+    #[tokio::test]
+    async fn goto_percent_with_no_newline_above_target_is_top() {
+        // the target sits mid-line with nothing but content above it: the
+        // containing line is the first line, deterministically pinned (the
+        // property covers this class; this pins the exact branch).
+        let d = doc(b"abcdefgh", 1 << 20);
+        assert_eq!(d.goto_percent(50).await.unwrap().ready(), Anchor::TOP);
     }
     #[test]
     fn percent_offset_handles_huge_sparse_sizes() {
@@ -998,6 +1145,139 @@ mod tests {
         let last = *p.progress.borrow();
         assert!(last.scanned >= first.scanned);
     }
+    fn lined_doc(lines: u32, block_size: usize) -> Document {
+        let mut data = Vec::new();
+        for i in 0..lines {
+            data.extend_from_slice(format!("line {i:04}\n").as_bytes());
+        }
+        let src = Arc::new(MockSource::new(data));
+        Document::new(
+            src,
+            Config {
+                block_size,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        )
+    }
+    #[tokio::test]
+    async fn goto_line_one_is_top() {
+        let d = lined_doc(10, 64);
+        assert_eq!(d.goto_line(1).await.unwrap().join().await, Anchor::TOP);
+        assert_eq!(d.goto_line(0).await.unwrap().join().await, Anchor::TOP);
+    }
+    #[tokio::test]
+    async fn goto_line_lands_on_the_nth_line_start() {
+        // ten-byte lines: line n (1-based) starts at (n-1) * 10.
+        let d = lined_doc(3000, 256);
+        assert_eq!(d.goto_line(5).await.unwrap().join().await, Anchor::at(40));
+        assert_eq!(
+            d.goto_line(2000).await.unwrap().join().await,
+            Anchor::at(19990)
+        );
+    }
+    #[tokio::test]
+    async fn goto_line_past_the_end_clamps_to_the_last_line() {
+        let d = lined_doc(100, 64);
+        assert_eq!(
+            d.goto_line(1_000_000).await.unwrap().join().await,
+            Anchor::at(990)
+        );
+    }
+    #[tokio::test]
+    async fn goto_line_on_an_empty_file_is_top() {
+        let d = doc(b"", 64);
+        assert_eq!(d.goto_line(7).await.unwrap().join().await, Anchor::TOP);
+    }
+    #[tokio::test]
+    async fn goto_line_beyond_the_frontier_pends_with_progress() {
+        // 2 ms latency per block keeps the background scan comfortably
+        // behind the query, so the goto must pend on the frontier.
+        let mut data = Vec::new();
+        for i in 0..4000u32 {
+            data.extend_from_slice(format!("line {i:04}\n").as_bytes());
+        }
+        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(2)));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 256,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        match d.goto_line(3500).await.unwrap() {
+            Resolution::Pending(p) => {
+                assert_eq!(p.label, "jumping to line");
+                let a = p.handle.await.unwrap().unwrap();
+                assert_eq!(a, Anchor::at(34990));
+            }
+            Resolution::Ready(a) => panic!("expected Pending, got Ready({})", a.offset()),
+        }
+    }
+    #[tokio::test]
+    async fn goto_line_with_an_unterminated_last_line_clamps_to_it() {
+        let mut data = b"a\nb\n".to_vec();
+        data.extend_from_slice(&[b'x'; 100]);
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 64,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        assert_eq!(d.goto_line(99).await.unwrap().join().await, Anchor::at(4));
+    }
+    fn lined(pat: &'static str, lines: u32, block_size: usize) -> Document {
+        let mut data = Vec::new();
+        for _ in 0..lines {
+            data.extend_from_slice(pat.as_bytes());
+        }
+        let src = Arc::new(MockSource::new(data));
+        Document::new(
+            src,
+            Config {
+                block_size,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        )
+    }
+    #[tokio::test]
+    async fn goto_line_one_past_a_checkpoint_aligned_end_clamps() {
+        // 1024 lines of "x\n": the newline count is exactly one checkpoint
+        // interval and the file ends on that newline, so line0 1024's
+        // "start" is the at-EOF phantom candidate (ERRATUM 4a#3).
+        let d = lined("x\n", 1024, 64);
+        assert_eq!(d.goto_line(2).await.unwrap().join().await, Anchor::at(2));
+        assert_eq!(
+            d.goto_line(1025).await.unwrap().join().await,
+            Anchor::at(2046),
+            "one past the end clamps to the last real line, never EOF"
+        );
+    }
+    #[tokio::test]
+    async fn goto_line_phantom_clamp_holds_through_the_pending_path() {
+        // same shape, but the query races a slow scan so resolution goes
+        // through the pending closure's own coverage check.
+        let src = Arc::new(
+            MockSource::new(b"x\n".repeat(1024)).with_latency(std::time::Duration::from_millis(2)),
+        );
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 64,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        assert_eq!(
+            d.goto_line(1025).await.unwrap().join().await,
+            Anchor::at(2046)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1027,11 +1307,11 @@ mod props {
             pct in 0u8..=100,
             rows in 1usize..24,
         ) {
-            let doc = Document::new(
-                std::sync::Arc::new(MockSource::new(data.clone())),
-                Config { block_size, prefetch_depth: 0, ..Config::default() },
-            );
             rt().block_on(async {
+                let doc = Document::new(
+                    std::sync::Arc::new(MockSource::new(data.clone())),
+                    Config { block_size, prefetch_depth: 0, ..Config::default() },
+                );
                 let a = doc.scroll_lines(Anchor::TOP, down).await.unwrap().ready();
                 prop_assert!(is_line_start(&data, a.offset()), "down -> {}", a.offset());
                 prop_assert!(a.offset() == 0 || a.offset() < data.len() as u64);
@@ -1056,11 +1336,11 @@ mod props {
         ) {
             // all-x content has no newlines, so the budget is the only stop.
             let src = std::sync::Arc::new(MockSource::new(vec![b'x'; len]));
-            let doc = Document::new(
-                src.clone(),
-                Config { block_size, prefetch_depth: 0, ..Config::default() },
-            );
             rt().block_on(async {
+                let doc = Document::new(
+                    src.clone(),
+                    Config { block_size, prefetch_depth: 0, ..Config::default() },
+                );
                 let _ = doc.viewport(Anchor::TOP, rows, cols, HScroll::new(hscroll)).await.unwrap();
                 Ok::<(), TestCaseError>(())
             })?;
@@ -1090,15 +1370,15 @@ mod props {
             // the oracle for the whole pending machinery: a navigation that
             // pends and completes in tiny chunks must land exactly where the
             // same navigation lands when the interactive budget is unlimited.
-            let sync_doc = Document::new(
-                std::sync::Arc::new(MockSource::new(data.clone())),
-                Config { block_size, nav_scan_budget: usize::MAX, prefetch_depth: 0, ..Config::default() },
-            );
-            let tiny_doc = Document::new(
-                std::sync::Arc::new(MockSource::new(data.clone())),
-                Config { block_size, nav_scan_budget: budget, prefetch_depth: 0, ..Config::default() },
-            );
             rt().block_on(async {
+                let sync_doc = Document::new(
+                    std::sync::Arc::new(MockSource::new(data.clone())),
+                    Config { block_size, nav_scan_budget: usize::MAX, prefetch_depth: 0, ..Config::default() },
+                );
+                let tiny_doc = Document::new(
+                    std::sync::Arc::new(MockSource::new(data.clone())),
+                    Config { block_size, nav_scan_budget: budget, prefetch_depth: 0, ..Config::default() },
+                );
                 let a_sync = sync_doc.scroll_lines(Anchor::TOP, down).await.unwrap().ready();
                 let a_tiny = tiny_doc.scroll_lines(Anchor::TOP, down).await.unwrap().join().await;
                 prop_assert_eq!(a_sync, a_tiny, "scroll down diverged");
@@ -1111,6 +1391,82 @@ mod props {
                 let e_sync = sync_doc.goto_end(rows).await.unwrap().ready();
                 let e_tiny = tiny_doc.goto_end(rows).await.unwrap().join().await;
                 prop_assert_eq!(e_sync, e_tiny, "goto end diverged");
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+        #[test]
+        fn goto_line_agrees_with_a_naive_reference(
+            data in proptest::collection::vec(
+                prop_oneof![2 => Just(b'\n'), 8 => any::<u8>()],
+                0..192,
+            ),
+            block_size in 1usize..32,
+            budget in 1usize..24,
+            n in 0u64..64,
+        ) {
+            // the reference: 1-based line starts by direct scan, with the
+            // vim clamp for n past the end and TOP for an empty file.
+            let starts = {
+                let mut v = vec![];
+                if !data.is_empty() {
+                    v.push(0u64);
+                }
+                for (i, &b) in data.iter().enumerate() {
+                    if b == b'\n' && i + 1 < data.len() {
+                        v.push(i as u64 + 1);
+                    }
+                }
+                v
+            };
+            let expected = match starts.len() {
+                0 => 0,
+                len => {
+                    let line0 = (n.saturating_sub(1) as usize).min(len - 1);
+                    starts[line0]
+                }
+            };
+            rt().block_on(async {
+                // construction spawns the background index scan via
+                // tokio::spawn, so it must happen inside the runtime.
+                let doc = Document::new(
+                    std::sync::Arc::new(MockSource::new(data.clone())),
+                    Config { block_size, nav_scan_budget: budget, prefetch_depth: 0, ..Config::default() },
+                );
+                let a = doc.goto_line(n).await.unwrap().join().await;
+                prop_assert_eq!(a.offset(), expected, "line {} in {} lines", n, starts.len());
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+        #[test]
+        fn goto_line_agrees_near_checkpoint_boundaries(
+            lines in 1016u64..1033,
+            delta in -3i64..4,
+            terminated in proptest::bool::ANY,
+        ) {
+            // the checkpoint interval is 1024 lines and the general oracle's
+            // byte-capped data can never form a second checkpoint; this
+            // property sweeps the boundary neighborhood — including the
+            // exactly-aligned trailing-newline phantom shape — with cheap
+            // constructed data (no per-element strategy cost). the exact
+            // aligned point is also pinned by two deterministic tests; this
+            // net covers its neighborhood against variants.
+            let mut data = b"x\n".repeat(lines as usize);
+            if !terminated {
+                data.push(b'y');
+            }
+            let total = if terminated { lines } else { lines + 1 };
+            let n = (lines as i64 + delta).max(0) as u64;
+            let line0 = n.saturating_sub(1).min(total - 1);
+            let expected = line0 * 2;
+            rt().block_on(async {
+                // construction spawns the background index scan via
+                // tokio::spawn, so it must happen inside the runtime.
+                let doc = Document::new(
+                    std::sync::Arc::new(MockSource::new(data)),
+                    Config { block_size: 64, nav_scan_budget: 64, prefetch_depth: 0, ..Config::default() },
+                );
+                let a = doc.goto_line(n).await.unwrap().join().await;
+                prop_assert_eq!(a.offset(), expected, "line {} of {}", n, total);
                 Ok::<(), TestCaseError>(())
             })?;
         }

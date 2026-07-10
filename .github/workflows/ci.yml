@@ -13,9 +13,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # proptest seeds are random per run; more cases per property raises the odds
-  # a bad seed fires on the PR run instead of after the merge (props run in
-  # microseconds, so 16x the default 256 is still negligible).
-  PROPTEST_CASES: 4096
+  # a bad seed fires on the PR run instead of after the merge, but properties
+  # are no longer all microsecond-cheap: the heaviest, the line-index oracle,
+  # is data-volume-bound and measures ~7.5ms/case in the debug job. so the
+  # count is budgeted rather than maximized: 1024 runs that property in ~7.7s
+  # in the debug job, the debug and release jobs together still draw ~2k
+  # fresh cases per property per PR, and the committed proptest-regressions
+  # corpus replays every previously-found counterexample regardless of this
+  # setting.
+  PROPTEST_CASES: 1024
 
 jobs:
   lint:

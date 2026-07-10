@@ -31,13 +31,15 @@ has a screenful of lines. That costs a bounded number of block reads
 regardless of file size, which is what makes first paint on a 100 GiB file
 indistinguishable from a 100 KiB one.
 
-Absolute line numbers are a separate, background concern (a planned
-`LineIndex` analyzer); navigation never waits for them. Jumps that are
-naturally byte-addressed (`G`, `<count>%`) snap to a line start with a
-small local backward scan: `G` searches back from EOF for the last line
-(and further back to walk up any additional rows the screen needs); `%`
-searches back from the target byte for the start of the line that contains
-it.
+Absolute line numbers are a separate, background concern, tracked by the
+`LineIndex` analyzer (Seams for what comes next, below, has the
+mechanics). Jumps that are naturally byte-addressed (`G`, `<count>%`)
+never wait for it: they snap to a line start with a small local backward
+scan — `G` searches back from EOF for the last line (and further back to
+walk up any additional rows the screen needs); `%` searches back from the
+target byte for the start of the line that contains it. Line-number
+navigation (`goto_line`) is the index's one consumer, and its resolution
+flow is covered in that section.
 
 ## The event loop
 
@@ -117,19 +119,49 @@ which is why `0%` is intentionally not a binding.
 
 ## Seams for what comes next
 
-The architecture keeps planned features additive rather than invasive:
+The architecture keeps future work additive rather than invasive.
+Background analysis, and `goto_line` as its first consumer, is the one
+seam already filled below; the rest are still ahead:
 
 - **`BlockSource`** is the I/O trait (positioned reads, known size). The
   current implementation is a blocking `pread` pool; an io_uring backend is
   a drop-in replacement to be adopted by benchmark, not by default.
-- **Background analysis** (line index, search, syntax) is designed as
-  streaming analyzers fed by a single shared scan through the same block
-  cache, so the file is read once no matter how many analyzers run.
+- **Background analysis** has its first real analyzer. `Document::new`
+  spawns a `ScanScheduler` — construction must happen inside a tokio
+  runtime, since spawning is how the scan starts — which runs one
+  sequential pass over the file through the shared block cache, calling
+  only the cache's `warm()` path (see [block cache](block_cache.md)): it
+  fills the probationary segment but never promotes, so scanning the whole
+  file cannot evict the interactive working set. `Document` owns the
+  scheduler, so dropping a document aborts its scan — the same
+  cancel-on-drop discipline as pending navigation (see The event loop,
+  above) — and no closed document leaves a background reader running. The
+  scan feeds `LineIndex`: a sparse table of the byte offset of every
+  1024th line start (~8 MB of checkpoints indexes a billion lines),
+  publishing progress after every ingested block through a watch channel
+  (the "frontier"). One subtlety worth stating precisely: a line "start"
+  that lands exactly at EOF is a trailing newline's phantom, not a real
+  line; `goto_line` guards against ever resolving there, redirecting to
+  the line before it. Search and syntax highlighting remain future
+  analyzers meant to share this same single-shared-scan design, so the
+  file is read once no matter how many analyzers eventually run.
+- **`goto_line`** is the line index's only consumer today (not yet bound
+  to a key — `<count>G` is future keymap work), and resolves through the
+  index three ways. If the index already covers the target line, it walks
+  forward from the nearest checkpoint with a budgeted `ForwardScan` (at
+  most 1023 newlines — see [budgeted scanning](budgeted_scanning.md)):
+  Ready if the walk finishes in budget, Pending on that same walk if not.
+  If the scan has finished and the line does not exist, it clamps to the
+  last real line, vim-style. Otherwise — the target is past what the scan
+  has covered so far, and the scan is still running — it pends on the
+  frontier, reporting the scan's own progress as the bar until coverage
+  catches up, then walks as above.
 - **Pending navigation** exists: `Resolution { Ready, Pending }` is how
   every navigation result is expressed today, and budget-exhausted jumps
   continue as cancellable background scans with live progress (see
   [budgeted scanning](budgeted_scanning.md)). A planned `Exhausted` variant
-  — for "no such answer", e.g. a go-to-line beyond the file — would arrive
-  with the line index once that feature lands. Making *reads themselves*
+  — for "no such answer" — has no consumer yet: `goto_line` clamps rather
+  than failing, so search's "pattern not found" is expected to be the
+  variant's first real use once search lands. Making *reads themselves*
   pending (a cold viewport block on a wedged mount still holds the loop) is
   the remaining step.

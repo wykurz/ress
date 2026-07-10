@@ -114,8 +114,19 @@ impl BlockCache {
         loop {
             let (fetch_tx, mut wait_rx) = {
                 let mut st = self.state.lock().unwrap();
-                if let Some(b) = st.protected.get(&idx) {
-                    return Ok(b.clone());
+                // consumer-truthful promotion (see the module doc) extends to
+                // protected recency, not just the promotion decision: a
+                // non-promoting caller (warm(): prefetch, the background
+                // index scan) touching an already-protected block is still
+                // machinery, not a real re-reference, so it must peek rather
+                // than refresh the block to most-recently-used.
+                let hit = if promote {
+                    st.protected.get(&idx).cloned()
+                } else {
+                    st.protected.peek(&idx).cloned()
+                };
+                if let Some(b) = hit {
+                    return Ok(b);
                 }
                 if promote {
                     if let Some(b) = Self::promote_entry(&mut st, idx) {
@@ -228,6 +239,23 @@ impl BlockCache {
     #[cfg(test)]
     pub(crate) fn in_flight_len(&self) -> usize {
         self.state.lock().unwrap().in_flight.len()
+    }
+    /// Test-only view of the protected segment's population.
+    #[cfg(test)]
+    pub(crate) fn protected_len(&self) -> usize {
+        self.state.lock().unwrap().protected.len()
+    }
+    /// Test-only view of the protected segment's key order, most-recently-used
+    /// first (`lru::LruCache::iter`'s order).
+    #[cfg(test)]
+    pub(crate) fn protected_keys(&self) -> Vec<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .protected
+            .iter()
+            .map(|(&k, _)| k)
+            .collect()
     }
 }
 

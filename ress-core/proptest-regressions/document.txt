@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 83aefeda7378aef2f043e8afe74b6938f4b05d227fb168f6eba26e27efff65f4 # shrinks to data = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 0, 0, 0, 0, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10], block_size = 1, budget = 1, down = 1, up = 1, pct = 73, rows = 1
+cc bb12e94071e067b045217825fb3d2c58003f006d2f88312b55de4cf6ab9c34f4 # shrinks to lines = 1024, delta = 1, terminated = true

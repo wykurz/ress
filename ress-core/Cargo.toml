@@ -10,6 +10,7 @@ anyhow.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 lru.workspace = true
+memchr = "2.7"
 tokio = { workspace = true, features = ["rt", "time", "sync"] }
 tracing.workspace = true
 unicode-width.workspace = true

@@ -1423,12 +1423,14 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "libc",
  "ratatui",
  "ress-core",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -1439,6 +1441,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "lru 0.12.5",
+ "memchr",
  "proptest",
  "tempfile",
  "tokio",
