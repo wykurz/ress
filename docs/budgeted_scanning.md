@@ -87,6 +87,25 @@ the rows above the tail) computes and publishes each stage's percentage
 against that stage's own span, so the indicator is not one continuous climb
 across the whole operation — each stage reads relative to itself.
 
+## Line index lookups reuse `ForwardScan`
+
+The background line index stores one checkpoint every 1024 lines, not
+every line, so resolving a line number to a byte offset means walking
+forward from the nearest checkpoint. That walk is the same `ForwardScan`
+used by navigation — constructed with the checkpoint's byte offset as
+`from` and the remaining line count (at most 1023) as `n` — so it gets the
+same budget discipline and pending machinery for free: an interactive
+query either finishes within budget or becomes the pending continuation of
+that exact scan, stepped further in the background with published
+progress.
+
+Checkpoint offsets are values the index computed mid-scan, not positions
+re-derived from the current file on every use. `ForwardScan::step` clamps
+its cursor and origin to the file size at the start of every step
+regardless of what the caller already checked, so a checkpoint offset that
+lands out of contract degrades into an in-file answer instead of scanning
+past EOF.
+
 ## Layout is budgeted too
 
 The same philosophy applies one layer up: `layout_row` (tab expansion,

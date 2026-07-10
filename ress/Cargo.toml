@@ -18,5 +18,9 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 
+[dev-dependencies]
+wait-timeout = "0.2"
+libc = "0.2"
+
 [lints]
 workspace = true

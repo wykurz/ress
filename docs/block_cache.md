@@ -2,8 +2,10 @@
 
 Every byte the engine reads flows through one shared `BlockCache`
 (`ress-core/src/cache.rs`). The viewport, navigation scans, prefetch, and
-future background analyzers all read the same fixed-size, block-aligned
-`Bytes` — so a block fetched for any reason serves every consumer.
+the background line-index scan all read the same fixed-size,
+block-aligned `Bytes` — so a block fetched for any reason serves every
+consumer. Future analyzers (search, syntax highlighting) are designed to
+share the same path.
 
 ## Shape
 
@@ -27,15 +29,16 @@ The cache is split into two LRU segments:
   Overflow from protected demotes back into probationary rather than
   evicting outright.
 
-A one-pass streaming scan (a future background indexer, or simply paging
-through a file once) touches each block once, so its blocks live and die in
-probation and can never evict the **promoted** working set — the blocks a
-consumer has actually come back to. First-touch interactive blocks compete
-in probation like everything else until their second touch; that window is
-the price of scan resistance, kept small by promotion happening on the very
-next real reference. ARC was considered and rejected — historically
-patent-encumbered, a poor fit for an MIT tool — and SLRU delivers the
-property that matters here with two plain LRUs.
+A one-pass streaming scan (the background line-index scan, or simply
+paging through a file once) touches each block once, so its blocks live
+and die in probation and can never evict the **promoted** working set —
+the blocks a consumer has actually come back to. First-touch interactive
+blocks compete in probation like everything else until their second
+touch; that window is the price of scan resistance, kept small by
+promotion happening on the very next real reference. ARC was considered
+and rejected — historically patent-encumbered, a poor fit for an MIT
+tool — and SLRU delivers the property that matters here with two plain
+LRUs.
 
 ### Promotion is consumer-truthful
 
@@ -43,10 +46,12 @@ property that matters here with two plain LRUs.
 machinery:
 
 - Interactive reads use `block()`, which promotes on a probationary hit.
-- Prefetch uses `warm()`, which fills but **never promotes**. Without this
-  split, redraws and the natural overlap of successive prefetch windows
-  would re-touch probationary blocks and push never-viewed data into the
-  protected segment, evicting what the user is actually looking at.
+- Prefetch and the background line-index scan both use `warm()`, which
+  fills but **never promotes** or refreshes an already-protected block's
+  recency. Without this split, redraws, the natural overlap of successive
+  prefetch windows, and a full-file index pass would all re-touch
+  probationary blocks and push never-viewed data into the protected
+  segment, evicting what the user is actually looking at.
 - The outcome must not depend on race timing: an interactive read that
   coalesces with an in-flight prefetch fill promotes just like one that
   arrives after the fill — including when churn evicts the entry in the

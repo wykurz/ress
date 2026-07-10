@@ -25,6 +25,8 @@ pub enum FwdStep {
 /// leaves the object, so a pending continuation is the same value as the
 /// interactive attempt — there is no cursor handoff to get wrong. Behavior
 /// after a terminal outcome (`Found`/`Eof`) is unspecified; callers stop.
+/// For an out-of-contract origin past EOF, terminal anchors clamp to the
+/// file size — in-file, though not a line start.
 pub struct ForwardScan {
     origin: u64,
     pos: u64,
@@ -55,10 +57,15 @@ impl ForwardScan {
     /// never reporting a start at or past EOF (an EOF-adjacent trailing
     /// newline terminates the scan instead).
     pub async fn step(&mut self, cache: &crate::cache::BlockCache) -> anyhow::Result<FwdStep> {
+        let size = cache.size();
+        // a computed position past EOF could otherwise echo back through
+        // a terminal anchor (the n == 0 Found or the Eof clamp); degrade to
+        // the real bytes, mirroring BackwardScan's out-of-range philosophy.
+        self.pos = self.pos.min(size);
+        self.origin = self.origin.min(size);
         if self.needed == 0 {
             return Ok(FwdStep::Found(self.pos));
         }
-        let size = cache.size();
         let bs = cache.block_size() as u64;
         let mut spent = 0usize;
         while self.pos < size && spent < self.chunk {
@@ -426,6 +433,30 @@ mod tests {
         let got = s.complete(&c, tx, 1026).await.unwrap();
         assert_eq!(got, 1025);
         assert!(rx.borrow().scanned > 0, "progress published per chunk");
+    }
+    #[tokio::test]
+    async fn forward_scan_out_of_range_origin_stays_in_file() {
+        // a computed origin past EOF must terminate AND clamp inside the
+        // file, mirroring BackwardScan's philosophy: contract-violating
+        // input degrades to the real bytes, never to an out-of-range anchor.
+        let c = cache(b"a\nb\n", 4);
+        let mut s = ForwardScan::new(64, 1, 1 << 10);
+        match s.step(&c).await.unwrap() {
+            FwdStep::Eof(clamp) => assert_eq!(clamp, 4, "clamped to size, not the garbage origin"),
+            other => panic!("expected Eof, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn forward_scan_zero_n_with_an_out_of_range_origin_is_clamped() {
+        // the n == 0 fast path returns the origin without touching the
+        // cache; it must still be bounded — an exact checkpoint hit is a
+        // plausible way for computed offsets to construct exactly this.
+        let c = cache(b"a\nb\n", 4);
+        let mut s = ForwardScan::new(64, 0, 1 << 10);
+        match s.step(&c).await.unwrap() {
+            FwdStep::Found(start) => assert_eq!(start, 4, "clamped into the file"),
+            other => panic!("expected Found, got {other:?}"),
+        }
     }
     #[tokio::test]
     async fn backward_scan_finds_nth_newline() {
