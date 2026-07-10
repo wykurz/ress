@@ -24,6 +24,19 @@ pub enum Nav {
     Percent(u8),
     Horizontal(i64),
 }
+/// A live pending navigation and the intent that produced it. Dropping it
+/// cancels the background scan, so every exit from the run loop — quit,
+/// stream end, supersession, and every error `?` — aborts the task instead
+/// of detaching it (aborted fetches clean up after themselves in the cache).
+struct ActiveNav {
+    nav: Nav,
+    p: PendingNav,
+}
+impl Drop for ActiveNav {
+    fn drop(&mut self) {
+        self.p.cancel();
+    }
+}
 /// Pager state: the byte anchor of the top line, the horizontal column offset,
 /// and the in-progress count prefix / `g` chord.
 pub struct App {
@@ -159,13 +172,12 @@ async fn draw(
 async fn apply_nav(
     doc: &Document,
     app: &mut App,
-    pending: &mut Option<(Nav, PendingNav)>,
+    pending: &mut Option<ActiveNav>,
     nav: Nav,
     rows: u16,
 ) -> anyhow::Result<()> {
-    if let Some((_, p)) = pending.take() {
-        p.cancel();
-    }
+    // dropping the previous slot cancels its scan.
+    *pending = None;
     let page = rows.max(1) as i64;
     let resolution = match nav {
         Nav::Lines(n) => Some(doc.scroll_lines(app.top, n).await?),
@@ -187,8 +199,24 @@ async fn apply_nav(
     };
     match resolution {
         Some(Resolution::Ready(a)) => app.top = a,
-        Some(Resolution::Pending(p)) => *pending = Some((nav, p)),
+        Some(Resolution::Pending(p)) => *pending = Some(ActiveNav { nav, p }),
         None => {}
+    }
+    Ok(())
+}
+/// Restarts any pending operation against the new height: row-dependent
+/// jumps (G) captured the old one, and restarting the rest from the unmoved
+/// anchor is harmless and simpler than classifying.
+async fn handle_resize(
+    doc: &Document,
+    app: &mut App,
+    pending: &mut Option<ActiveNav>,
+    rows: u16,
+) -> anyhow::Result<()> {
+    if let Some(active) = pending.take() {
+        let nav = active.nav;
+        drop(active);
+        apply_nav(doc, app, pending, nav, rows).await?;
     }
     Ok(())
 }
@@ -198,13 +226,13 @@ async fn apply_nav(
 pub async fn run(doc: Document) -> anyhow::Result<()> {
     let mut term = crate::terminal::Term::new()?;
     let mut app = App::new();
-    let mut pending: Option<(Nav, PendingNav)> = None;
+    let mut pending: Option<ActiveNav> = None;
     let (mut cols, mut rows) = crossterm::terminal::size()?;
     draw(
         &mut term,
         &doc,
         &app,
-        pending.as_ref().map(|(_, p)| p),
+        pending.as_ref().map(|a| &a.p),
         cols,
         rows,
     )
@@ -214,7 +242,7 @@ pub async fn run(doc: Document) -> anyhow::Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            done = async { (&mut pending.as_mut().unwrap().1.handle).await }, if pending.is_some() => {
+            done = async { (&mut pending.as_mut().unwrap().p.handle).await }, if pending.is_some() => {
                 pending = None;
                 // an aborted or failed scan leaves the anchor where it was;
                 // failures are logged so they stay diagnosable even before
@@ -225,42 +253,34 @@ pub async fn run(doc: Document) -> anyhow::Result<()> {
                     Err(e) if e.is_cancelled() => {}
                     Err(e) => tracing::warn!("background scan panicked: {e:?}"),
                 }
-                draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
             }
             _ = tick.tick(), if pending.is_some() => {
-                draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
             }
             ev = events.next() => {
                 let Some(ev) = ev else {
-                    // the input stream ended: cancel any live scan before
-                    // leaving the loop.
-                    if let Some((_, p)) = pending.take() {
-                        p.cancel();
-                    }
+                    // dropping the slot cancels any live scan.
+                    pending.take();
                     break;
                 };
-                // error returns via `?` below can still drop a live pending
-                // scan without cancelling it; the detached task is bounded by
-                // the runtime's shutdown timeout in main.
+                // any `?` from here unwinds through `pending`, whose drop
+                // cancels a live scan.
                 match ev? {
                     Event::Key(key) => match app.handle_key(key) {
                         Action::Quit => {
-                            if let Some((_, p)) = pending.take() {
-                                p.cancel();
-                            }
+                            pending.take();
                             break;
                         }
                         Action::Nav(nav) => {
                             apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
-                            draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
                         }
                         Action::Cancel => {
-                            if let Some((_, p)) = pending.take() {
-                                p.cancel();
-                            }
-                            draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                            pending = None;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
                         }
-                        Action::Redraw => draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?,
+                        Action::Redraw => draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?,
                         Action::None => {}
                     },
                     Event::Mouse(m) => {
@@ -271,21 +291,14 @@ pub async fn run(doc: Document) -> anyhow::Result<()> {
                         };
                         if let Some(nav) = nav {
                             apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
-                            draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
                         }
                     }
                     Event::Resize(c, r) => {
                         cols = c;
                         rows = r;
-                        // any pending operation restarts against the new
-                        // dimensions: row-dependent jumps (G) captured the old
-                        // height, and restarting the rest from the unmoved
-                        // anchor is harmless and simpler than classifying.
-                        if let Some((nav, p)) = pending.take() {
-                            p.cancel();
-                            apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
-                        }
-                        draw(&mut term, &doc, &app, pending.as_ref().map(|(_, p)| p), cols, rows).await?;
+                        handle_resize(&doc, &mut app, &mut pending, rows).await?;
+                        draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
                     }
                     _ => {}
                 }
@@ -522,7 +535,13 @@ mod tests {
             .unwrap();
         assert!(pending.is_some(), "expected the percent jump to pend");
         assert!(
-            matches!(pending, Some((Nav::Percent(90), _))),
+            matches!(
+                pending,
+                Some(ActiveNav {
+                    nav: Nav::Percent(90),
+                    ..
+                })
+            ),
             "slot must carry the originating intent"
         );
         assert_eq!(app.top, Anchor::TOP, "anchor must not move while pending");
@@ -534,5 +553,86 @@ mod tests {
             "new motion must supersede the pending op"
         );
         assert_eq!(app.top.offset(), 2);
+    }
+    fn sparse_doc() -> Document {
+        // 100 short lines then a giant unterminated tail; tiny budget so
+        // row-dependent jumps pend.
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(b"y\n");
+        }
+        data.extend_from_slice(&[b'x'; 8192]);
+        let src = std::sync::Arc::new(ress_core::source::MockSource::new(data));
+        Document::new(
+            src,
+            ress_core::Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..ress_core::Config::default()
+            },
+        )
+    }
+    #[tokio::test]
+    async fn handle_resize_restarts_the_pending_intent_against_new_rows() {
+        // Bottom captured rows=10 when it pended; a resize to 3 rows must
+        // cancel and re-dispatch the SAME intent so the answer reflects the
+        // new height (goto_end(3) here: tail start 200, two lines up = 196).
+        let doc = sparse_doc();
+        let mut app = App::new();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Bottom, 10)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending,
+            Some(ActiveNav {
+                nav: Nav::Bottom,
+                ..
+            })
+        ));
+        handle_resize(&doc, &mut app, &mut pending, 3)
+            .await
+            .unwrap();
+        let mut active = pending.take().expect("resize must re-pend the same intent");
+        assert!(matches!(active.nav, Nav::Bottom));
+        let a = (&mut active.p.handle).await.unwrap().unwrap();
+        assert_eq!(a.offset(), 196);
+    }
+    #[tokio::test]
+    async fn dropping_the_pending_slot_aborts_the_scan() {
+        // the run loop's error-`?` paths rely on drop, not explicit cancel;
+        // once the task is aborted its progress sender is destroyed.
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(b"y\n");
+        }
+        data.extend_from_slice(&[b'x'; 8192]);
+        let src = std::sync::Arc::new(
+            ress_core::source::MockSource::new(data)
+                .with_latency(std::time::Duration::from_millis(2)),
+        );
+        let doc = Document::new(
+            src,
+            ress_core::Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..ress_core::Config::default()
+            },
+        );
+        let mut app = App::new();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Percent(90), 10)
+            .await
+            .unwrap();
+        let active = pending.take().expect("expected the percent jump to pend");
+        let mut rx = active.p.progress.clone();
+        drop(active);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while rx.changed().await.is_ok() {}
+        })
+        .await
+        .expect("scan task outlived its drop guard");
     }
 }

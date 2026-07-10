@@ -48,7 +48,7 @@ the philosophy). Counts prefix motions: `12j` moves twelve lines.
 | `Ctrl-f` / `Space` / `PgDn` | full page down |
 | `Ctrl-b` / `PgUp` | full page up |
 | `gg` / `ge` / `G` | top / end of file (`ge` and `G` are aliases) |
-| `<count>%` | jump to percentage of the file |
+| `<count>%` | jump to the line containing the byte at that percentage |
 | `h` / `l` / `←` / `→` | horizontal scroll (long lines are chopped) |
 | mouse wheel | scroll three lines |
 | `Ctrl-l` | force redraw |

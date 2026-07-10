@@ -156,80 +156,45 @@ impl Document {
             }
         }
     }
-    /// Finds the start of the `n`-th line after `start`, clamped at the furthest
-    /// line start the budgeted scan saw (EOF or budget — never past EOF); a
-    /// budget outcome continues as a pending background scan.
+    /// Finds the start of the `n`-th line after `start`, clamped at the last
+    /// real line start when EOF arrives first; a budget outcome continues as
+    /// a pending background scan of the same scan object.
     async fn scroll_down(&self, start: u64, n: usize) -> anyhow::Result<Resolution> {
-        // a zero budget would make pending chunks spin without forward
-        // progress; one byte is the smallest honest chunk.
-        let budget = self.config.nav_scan_budget.max(1);
-        match crate::scan::nth_line_start_after(self.cache(), start, n, budget).await? {
-            crate::scan::Forward::Found { start } => Ok(Resolution::Ready(Anchor(start))),
-            crate::scan::Forward::Eof { last_start } => Ok(Resolution::Ready(Anchor(last_start))),
-            crate::scan::Forward::Budget {
-                last_start,
-                resume,
-                found,
-            } => {
+        let mut scan = crate::scan::ForwardScan::new(start, n, self.config.nav_scan_budget);
+        match scan.step(self.cache()).await? {
+            crate::scan::FwdStep::Found(s) => Ok(Resolution::Ready(Anchor(s))),
+            crate::scan::FwdStep::Eof(clamp) => Ok(Resolution::Ready(Anchor(clamp))),
+            crate::scan::FwdStep::More => {
                 let cache = self.cache.clone();
                 let span = self.size - start;
-                let scanned = resume - start;
                 Ok(Resolution::Pending(spawn_pending(
                     "scrolling",
                     span,
-                    scanned,
-                    move |tx| async move {
-                        let s = forward_to_completion(
-                            cache,
-                            resume,
-                            last_start,
-                            n - found,
-                            budget,
-                            tx,
-                            crate::resolve::Progress { scanned, span },
-                        )
-                        .await?;
-                        Ok(Anchor(s))
-                    },
+                    scan.scanned(),
+                    move |tx| async move { scan.complete(&cache, tx, span).await.map(Anchor) },
                 )))
             }
         }
     }
     /// Finds the start of the `n`-th line before `start`, clamped at 0; a
-    /// budget outcome continues as a pending background scan to the true
-    /// target instead of staying put.
+    /// budget outcome continues as a pending background scan of the same
+    /// scan object.
     async fn scroll_up(&self, start: u64, n: usize) -> anyhow::Result<Resolution> {
         if start == 0 || n == 0 {
             return Ok(Resolution::Ready(Anchor(start)));
         }
-        let budget = self.config.nav_scan_budget.max(1);
-        match crate::scan::nth_newline_before(self.cache(), start, n, budget).await? {
-            crate::scan::Backward::Found { start: s } => Ok(Resolution::Ready(Anchor(s))),
-            crate::scan::Backward::Top => Ok(Resolution::Ready(Anchor::TOP)),
-            crate::scan::Backward::Budget { resume, found } => {
+        let mut scan = crate::scan::BackwardScan::new(start, n, self.config.nav_scan_budget);
+        match scan.step(self.cache()).await? {
+            crate::scan::BwdStep::Found(s) => Ok(Resolution::Ready(Anchor(s))),
+            crate::scan::BwdStep::Top => Ok(Resolution::Ready(Anchor::TOP)),
+            crate::scan::BwdStep::More => {
                 let cache = self.cache.clone();
                 let span = start;
-                let scanned = start - resume;
                 Ok(Resolution::Pending(spawn_pending(
                     "scrolling",
                     span,
-                    scanned,
-                    move |tx| async move {
-                        match backward_to_completion(
-                            cache,
-                            resume,
-                            n - found,
-                            budget,
-                            tx,
-                            span,
-                            scanned,
-                        )
-                        .await?
-                        {
-                            Some(s) => Ok(Anchor(s)),
-                            None => Ok(Anchor::TOP),
-                        }
-                    },
+                    scan.scanned(),
+                    move |tx| async move { scan.complete(&cache, tx, span).await.map(Anchor) },
                 )))
             }
         }
@@ -245,10 +210,11 @@ impl Document {
         if self.size == 0 {
             return Ok(Resolution::Ready(Anchor::TOP));
         }
-        let budget = self.config.nav_scan_budget.max(1);
+        let budget = self.config.nav_scan_budget;
         let up = rows.saturating_sub(1);
-        match crate::scan::nth_newline_before(self.cache(), self.size, 1, budget).await? {
-            crate::scan::Backward::Found { start: last } => match self.scroll_up(last, up).await? {
+        let mut scan = crate::scan::BackwardScan::new(self.size, 1, budget);
+        match scan.step(self.cache()).await? {
+            crate::scan::BwdStep::Found(last) => match self.scroll_up(last, up).await? {
                 Resolution::Ready(a) => Ok(Resolution::Ready(a)),
                 Resolution::Pending(mut p) => {
                     // the user asked to jump to the end, not to scroll.
@@ -256,49 +222,37 @@ impl Document {
                     Ok(Resolution::Pending(p))
                 }
             },
-            crate::scan::Backward::Top => Ok(Resolution::Ready(Anchor::TOP)),
-            crate::scan::Backward::Budget { resume, found } => {
+            crate::scan::BwdStep::Top => Ok(Resolution::Ready(Anchor::TOP)),
+            crate::scan::BwdStep::More => {
                 let cache = self.cache.clone();
                 let span = self.size;
-                let scanned = self.size - resume;
                 Ok(Resolution::Pending(spawn_pending(
                     "jumping to end",
                     span,
-                    scanned,
+                    scan.scanned(),
                     move |tx| async move {
-                        let last = match backward_to_completion(
-                            cache.clone(),
-                            resume,
-                            1 - found,
-                            budget,
-                            tx.clone(),
-                            span,
-                            scanned,
-                        )
-                        .await?
-                        {
-                            Some(s) => s,
-                            None => return Ok(Anchor::TOP),
-                        };
+                        let last = scan.complete(&cache, tx.clone(), span).await?;
                         if up == 0 {
+                            // `BackwardScan::new(last, 0, ..)` would resolve
+                            // Top (anchor 0); the tail line itself is the
+                            // answer here, so guard before constructing.
                             return Ok(Anchor(last));
                         }
-                        // walking up from line start `last` searches [0, last-1): the
-                        // byte at last-1 is the newline that made `last` a line start.
-                        match backward_to_completion(cache, last - 1, up, budget, tx, span, span)
-                            .await?
-                        {
-                            Some(s) => Ok(Anchor(s)),
-                            None => Ok(Anchor::TOP),
-                        }
+                        let walk = crate::scan::BackwardScan::new(last, up, budget);
+                        // the walk-up is its own phase with its own honest
+                        // span; inheriting the first phase's span pinned the
+                        // progress row at 99% for the whole walk.
+                        let span2 = walk.remaining_bytes();
+                        walk.complete(&cache, tx, span2).await.map(Anchor)
                     },
                 )))
             }
         }
     }
-    /// Jumps `pct`% through the file by byte, snapped to a line start;
-    /// a snap that cannot resolve within the interactive budget continues as
-    /// a pending background scan to the line containing the target.
+    /// Jumps `pct`% through the file by byte, landing on the start of the
+    /// line containing the target byte (less-style, so the destination never
+    /// depends on the scan budget); a snap that cannot resolve within the
+    /// interactive budget continues as a pending background scan.
     pub async fn goto_percent(&self, pct: u8) -> anyhow::Result<Resolution> {
         let pct = pct.min(100) as u64;
         if self.size == 0 || pct == 0 {
@@ -311,132 +265,28 @@ impl Document {
         if target == 0 {
             return Ok(Resolution::Ready(Anchor::TOP));
         }
-        let budget = self.config.nav_scan_budget.max(1);
+        let budget = self.config.nav_scan_budget;
         let bs = self.cache.block_size() as u64;
         let prev = self.cache.block((target - 1) / bs).await?;
         let rel = ((target - 1) % bs) as usize;
         if prev.get(rel) == Some(&b'\n') {
             return Ok(Resolution::Ready(Anchor(target)));
         }
-        // no line start at-or-after within reach means the answer is the line
-        // containing the target: snap backward, pending past the budget.
-        match crate::scan::nth_line_start_after(self.cache(), target, 1, budget).await? {
-            crate::scan::Forward::Found { start } => return Ok(Resolution::Ready(Anchor(start))),
-            crate::scan::Forward::Eof { .. } | crate::scan::Forward::Budget { .. } => {}
-        }
-        match crate::scan::nth_newline_before(self.cache(), target, 1, budget).await? {
-            crate::scan::Backward::Found { start } => Ok(Resolution::Ready(Anchor(start))),
-            crate::scan::Backward::Top => Ok(Resolution::Ready(Anchor::TOP)),
-            crate::scan::Backward::Budget { resume, found } => {
+        // the answer is the line containing the target byte: search backward
+        // for the newline that starts that line, pending past the budget.
+        let mut snap = crate::scan::BackwardScan::new(target, 1, budget);
+        match snap.step(self.cache()).await? {
+            crate::scan::BwdStep::Found(start) => Ok(Resolution::Ready(Anchor(start))),
+            crate::scan::BwdStep::Top => Ok(Resolution::Ready(Anchor::TOP)),
+            crate::scan::BwdStep::More => {
                 let cache = self.cache.clone();
                 let span = target;
-                let scanned = target - resume;
                 Ok(Resolution::Pending(spawn_pending(
                     "percent jump",
                     span,
-                    scanned,
-                    move |tx| async move {
-                        match backward_to_completion(
-                            cache,
-                            resume,
-                            1 - found,
-                            budget,
-                            tx,
-                            span,
-                            scanned,
-                        )
-                        .await?
-                        {
-                            Some(s) => Ok(Anchor(s)),
-                            None => Ok(Anchor::TOP),
-                        }
-                    },
+                    snap.scanned(),
+                    move |tx| async move { snap.complete(&cache, tx, span).await.map(Anchor) },
                 )))
-            }
-        }
-    }
-}
-/// Runs a backward newline search to completion in budget-sized chunks,
-/// publishing progress after each. `bound` is the exclusive upper end of the
-/// not-yet-searched region: the scan covers all of `[0, bound)`, including
-/// the boundary byte a fresh `nth_newline_before` entry call would skip.
-async fn backward_to_completion(
-    cache: Arc<crate::cache::BlockCache>,
-    bound: u64,
-    n: usize,
-    chunk: usize,
-    tx: tokio::sync::watch::Sender<crate::resolve::Progress>,
-    span: u64,
-    already_scanned: u64,
-) -> anyhow::Result<Option<u64>> {
-    let mut bound = bound;
-    let mut remaining = n;
-    let mut scanned = already_scanned;
-    loop {
-        // `nth_newline_before(pos)` searches `[0, pos - 1)`, so `bound + 1`
-        // covers `[0, bound)` exactly; `bound` is always < size, so the
-        // increment cannot overflow.
-        match crate::scan::nth_newline_before(&cache, bound + 1, remaining, chunk).await? {
-            crate::scan::Backward::Found { start } => return Ok(Some(start)),
-            crate::scan::Backward::Top => return Ok(None),
-            crate::scan::Backward::Budget { resume, found } => {
-                scanned += bound - resume;
-                remaining -= found;
-                bound = resume;
-                let _ = tx.send(crate::resolve::Progress { scanned, span });
-                // a hot cache can serve whole chunks without ever yielding;
-                // give aborts a guaranteed point to take effect between chunks.
-                tokio::task::yield_now().await;
-            }
-        }
-    }
-}
-/// Forward twin of `backward_to_completion`; resolves to the n-th line start
-/// after `from`, clamped at the last verified line start when EOF arrives
-/// first. `last_known` seeds that clamp; a chunk's `last_start` is trusted
-/// only when it advanced past the chunk's entry cursor, which is exactly
-/// when the chunk saw a real newline (otherwise it is the mid-line cursor).
-async fn forward_to_completion(
-    cache: Arc<crate::cache::BlockCache>,
-    from: u64,
-    last_known: u64,
-    n: usize,
-    chunk: usize,
-    tx: tokio::sync::watch::Sender<crate::resolve::Progress>,
-    initial: crate::resolve::Progress,
-) -> anyhow::Result<u64> {
-    let span = initial.span;
-    let mut resume = from;
-    let mut remaining = n;
-    let mut last = last_known;
-    let mut scanned = initial.scanned;
-    // resuming mid-line is sound: the scanner only counts newlines at or
-    // after `resume`, and every byte before it was scanned by prior chunks.
-    loop {
-        match crate::scan::nth_line_start_after(&cache, resume, remaining, chunk).await? {
-            crate::scan::Forward::Found { start } => return Ok(start),
-            crate::scan::Forward::Eof { last_start } => {
-                return Ok(if last_start > resume {
-                    last_start
-                } else {
-                    last
-                });
-            }
-            crate::scan::Forward::Budget {
-                last_start,
-                resume: r,
-                found,
-            } => {
-                if last_start > resume {
-                    last = last_start;
-                }
-                scanned += r - resume;
-                remaining -= found;
-                resume = r;
-                let _ = tx.send(crate::resolve::Progress { scanned, span });
-                // a hot cache can serve whole chunks without ever yielding;
-                // give aborts a guaranteed point to take effect between chunks.
-                tokio::task::yield_now().await;
             }
         }
     }
@@ -779,11 +629,12 @@ mod tests {
         assert_eq!(a, Anchor(4));
     }
     #[tokio::test]
-    async fn goto_percent_rounds_up_to_next_line() {
-        // 37% of 8 bytes = offset 2 (the '\n' after "aa"); snap forward to 'b' at 3.
+    async fn goto_percent_lands_on_the_containing_line() {
+        // 37% of 8 bytes = offset 2, the '\n' terminating "aa": that byte
+        // belongs to the "aa" line, so the jump lands on its start.
         let d = doc(b"aa\nb\ncc\n", 1 << 20);
         let a = d.goto_percent(37).await.unwrap().ready();
-        assert_eq!(a, Anchor(3));
+        assert_eq!(a, Anchor::TOP);
     }
     #[tokio::test]
     async fn goto_percent_zero_is_top() {
@@ -811,16 +662,16 @@ mod tests {
     }
     #[tokio::test]
     async fn goto_percent_on_trailing_newline_clamps_to_last_line() {
-        // a\nb\n size 4; 75% -> byte 3 (the trailing '\n'); snapping forward would
-        // reach EOF (a blank screen), so it must clamp to the last content line.
+        // a\nb\n size 4; 75% -> byte 3, the trailing '\n' itself: that byte
+        // belongs to the "b" line, so the jump lands on its start, byte 2.
         let d = doc(b"a\nb\n", 1 << 20);
         let a = d.goto_percent(75).await.unwrap().ready();
         assert_eq!(a, Anchor(2));
     }
     #[tokio::test]
     async fn budgeted_percent_jump_lands_in_the_target_line() {
-        // the next newline after the percent target is beyond the budget; snap
-        // backward to the line containing the target instead of seeking EOF.
+        // the target byte sits inside the second (10000-byte) line; the jump
+        // lands on that line's start, well within the 256-byte backward budget.
         let mut data = vec![b'a'; 10000];
         data.push(b'\n');
         data.extend_from_slice(&[b'b'; 10000]);
@@ -837,6 +688,24 @@ mod tests {
             },
         );
         assert_eq!(d.goto_percent(51).await.unwrap().ready(), Anchor(10001));
+    }
+    #[tokio::test]
+    async fn goto_percent_is_budget_independent() {
+        // the oracle's minimal divergence case: round-up-within-budget used
+        // to send an unlimited budget to 7 and budget=1 to 4 (ERRATUM 3c#4).
+        for budget in [1usize, 1 << 20] {
+            let src = Arc::new(MockSource::new(bytes::Bytes::from_static(b"\n\na\nbc\nd")));
+            let d = Document::new(
+                src,
+                Config {
+                    block_size: 1,
+                    nav_scan_budget: budget,
+                    prefetch_depth: 0,
+                    ..Config::default()
+                },
+            );
+            assert_eq!(d.goto_percent(63).await.unwrap().join().await, Anchor(4));
+        }
     }
     #[tokio::test]
     async fn percent_into_a_long_final_line_snaps_to_its_start() {
@@ -1046,6 +915,34 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn goto_end_of_one_row_pends_to_the_tail_line() {
+        // rows == 1 makes up == 0: the walk-up must be skipped entirely —
+        // constructing a zero-count BackwardScan would resolve Top and
+        // silently send "go to end" to the very top of the file.
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(b"y\n");
+        }
+        data.extend_from_slice(&[b'x'; 8192]);
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        match d.goto_end(1).await.unwrap() {
+            Resolution::Pending(p) => {
+                let a = p.handle.await.unwrap().unwrap();
+                assert_eq!(a, Anchor(200), "the giant tail's start, never TOP");
+            }
+            Resolution::Ready(a) => panic!("expected Pending, got Ready({})", a.offset()),
+        }
+    }
+    #[tokio::test]
     async fn cancelled_pending_nav_leaves_the_engine_healthy() {
         let src = Arc::new(
             MockSource::new({
@@ -1176,6 +1073,46 @@ mod props {
                 block_size,
                 budget
             );
+        }
+        #[test]
+        fn pending_and_sync_navigation_agree(
+            data in proptest::collection::vec(
+                prop_oneof![2 => Just(b'\n'), 8 => any::<u8>()],
+                0..160,
+            ),
+            block_size in 1usize..32,
+            budget in 1usize..24,
+            down in 1i64..40,
+            up in 1i64..40,
+            pct in 0u8..=100,
+            rows in 1usize..10,
+        ) {
+            // the oracle for the whole pending machinery: a navigation that
+            // pends and completes in tiny chunks must land exactly where the
+            // same navigation lands when the interactive budget is unlimited.
+            let sync_doc = Document::new(
+                std::sync::Arc::new(MockSource::new(data.clone())),
+                Config { block_size, nav_scan_budget: usize::MAX, prefetch_depth: 0, ..Config::default() },
+            );
+            let tiny_doc = Document::new(
+                std::sync::Arc::new(MockSource::new(data.clone())),
+                Config { block_size, nav_scan_budget: budget, prefetch_depth: 0, ..Config::default() },
+            );
+            rt().block_on(async {
+                let a_sync = sync_doc.scroll_lines(Anchor::TOP, down).await.unwrap().ready();
+                let a_tiny = tiny_doc.scroll_lines(Anchor::TOP, down).await.unwrap().join().await;
+                prop_assert_eq!(a_sync, a_tiny, "scroll down diverged");
+                let u_sync = sync_doc.scroll_lines(a_sync, -up).await.unwrap().ready();
+                let u_tiny = tiny_doc.scroll_lines(a_sync, -up).await.unwrap().join().await;
+                prop_assert_eq!(u_sync, u_tiny, "scroll up diverged");
+                let p_sync = sync_doc.goto_percent(pct).await.unwrap().ready();
+                let p_tiny = tiny_doc.goto_percent(pct).await.unwrap().join().await;
+                prop_assert_eq!(p_sync, p_tiny, "percent jump diverged");
+                let e_sync = sync_doc.goto_end(rows).await.unwrap().ready();
+                let e_tiny = tiny_doc.goto_end(rows).await.unwrap().join().await;
+                prop_assert_eq!(e_sync, e_tiny, "goto end diverged");
+                Ok::<(), TestCaseError>(())
+            })?;
         }
     }
 }

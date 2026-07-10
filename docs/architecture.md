@@ -34,9 +34,10 @@ indistinguishable from a 100 KiB one.
 Absolute line numbers are a separate, background concern (a planned
 `LineIndex` analyzer); navigation never waits for them. Jumps that are
 naturally byte-addressed (`G`, `<count>%`) snap to a line start with a
-small local scan — forward to the next line start in the normal case,
-backward to the line containing the target when no line start is within
-reach ahead of it.
+small local backward scan: `G` searches back from EOF for the last line
+(and further back to walk up any additional rows the screen needs); `%`
+searches back from the target byte for the start of the line that contains
+it.
 
 ## The event loop
 
@@ -45,13 +46,22 @@ async event stream, the completion of a pending navigation scan, and a
 repaint tick (active only while something is pending) that keeps the
 progress indicator fresh. Key presses resolve through the pure `handle_key`
 state machine into `Nav` intents; an intent that resolves within its budget
-applies immediately, and one that cannot becomes the pending operation —
-the viewport stays put, a transient bottom-row indicator shows progress,
-`Esc` cancels, any new motion supersedes, quitting aborts, and a resize
-restarts the pending jump against the new dimensions (a `G` in flight must
-not finish positioned for the old screen height). Terminal state (alternate
-screen, raw mode, mouse capture) is owned by a guard that restores it on
-every exit path, including panics.
+applies immediately, and one that cannot becomes the pending operation — the
+viewport stays put and a transient bottom-row indicator shows progress. A
+jump to the end that also has to walk up several rows runs that walk as a
+second stage with its own progress span, so the indicator is not one
+continuous climb across the whole operation.
+
+The pending slot holds its scan behind a cancel-on-drop guard: `Esc`, a new
+motion superseding it, quitting, the event stream ending, and any error
+unwinding through the loop's `?` all drop the slot rather than detach the
+task, so every exit path aborts a live scan. A resize drops it the same way
+and re-applies the originating intent against the new dimensions (a `G` in
+flight must not finish positioned for the old screen height). The cache's
+own in-flight guard (see [block cache](block_cache.md)) means a scan
+aborted mid-fetch cleans up its own in-flight registration instead of
+leaking it. Terminal state (alternate screen, raw mode, mouse capture) is
+owned by a guard that restores it on every exit path, including panics.
 
 Runtime shutdown is bounded: once the event loop returns, the runtime is
 shut down with a timeout, so **background** reads wedged on a dead network
@@ -116,9 +126,10 @@ The architecture keeps planned features additive rather than invasive:
   streaming analyzers fed by a single shared scan through the same block
   cache, so the file is read once no matter how many analyzers run.
 - **Pending navigation** exists: `Resolution { Ready, Pending }` is how
-  every navigation result is expressed, and budget-exhausted jumps continue
-  as cancellable background scans with live progress (see
-  [budgeted scanning](budgeted_scanning.md)). The `Exhausted` variant — for
-  "no such answer", e.g. a go-to-line beyond the file — arrives with the
-  line index. Making *reads themselves* pending (a cold viewport block on a
-  wedged mount still holds the loop) is the remaining step.
+  every navigation result is expressed today, and budget-exhausted jumps
+  continue as cancellable background scans with live progress (see
+  [budgeted scanning](budgeted_scanning.md)). A planned `Exhausted` variant
+  — for "no such answer", e.g. a go-to-line beyond the file — would arrive
+  with the line index once that feature lands. Making *reads themselves*
+  pending (a cold viewport block on a wedged mount still holds the loop) is
+  the remaining step.

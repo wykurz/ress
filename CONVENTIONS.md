@@ -7,6 +7,11 @@
 - Ratio/percentage arithmetic on `u64` file offsets is done in `u128`
   (see `percent_offset`, `Progress::percent`) — saturating `u64` math
   protects against overflow but silently corrupts the ratio.
+- Resumable scans carry their cursor inside a step object
+  (`ForwardScan`/`BackwardScan`); window and entry semantics are captured
+  once at construction and never re-derived by callers — bare `u64` resume
+  cursors passed between functions are the bug class this design
+  eliminates.
 
 ## Testing
 - Name tests after observed behavior (e.g. `returns_first_screen`, `chops_long_lines`).
