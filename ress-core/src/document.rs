@@ -5,10 +5,13 @@ use crate::Config;
 use crate::resolve::Resolution;
 use crate::source::BlockSource;
 use std::sync::Arc;
-/// The scroll position: the byte offset of the first visible line. Navigation is
-/// expressed in anchors, never line numbers, so it never waits on indexing.
-/// Anchors come only from `Anchor::TOP` or `Document` navigation, which keeps
-/// the offset a line start: 0, or the byte just past a newline before EOF.
+/// The scroll position: the byte offset of the first visible line. Scrolling
+/// and rendering are expressed in anchors, never line numbers, so they never
+/// wait on indexing; `goto_line` is the deliberate exception, since turning a
+/// line number into an anchor needs the background line index and pends on
+/// its progress when the query outruns the indexed frontier. Anchors come
+/// only from `Anchor::TOP` or `Document` navigation, which keeps the offset a
+/// line start: 0, or the byte just past a newline before EOF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Anchor(u64);
 impl Anchor {
@@ -69,7 +72,7 @@ pub struct Document {
     size: u64,
     config: Config,
     prefetcher: crate::prefetch::Prefetcher,
-    scheduler: crate::schedule::ScanScheduler,
+    scheduler: Option<crate::schedule::ScanScheduler>,
 }
 impl Document {
     /// Must be called within a tokio runtime: construction spawns the
@@ -88,7 +91,29 @@ impl Document {
             size,
             config,
             prefetcher,
-            scheduler,
+            scheduler: Some(scheduler),
+        }
+    }
+    /// Test-only: a document with no background index scan, for tests that
+    /// meter source reads and must not race a scanner. `goto_line` panics
+    /// on such a document; every other navigation is index-free by design.
+    /// No tokio runtime is required to construct one — unlike `new`, this
+    /// spawns nothing.
+    #[cfg(test)]
+    pub(crate) fn new_unindexed(source: Arc<dyn BlockSource>, config: Config) -> Self {
+        let size = source.size();
+        let cache = Arc::new(crate::cache::BlockCache::new(
+            source,
+            config.block_size,
+            config.cache_bytes,
+        ));
+        let prefetcher = crate::prefetch::Prefetcher::new(cache.clone(), config.prefetch_depth);
+        Self {
+            cache,
+            size,
+            config,
+            prefetcher,
+            scheduler: None,
         }
     }
     /// The shared cache, for the prefetcher.
@@ -301,10 +326,13 @@ impl Document {
     /// pends on index progress, then walks the at-most-1023-line tail from
     /// the nearest checkpoint with a budgeted forward scan.
     pub async fn goto_line(&self, n: u64) -> anyhow::Result<Resolution> {
+        const NO_INDEX: &str =
+            "goto_line needs the background index (unindexed documents are test-only)";
+        let scheduler = self.scheduler.as_ref().expect(NO_INDEX);
         let line0 = n.saturating_sub(1);
         let budget = self.config.nav_scan_budget;
         let (covered, clamp0, cp) = {
-            let ix = self.scheduler.index().lock().unwrap();
+            let ix = scheduler.index().lock().unwrap();
             let covered = ix.newlines() >= line0;
             let clamp0 = ix.total_lines().map(|t| t.saturating_sub(1));
             (
@@ -314,21 +342,7 @@ impl Document {
             )
         };
         if covered {
-            let (line0, cp) = if cp.0 >= self.size {
-                // the queried start sits at EOF — a trailing newline's
-                // phantom line, not a line; the real last line is the one
-                // before it (ERRATUM 4a#3).
-                let prev = line0.saturating_sub(1);
-                let cp = self
-                    .scheduler
-                    .index()
-                    .lock()
-                    .unwrap()
-                    .nearest_checkpoint(prev);
-                (prev, cp)
-            } else {
-                (line0, cp)
-            };
+            let (line0, cp) = dephantom(scheduler.index(), self.size, line0, cp);
             return self.walk_to_line(line0, cp, budget).await;
         }
         if let Some(clamp0) = clamp0 {
@@ -337,17 +351,12 @@ impl Document {
             if self.size == 0 {
                 return Ok(Resolution::Ready(Anchor::TOP));
             }
-            let cp = self
-                .scheduler
-                .index()
-                .lock()
-                .unwrap()
-                .nearest_checkpoint(clamp0);
+            let cp = scheduler.index().lock().unwrap().nearest_checkpoint(clamp0);
             return self.walk_to_line(clamp0, cp, budget).await;
         }
         let cache = self.cache.clone();
-        let index = self.scheduler.index().clone();
-        let mut frontier = self.scheduler.frontier();
+        let index = scheduler.index().clone();
+        let mut frontier = scheduler.frontier();
         let size = self.size;
         let seed = frontier.borrow().processed_up_to;
         Ok(Resolution::Pending(spawn_pending(
@@ -383,15 +392,7 @@ impl Document {
                 if size == 0 {
                     return Ok(Anchor::TOP);
                 }
-                let (line0, cp) = if cp.0 >= size {
-                    // the queried start sits at EOF — a trailing newline's
-                    // phantom line, not a line; the real last line is the
-                    // one before it (ERRATUM 4a#3).
-                    let prev = line0.saturating_sub(1);
-                    (prev, index.lock().unwrap().nearest_checkpoint(prev))
-                } else {
-                    (line0, cp)
-                };
+                let (line0, cp) = dephantom(&index, size, line0, cp);
                 let (cp_off, cp_line0) = cp;
                 let scan =
                     crate::scan::ForwardScan::new(cp_off, (line0 - cp_line0) as usize, budget);
@@ -429,6 +430,25 @@ impl Document {
             }
         }
     }
+}
+/// Steps a resolved (line0, checkpoint) pair off the at-EOF phantom: a
+/// trailing newline's "line start" at the file size is not a line, so the
+/// real last line is the one before it. A no-op for every in-file
+/// checkpoint. Steps back with `saturating_sub`, not plain subtraction:
+/// `line0 == 0` reaches this guard too (an empty file trivially satisfies
+/// the caller's "covered" check at line 0), and must step back to 0 rather
+/// than underflow.
+fn dephantom(
+    index: &std::sync::Mutex<crate::index::LineIndex>,
+    size: u64,
+    line0: u64,
+    cp: (u64, u64),
+) -> (u64, (u64, u64)) {
+    if cp.0 < size {
+        return (line0, cp);
+    }
+    let prev = line0.saturating_sub(1);
+    (prev, index.lock().unwrap().nearest_checkpoint(prev))
 }
 /// Spawns a pending-navigation task with a fresh progress channel.
 fn spawn_pending<F, Fut>(
@@ -537,7 +557,7 @@ mod tests {
         // viewport must stop at its scan budget rather than pull the whole "file"
         // into memory before the first paint.
         let src = Arc::new(MockSource::new(bytes::Bytes::from(vec![b'x'; 4096])));
-        let d = Document::new(
+        let d = Document::new_unindexed(
             src.clone(),
             Config {
                 block_size: 16,
@@ -595,7 +615,7 @@ mod tests {
         // the window sits at the cap (and shows content); the guarantee under
         // test is that the read stays budget-bounded instead of scanning to EOF.
         let src = Arc::new(MockSource::new(bytes::Bytes::from(vec![b'x'; 1 << 20])));
-        let d = Document::new(
+        let d = Document::new_unindexed(
             src.clone(),
             Config {
                 block_size: 4096,
@@ -665,7 +685,7 @@ mod tests {
             data.extend_from_slice(b"x\n");
         }
         let src = Arc::new(MockSource::new(data));
-        let d = Document::new(
+        let d = Document::new_unindexed(
             src.clone(),
             Config {
                 prefetch_depth: 0,
@@ -704,7 +724,7 @@ mod tests {
             data.extend_from_slice(format!("line {i:04}\n").as_bytes());
         }
         let src = Arc::new(MockSource::new(data));
-        let d = Document::new(
+        let d = Document::new_unindexed(
             src.clone(),
             Config {
                 block_size: 1024,
@@ -1186,8 +1206,13 @@ mod tests {
     }
     #[tokio::test]
     async fn goto_line_on_an_empty_file_is_top() {
+        // n=7 takes the uncovered clamp shortcut; n<=1 takes the covered
+        // branch straight into dephantom — the shape whose underflow
+        // saturating_sub prevents.
         let d = doc(b"", 64);
         assert_eq!(d.goto_line(7).await.unwrap().join().await, Anchor::TOP);
+        assert_eq!(d.goto_line(1).await.unwrap().join().await, Anchor::TOP);
+        assert_eq!(d.goto_line(0).await.unwrap().join().await, Anchor::TOP);
     }
     #[tokio::test]
     async fn goto_line_beyond_the_frontier_pends_with_progress() {
@@ -1207,10 +1232,16 @@ mod tests {
             },
         );
         match d.goto_line(3500).await.unwrap() {
-            Resolution::Pending(p) => {
+            Resolution::Pending(mut p) => {
                 assert_eq!(p.label, "jumping to line");
-                let a = p.handle.await.unwrap().unwrap();
+                let first = *p.progress.borrow();
+                let a = (&mut p.handle).await.unwrap().unwrap();
                 assert_eq!(a, Anchor::at(34990));
+                let last = *p.progress.borrow();
+                assert!(
+                    last.scanned > first.scanned,
+                    "a pending line jump must publish frontier progress"
+                );
             }
             Resolution::Ready(a) => panic!("expected Pending, got Ready({})", a.offset()),
         }
@@ -1278,6 +1309,23 @@ mod tests {
             Anchor::at(2046)
         );
     }
+    #[tokio::test]
+    async fn goto_line_phantom_clamp_resolves_synchronously_once_indexed() {
+        // joining a past-the-end jump waits for the scan to finish (its
+        // clamp needs total_lines), so the second ask is answered from the
+        // covered branch — pinning the sync-side dephantom deterministically
+        // (the pending twin is separately pinned; a cold index would always
+        // route this shape through it).
+        let d = lined("x\n", 1024, 64);
+        assert_eq!(
+            d.goto_line(4000).await.unwrap().join().await,
+            Anchor::at(2046)
+        );
+        match d.goto_line(1025).await.unwrap() {
+            Resolution::Ready(a) => assert_eq!(a, Anchor::at(2046)),
+            Resolution::Pending(_) => panic!("index is done; the ask must resolve synchronously"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1337,7 +1385,7 @@ mod props {
             // all-x content has no newlines, so the budget is the only stop.
             let src = std::sync::Arc::new(MockSource::new(vec![b'x'; len]));
             rt().block_on(async {
-                let doc = Document::new(
+                let doc = Document::new_unindexed(
                     src.clone(),
                     Config { block_size, prefetch_depth: 0, ..Config::default() },
                 );

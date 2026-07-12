@@ -48,6 +48,7 @@ the philosophy). Counts prefix motions: `12j` moves twelve lines.
 | `Ctrl-f` / `Space` / `PgDn` | full page down |
 | `Ctrl-b` / `PgUp` | full page up |
 | `gg` / `ge` / `G` | top / end of file (`ge` and `G` are aliases) |
+| `<count>G` / `<count>gg` | jump to line N (past the end clamps to the last line) |
 | `<count>%` | jump to the line containing the byte at that percentage |
 | `h` / `l` / `←` / `→` | horizontal scroll (long lines are chopped) |
 | mouse wheel | scroll three lines |
@@ -56,12 +57,13 @@ the philosophy). Counts prefix motions: `12j` moves twelve lines.
 | `q` / `Ctrl-c` | quit |
 
 Jumps that need more scanning than the interactive budget (for example `G`
-into a file whose tail is one giant line, or a very large count) continue in
-the background: the viewport stays put, a transient bottom-row indicator
-shows progress, `Esc` cancels, and any new motion supersedes the scan.
+into a file whose tail is one giant line, a very large count, or a
+`<count>G` or `<count>gg` jump beyond what the background line index has
+scanned) continue in the background: the viewport stays put, a transient
+bottom-row indicator shows progress, `Esc` cancels, and any new motion
+supersedes the scan.
 
-Reserved for upcoming features: `/` `?` `n` `N` (search), `:` and `<count>G`
-(go to line — today a count before `G` is ignored and `G` jumps to the end),
+Reserved for upcoming features: `/` `?` `n` `N` (search), `:` (go to line),
 `w` (wrap toggle), `0` (reset horizontal scroll).
 
 Building
