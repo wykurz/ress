@@ -145,9 +145,9 @@ seam already filled below; the rest are still ahead:
   the line before it. Search and syntax highlighting remain future
   analyzers meant to share this same single-shared-scan design, so the
   file is read once no matter how many analyzers eventually run.
-- **`goto_line`** is the line index's only consumer today (not yet bound
-  to a key — `<count>G` is future keymap work), and resolves through the
-  index three ways. If the index already covers the target line, it walks
+- **`goto_line`** is the line index's only consumer today, bound to
+  `<count>G` and `<count>gg`, and resolves through the index three ways.
+  If the index already covers the target line, it walks
   forward from the nearest checkpoint with a budgeted `ForwardScan` (at
   most 1023 newlines — see [budgeted scanning](budgeted_scanning.md)):
   Ready if the walk finishes in budget, Pending on that same walk if not.

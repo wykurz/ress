@@ -30,10 +30,12 @@ loops, and the cursor lives inside the object rather than being handed back
 to the caller as a value — an interactive attempt and the pending
 continuation it falls back to are literally the same scan, stepped further,
 never a fresh scan re-derived from a resume cursor. All navigation
-(`scroll_lines`, `goto_end`, `goto_percent`) and the viewport itself compose
-`fill_lines` and these two scans. Outcomes are explicit enums — a caller
-must decide what `More` means for its operation; there is no silent
-fallthrough.
+(`scroll_lines`, `goto_end`, `goto_percent`, `goto_line`) and the viewport
+itself compose `fill_lines` and these two scans; `goto_line` additionally
+consults the background line index to pick its scan's starting checkpoint
+(see "Line index lookups reuse `ForwardScan`" below). Outcomes are explicit
+enums — a caller must decide what `More` means for its operation; there is
+no silent fallthrough.
 
 ## The budget contract is block-granular
 

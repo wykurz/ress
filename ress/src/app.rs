@@ -21,6 +21,7 @@ pub enum Nav {
     Page(i8),
     Top,
     Bottom,
+    Line(u64),
     Percent(u8),
     Horizontal(i64),
 }
@@ -67,15 +68,20 @@ impl App {
             self.pending_g = false;
             match (key.code, ctrl) {
                 (KeyCode::Char('g'), false) => {
-                    self.count = None;
-                    return Action::Nav(Nav::Top);
+                    return match self.count.take() {
+                        Some(n) => Action::Nav(Nav::Line(n as u64)),
+                        None => Action::Nav(Nav::Top),
+                    };
                 }
-                // helix-style goto-end, alias of G.
+                // helix-style goto-end, alias of bare G; a count means goto-line only through G/gg.
                 (KeyCode::Char('e'), false) => {
                     self.count = None;
                     return Action::Nav(Nav::Bottom);
                 }
-                _ => {}
+                _ => {
+                    // vim aborts the pending count with the chord.
+                    self.count = None;
+                }
             }
         }
         match (key.code, ctrl) {
@@ -115,10 +121,10 @@ impl App {
                 self.pending_g = true;
                 Action::None
             }
-            (KeyCode::Char('G'), false) => {
-                self.count = None;
-                Action::Nav(Nav::Bottom)
-            }
+            (KeyCode::Char('G'), false) => match self.count.take() {
+                Some(n) => Action::Nav(Nav::Line(n as u64)),
+                None => Action::Nav(Nav::Bottom),
+            },
             (KeyCode::Char('%'), false) => match self.count.take() {
                 Some(p) => Action::Nav(Nav::Percent(p.min(100) as u8)),
                 None => Action::None,
@@ -191,6 +197,7 @@ async fn apply_nav(
             None
         }
         Nav::Bottom => Some(doc.goto_end(rows as usize).await?),
+        Nav::Line(n) => Some(doc.goto_line(n).await?),
         Nav::Percent(p) => Some(doc.goto_percent(p).await?),
         Nav::Horizontal(n) => {
             app.hscroll = app.hscroll.shift(n);
@@ -377,8 +384,48 @@ mod tests {
         assert_eq!(app.handle_key(key('j')), Action::Nav(Nav::Lines(1)));
     }
     #[test]
+    fn a_cancelled_chord_drops_the_count() {
+        // 5g followed by j: vim aborts the count with the chord, so the
+        // j is a single-line motion, not five.
+        let mut app = App::new();
+        app.handle_key(key('5'));
+        app.handle_key(key('g'));
+        assert_eq!(app.handle_key(key('j')), Action::Nav(Nav::Lines(1)));
+    }
+    #[test]
     fn shift_g_goes_to_bottom() {
         assert_eq!(App::new().handle_key(key('G')), Action::Nav(Nav::Bottom));
+    }
+    #[test]
+    fn count_g_goes_to_line() {
+        let mut app = App::new();
+        app.handle_key(key('4'));
+        app.handle_key(key('2'));
+        assert_eq!(app.handle_key(key('G')), Action::Nav(Nav::Line(42)));
+    }
+    #[test]
+    fn bare_g_still_goes_to_bottom() {
+        assert_eq!(App::new().handle_key(key('G')), Action::Nav(Nav::Bottom));
+    }
+    #[test]
+    fn count_gg_goes_to_line() {
+        let mut app = App::new();
+        app.handle_key(key('7'));
+        app.handle_key(key('g'));
+        assert_eq!(app.handle_key(key('g')), Action::Nav(Nav::Line(7)));
+    }
+    #[test]
+    fn bare_gg_still_goes_to_top() {
+        let mut app = App::new();
+        app.handle_key(key('g'));
+        assert_eq!(app.handle_key(key('g')), Action::Nav(Nav::Top));
+    }
+    #[test]
+    fn ge_ignores_a_count() {
+        let mut app = App::new();
+        app.handle_key(key('9'));
+        app.handle_key(key('g'));
+        assert_eq!(app.handle_key(key('e')), Action::Nav(Nav::Bottom));
     }
     #[test]
     fn count_percent_jumps() {
@@ -477,6 +524,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app.top.offset(), 20);
+    }
+    #[tokio::test]
+    async fn apply_nav_line_jumps_to_the_line_start() {
+        // a cold index always pends (the scanner task has not been polled
+        // when the first coverage check runs), so warm it to done first: a
+        // past-the-end jump can only resolve once total_lines is known.
+        let doc = nav_doc();
+        let mut app = App::new();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Line(9999), 10)
+            .await
+            .unwrap();
+        let mut active = pending.take().expect("a cold-index jump must pend");
+        let _ = (&mut active.p.handle).await;
+        drop(active);
+        apply_nav(&doc, &mut app, &mut pending, Nav::Line(3), 10)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_none(),
+            "a warmed index must resolve synchronously"
+        );
+        assert_eq!(app.top.offset(), 4, "line 3 of two-byte lines");
     }
     #[tokio::test]
     async fn apply_nav_horizontal_clamps_at_zero() {
@@ -598,6 +668,36 @@ mod tests {
         assert!(matches!(active.nav, Nav::Bottom));
         let a = (&mut active.p.handle).await.unwrap().unwrap();
         assert_eq!(a.offset(), 196);
+    }
+    #[tokio::test]
+    async fn line_jump_beyond_the_frontier_pends_with_the_jump_label() {
+        let mut data = Vec::new();
+        for i in 0..4000u32 {
+            data.extend_from_slice(format!("line {i:04}\n").as_bytes());
+        }
+        let src = std::sync::Arc::new(
+            ress_core::source::MockSource::new(data)
+                .with_latency(std::time::Duration::from_millis(2)),
+        );
+        let doc = Document::new(
+            src,
+            ress_core::Config {
+                block_size: 256,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..ress_core::Config::default()
+            },
+        );
+        let mut app = App::new();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::Line(3500), 10)
+            .await
+            .unwrap();
+        let mut active = pending.take().expect("a jump past the frontier must pend");
+        assert!(matches!(active.nav, Nav::Line(3500)));
+        assert_eq!(active.p.label, "jumping to line");
+        let a = (&mut active.p.handle).await.unwrap().unwrap();
+        assert_eq!(a.offset(), 34990);
     }
     #[tokio::test]
     async fn dropping_the_pending_slot_aborts_the_scan() {

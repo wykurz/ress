@@ -197,8 +197,12 @@ mod tests {
     }
     #[tokio::test]
     async fn dropping_the_scheduler_aborts_the_scan() {
+        // 60s per block cannot finish inside the 2s timeout below, so the
+        // channel closing only proves the scheduler dropped its sender —
+        // the done check below is what proves that happened via abort()
+        // rather than the scan actually running to completion.
         let src = Arc::new(
-            MockSource::new(vec![b'x'; 1 << 20]).with_latency(std::time::Duration::from_millis(2)),
+            MockSource::new(vec![b'x'; 1 << 20]).with_latency(std::time::Duration::from_secs(60)),
         );
         let c = Arc::new(crate::cache::BlockCache::new(src, 4096, 1 << 20));
         let s = ScanScheduler::spawn(c);
@@ -209,5 +213,13 @@ mod tests {
         })
         .await
         .expect("scan task outlived its drop guard");
+        // a watch receiver keeps the last value after its sender drops: an
+        // abort mid-scan leaves the initial default frontier (done == false)
+        // behind, while a natural finish would have sent one with done ==
+        // true — this is the direct discriminator between the two.
+        assert!(
+            !rx.borrow().done,
+            "the scan must have been aborted, not completed"
+        );
     }
 }
