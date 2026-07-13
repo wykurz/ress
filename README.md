@@ -30,6 +30,16 @@ finished it reads `L?` until the count resolves. If a read error ends
 indexing early, the total never appears — its partial line count is real,
 but it is not the file's total.
 
+Above the status line, a dim hint bar shows the live keymap for whichever
+mode is active — motions in normal use, edit keys while composing `:N`,
+`any key closes` in help — whenever the terminal has room to spare for it.
+A one-cell scrollbar marks the viewport's position on the right edge of
+the content area, proportional to its byte offset through the file — a
+position marker, not a size-proportional thumb. Short terminals degrade in
+steps: 4 rows or more keep both the hint bar and the bottom row, 2-3 rows
+keep the bottom row alone, and 1 row or fewer drops chrome entirely so
+content still has somewhere to paint.
+
 Usage
 =====
 
@@ -60,21 +70,23 @@ the philosophy). Counts prefix motions: `12j` moves twelve lines.
 | `gg` / `ge` / `G` | top / end of file (`ge` and `G` are aliases) |
 | `<count>G` / `<count>gg` | jump to line N (past the end clamps to the last line) |
 | `<count>%` | jump to the line containing the byte at that percentage |
+| `:N` | jump to line N (Enter to go, Esc to cancel, Backspace to edit; needs 2+ rows, 3+ columns) |
 | `h` / `l` / `←` / `→` | horizontal scroll (long lines are chopped) |
-| mouse wheel | scroll three lines |
+| mouse wheel | scroll three lines (normal view only; a tick in command or help is ignored and never touches a running jump) |
 | `Ctrl-l` | force redraw |
 | `Esc` | cancel a pending operation, count, or chord |
+| `F1` | toggle the help overlay (needs 7+ rows, 5+ columns) |
 | `q` / `Ctrl-c` | quit |
 
 Jumps that need more scanning than the interactive budget (for example `G`
 into a file whose tail is one giant line, a very large count, or a
-`<count>G` or `<count>gg` jump beyond what the background line index has
-scanned) continue in the background: the viewport stays put, a transient
-bottom-row indicator shows progress, `Esc` cancels, and any new motion
-supersedes the scan.
+`<count>G`, `<count>gg`, or `:N` jump beyond what the background line index
+has scanned) continue in the background: the viewport stays put, a
+transient bottom-row indicator shows progress, `Esc` cancels, and any new
+motion supersedes the scan.
 
-Reserved for upcoming features: `/` `?` `n` `N` (search), `:` (go to line),
-`w` (wrap toggle), `0` (reset horizontal scroll).
+Reserved for upcoming features: `/` `?` `n` `N` (search), `w` (wrap
+toggle), `0` (reset horizontal scroll).
 
 Building
 ========
@@ -97,7 +109,8 @@ Documentation
 Design documents describing the internals live in the `docs/` directory:
 
 - [Architecture](docs/architecture.md) — crate layout, offset-driven
-  rendering, the event loop, the status line, and the type-level invariants
+  rendering, the event loop, the mode machine and chrome stack, the status
+  line, and the type-level invariants
 - [Block cache](docs/block_cache.md) — scan-resistant eviction, read
   coalescing, and the promotion policy
 - [Budgeted scanning](docs/budgeted_scanning.md) — how every read path is

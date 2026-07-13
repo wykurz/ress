@@ -10,8 +10,9 @@ subsystem.
 
 - **`ress`** — the binary: clap CLI, terminal setup/teardown, the event loop,
   the keymap, and blitting rendered rows into ratatui. It contains as little
-  logic as possible; the one non-trivial piece (`handle_key`, the keymap state
-  machine) is a pure function with unit tests.
+  logic as possible; the one non-trivial piece (`handle_key`, the mode
+  machine) is a deterministic, IO-free state machine — no terminal, no I/O
+  — exhaustively unit-tested.
 - **`ress-core`** — the engine: file I/O, the block cache, scanning,
   navigation, and line layout. It has **no terminal dependencies**, so all of
   the hard logic is testable headless. The property-test suites live here and
@@ -61,14 +62,19 @@ continuous climb across the whole operation.
 
 The frontier arm and the status arm keep the tick informed rather than
 drawing themselves: each raises a `dirty` flag when its background task
-has published something new, gated on a chrome row existing at all (a
-hidden row has nothing to repaint for), and the tick — firing every 100ms
+has published something new, gated on the status line specifically being
+this frame's bottom-row occupant (`ChromeLayout::status_visible`) — not
+just a chrome row existing at all, since a row that exists but is
+currently showing the `:` command line instead has just as little to
+repaint for as a hidden one does. The tick — firing every 100ms
 unconditionally, dirty or not, pending or not — is the loop's sole point
-that turns a raised flag into a repaint, also redrawing (chrome-gated the
-same way) while a navigation is pending, since a pending nav's progress
-row is exactly as invisible on a chromeless terminal as the status line
-is. Every draw call site clears `dirty` itself immediately afterward; the
-two `watch` subscriptions are what re-arm it, not a signal threaded back
+that turns a raised flag into a repaint, also redrawing while a
+navigation is pending, gated the same specific way
+(`ChromeLayout::progress_visible`): a pending nav's progress row is
+exactly as invisible when Command's line covers it as it is on a
+chromeless terminal. Every draw call site clears `dirty` itself
+immediately afterward; the two `watch` subscriptions are what re-arm it,
+not a signal threaded back
 through `draw`'s own return value — see [concurrency](concurrency.md) for
 why that coalescing stays correct with nothing more than a bool and a
 timer. A burst of index or status progress between two ticks still costs
@@ -93,28 +99,110 @@ awaiting — a cold viewport or navigation block — still holds the loop,
 including the `q` that would quit, until it returns; making foreground
 reads cancellable too is the planned Resolution-for-reads work.
 
+## The mode machine and the chrome stack
+
+`handle_key` routes every key press by `Mode` — `Normal`, `Command`, or
+`Help` — before deciding what it means: each mode consults its own key
+table, so a binding in one mode has no effect in another. `Help` is the
+simplest: any key at all closes it back to `Normal` without ever reaching
+`Normal`'s own table, which is why `q` pressed inside help cannot quit the
+pager — it just closes help, like any other key would. `Command` owns the
+`:N` line-jump prompt: digits accumulate into a buffer capped at 20
+characters (more than a `u64` line number can ever need), Backspace edits
+it, and Enter commits it as a `Nav::Line` — an all-digit buffer's only
+parse failure is overflow, and `goto_line`'s vim-style clamp already
+treats an overflowed value the same as a past-the-end line number, so
+there is no separate error path to render. Esc, or Enter on an empty
+buffer, cancels back to `Normal` instead. Every buffer edit repaints
+immediately, unlike `Normal`'s count prefix below: the buffer is on
+screen, so leaving an edit unpainted would freeze the row while
+keystrokes kept registering underneath it.
+
+The mouse wheel never reaches this router — `run`'s own event loop
+decides its effect directly, since a wheel tick is not a key event at
+all — but the same invariant governs it: wheel navigation routes only
+where navigation is owned, `Normal`, exactly where `j`/`k` do. In
+`Command` or `Help` a tick is a true no-op: it does not close `Help`,
+abort the command being composed, or touch a navigation already
+pending — a scan started before the tick keeps running, untouched,
+exactly as it would have before an unrelated key.
+
+`Normal`'s own table carries one more piece of state across key presses:
+an optional numeric count, built one digit at a time and spent as a
+multiplier by the motion that consumes it. What survives a given key
+press is a rule, not a per-key list: only a digit that extends the count,
+or a motion that spends it, lets it live past that key — everything else
+drops it, matching vim's own behavior. An unmapped key, `Ctrl-l`,
+entering `Command` or `Help`, and any motion with no count semantics of
+its own (half-page and full-page among them) all clear it on the way
+through, and a `g`-chord that does not complete as `gg` or `ge` aborts
+both the chord and whatever count was armed for it. "Entering `Command`
+or `Help`" means a *successful* entry specifically: a `:`/F1 the
+terminal refuses is as if the key had never been pressed at all, so it
+changes nothing — count, chord, and all — leaving both exactly as they
+were for the next key to build on or complete. `Command` needs a bottom
+chrome row and `cols >= 3` (room for `:` plus one digit plus the
+cursor); `Help` needs `rows >= 7` and `cols >= 5` (`Block::bordered`'s
+own interior, once its border and the panel's one-cell margin are both
+subtracted, needs at least one cell on each axis) — below either bound
+the key is refused as just described.
+
+The terminal's bottom rows are chrome, not content, reserved in steps
+rather than a flat amount: `chrome_rows` gives a terminal of 4 rows or
+more both the hint bar and the bottom row (2), one with 2 or 3 rows the
+bottom row alone (1 — unchanged from before the hint bar existed), and
+one with 0 or 1 rows no chrome at all, so its lone row still goes to
+content instead of being lost to chrome nobody could read anyway.
+`content_rows` is simply `rows - chrome_rows(rows)`, applied everywhere
+terminal rows enter the loop — the pre-draw viewport fetch, row-dependent
+jumps like `G`, and the live frame area inside `draw` alike — so none of
+them can drift from what the reservation actually applies. The hint bar,
+when shown, is a persistent DIM row one above the bottom row, naming the
+current mode's own keys — a condensed cheat-sheet in `Normal`, the edit
+keys in `Command`, "any key closes" in `Help` — DIM rather than reversed
+so it reads as distinct chrome, not a second status line. The bottom row
+itself shows exactly one of three things, in precedence order: the `:`
+command line while `Command` is composing one, else the transient
+progress row while a navigation scan is pending (see
+[budgeted scanning](budgeted_scanning.md)), else the status line (below).
+The help overlay paints last, over the content area only: `Clear` first,
+so no content already painted there bleeds through, then a bordered
+`Block` holding the keymap reference — both chrome rows stay visible
+beneath it exactly as they were before `Help` opened.
+
+The content area's own text width narrows by one column whenever a
+scrollbar gutter is shown on its right edge: `content_cols(size, rows,
+cols)` cedes a column only when there is a file to mark a position in
+(`size > 0`), a content row to draw it on (`rows > 0`), and a second
+column left over for text once the gutter's own is spoken for (`cols >=
+2`) — an empty file or a one-column terminal keeps the full width
+instead. The gutter itself is a DIM `│` track cell per row, plus one
+plain `█` cell marking where the viewport's top anchor falls,
+proportional to its byte offset through the file — a position marker, not
+a proportional-height thumb: the viewport's own byte span isn't cheaply
+known at render time, so sizing a thumb to it would need a second scan or
+a rough estimate presented as exact. Match-position ticks from a future
+search analyzer (see Seams for what comes next, below) are a more likely
+next addition to this gutter than a proportional-height thumb.
+
 ## The status line
 
-The terminal's bottom row is reserved chrome, not content: `content_rows`
-gives the viewport `rows - 1`, except that a 1- or 0-row terminal has no
-row to spare, so content keeps the whole area rather than losing its only
-row to chrome. That reserved row shows exactly one of two things: the
-transient progress row while a navigation scan is pending (see
-[budgeted scanning](budgeted_scanning.md)), or otherwise the status line —
+Once it wins the bottom row's precedence (see The mode machine and the
+chrome stack, above), the status line reads
 `{name} · L{n}[/{total}] · {pct}%`, with an empty file reading
-`{name} · empty · {pct}%` — recomputed on every draw. `pct` is
+`{name} · empty · {pct}%` instead — recomputed on every draw. `pct` is
 the anchor's byte offset as a percentage of the file size, unrelated to
 indexing progress and always available; `n` and `total` come from the
 background index (the indexing mechanics are in Seams for what comes
 next, below) through queries that resolve on their own schedules, so
 every combination of known and unknown is a real, displayed state. `draw`
 skips the status line's queries entirely, requesting nothing and reading
-neither `n` nor `total`, in the two cases where the row will not be
-shown: while a scan owns it instead, and on a terminal too short to
-have a chrome row at all (`has_chrome_row`, next to `content_rows`) —
-either way, not only would the result go unused, but the request that
-would otherwise wake the status worker would be spent on a number nobody
-will ever see.
+neither `n` nor `total`, in every case where the row will not show it:
+while the command line or the progress row claims it instead, and on a
+terminal too short to have a chrome row at all (`chrome_rows(rows) > 0`,
+next to `content_rows`) — in every case, not only would the result go
+unused, but the request that would otherwise wake the status worker would
+be spent on a number nobody will ever see.
 
 The current line comes from `StatusWorker` (`ress_core::status`), one
 background task per document answering "what line is this anchor on" —
@@ -271,8 +359,8 @@ seam already filled below; the rest are still ahead:
   the line before it. Search and syntax highlighting remain future
   analyzers meant to share this same single-shared-scan design, so the
   file is read once no matter how many analyzers eventually run.
-- **`goto_line`** is bound to `<count>G` and `<count>gg`, and resolves
-  through the index three ways.
+- **`goto_line`** is bound to `<count>G`, `<count>gg`, and the `:N`
+  command line, and resolves through the index three ways.
   If the index already covers the target line, it walks
   forward from the nearest checkpoint with a budgeted `ForwardScan` (at
   most 1023 newlines — see [budgeted scanning](budgeted_scanning.md)):
