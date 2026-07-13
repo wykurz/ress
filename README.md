@@ -20,6 +20,16 @@ Opening a multi-gigabyte file shows the first screen in milliseconds; paging
 back through recently viewed content issues no reads at all, for as much
 content as the cache holds (256 MiB by default).
 
+A status line on the bottom row reads `{name} · L{n}[/{total}] · {pct}%` —
+the current line, the file's total once the background index finishes
+cleanly, and how far the anchor sits through the file by byte offset. An
+empty file reads `{name} · empty · {pct}%` instead, skipping the
+misleading `L1/0`. While the background index is still running, an
+unresolved line number reads `indexing… {k} lines`; once indexing has
+finished it reads `L?` until the count resolves. If a read error ends
+indexing early, the total never appears — its partial line count is real,
+but it is not the file's total.
+
 Usage
 =====
 
@@ -87,13 +97,15 @@ Documentation
 Design documents describing the internals live in the `docs/` directory:
 
 - [Architecture](docs/architecture.md) — crate layout, offset-driven
-  rendering, the event loop, and the type-level invariants
+  rendering, the event loop, the status line, and the type-level invariants
 - [Block cache](docs/block_cache.md) — scan-resistant eviction, read
   coalescing, and the promotion policy
 - [Budgeted scanning](docs/budgeted_scanning.md) — how every read path is
   bounded, and what happens when a budget runs out
 - [Prefetch](docs/prefetch.md) — keeping the scroll direction warm without
   polluting the cache
+- [Concurrency](docs/concurrency.md) — the one-owned-task, watch-channel
+  shape every background computation shares
 
 Session-scoped specs and implementation plans are working artifacts and are
 deliberately not part of the repository.

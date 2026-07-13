@@ -8,6 +8,7 @@ pub mod resolve;
 pub(crate) mod scan;
 pub(crate) mod schedule;
 pub mod source;
+pub(crate) mod status;
 /// Tunable engine parameters. Defaults target high-latency network filesystems.
 #[derive(Debug, Clone)]
 pub struct Config {

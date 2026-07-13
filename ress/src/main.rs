@@ -19,8 +19,9 @@ fn main() -> anyhow::Result<()> {
         // the document spawns its background indexer at construction, so
         // it must be built inside the runtime.
         let document = ress_core::document::Document::new(source, config);
-        tracing::info!("opened {} ({} bytes)", cli.file.display(), document.size());
-        app::run(document).await
+        let name = cli.file.display().to_string();
+        tracing::info!("opened {name} ({} bytes)", document.size());
+        app::run(document, name).await
     });
     // a wedged blocking read on a dead network mount must never hold the
     // process hostage after quit; abandon outstanding background fills.

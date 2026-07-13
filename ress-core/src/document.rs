@@ -2,6 +2,10 @@
 //! rendering is driven by byte offsets, not line numbers, so first paint costs
 //! one block read regardless of file size.
 use crate::Config;
+/// Re-exported so callers outside the crate (the terminal frontend's status
+/// line) can name the type `Document::index_frontier` returns; the `index`
+/// module itself stays `pub(crate)`.
+pub use crate::index::Frontier;
 use crate::resolve::Resolution;
 use crate::source::BlockSource;
 use std::sync::Arc;
@@ -66,6 +70,16 @@ impl HScroll {
 pub struct ViewportRender {
     pub rows: Vec<String>,
 }
+/// Panic message for the index-only queries (`goto_line`, `request_line_number`/
+/// `line_number`/`status_snapshots`, `index_frontier`) on a document built
+/// via `new_unindexed`; those are test-only constructions and never reach
+/// these call paths in production.
+const NO_INDEX: &str = "goto_line needs the background index (unindexed documents are test-only)";
+/// Re-exported so callers outside the crate (the terminal frontend's status
+/// line) can name the types `Document::line_number` and `status_snapshots`
+/// return without reaching into `crate::status` directly; the `status`
+/// module itself stays `pub(crate)`, same treatment as `Frontier` above.
+pub use crate::status::{LineNumber, StatusSnapshot};
 /// A read-only view over a file's bytes.
 pub struct Document {
     cache: Arc<crate::cache::BlockCache>,
@@ -73,10 +87,15 @@ pub struct Document {
     config: Config,
     prefetcher: crate::prefetch::Prefetcher,
     scheduler: Option<crate::schedule::ScanScheduler>,
+    /// The status line's line-number worker; spawned after `scheduler`
+    /// since it needs that scan's index and frontier handles. See
+    /// `crate::status` for why this is one owned, cancel-on-drop task
+    /// rather than a shared memo two call sites could each half-update.
+    status: Option<crate::status::StatusWorker>,
 }
 impl Document {
     /// Must be called within a tokio runtime: construction spawns the
-    /// background index scan.
+    /// background index scan and the status worker.
     pub fn new(source: Arc<dyn BlockSource>, config: Config) -> Self {
         let size = source.size();
         let cache = Arc::new(crate::cache::BlockCache::new(
@@ -86,19 +105,27 @@ impl Document {
         ));
         let prefetcher = crate::prefetch::Prefetcher::new(cache.clone(), config.prefetch_depth);
         let scheduler = crate::schedule::ScanScheduler::spawn(cache.clone());
+        let status = crate::status::StatusWorker::spawn(
+            cache.clone(),
+            scheduler.index().clone(),
+            scheduler.frontier(),
+            config.nav_scan_budget,
+        );
         Self {
             cache,
             size,
             config,
             prefetcher,
             scheduler: Some(scheduler),
+            status: Some(status),
         }
     }
-    /// Test-only: a document with no background index scan, for tests that
-    /// meter source reads and must not race a scanner. `goto_line` panics
-    /// on such a document; every other navigation is index-free by design.
-    /// No tokio runtime is required to construct one — unlike `new`, this
-    /// spawns nothing.
+    /// Test-only: a document with no background index scan and no status
+    /// worker, for tests that meter source reads and must not race a
+    /// scanner. `goto_line` and the status-line queries panic on such a
+    /// document; every other navigation is index-free by design. No tokio
+    /// runtime is required to construct one — unlike `new`, this spawns
+    /// nothing.
     #[cfg(test)]
     pub(crate) fn new_unindexed(source: Arc<dyn BlockSource>, config: Config) -> Self {
         let size = source.size();
@@ -114,6 +141,7 @@ impl Document {
             config,
             prefetcher,
             scheduler: None,
+            status: None,
         }
     }
     /// The shared cache, for the prefetcher.
@@ -326,8 +354,6 @@ impl Document {
     /// pends on index progress, then walks the at-most-1023-line tail from
     /// the nearest checkpoint with a budgeted forward scan.
     pub async fn goto_line(&self, n: u64) -> anyhow::Result<Resolution> {
-        const NO_INDEX: &str =
-            "goto_line needs the background index (unindexed documents are test-only)";
         let scheduler = self.scheduler.as_ref().expect(NO_INDEX);
         let line0 = n.saturating_sub(1);
         let budget = self.config.nav_scan_budget;
@@ -401,6 +427,51 @@ impl Document {
                 scan.complete(&cache, tx, span2).await.map(Anchor)
             },
         )))
+    }
+    /// Asks the status worker for `a`'s line number; the answer arrives
+    /// later, through `line_number`/`status_snapshots` — this never blocks
+    /// and never fails, not even without a tokio runtime bound to the
+    /// calling thread, since it is nothing more than a `watch` send. A
+    /// request for an anchor the worker is already resolving supersedes it
+    /// outright; see `crate::status` for the worker's own life.
+    pub fn request_line_number(&self, a: Anchor) {
+        self.status
+            .as_ref()
+            .expect(NO_INDEX)
+            .request_line_number(a.offset());
+    }
+    /// The status worker's latest snapshot. Stale the moment the anchor
+    /// moves until a fresh `request_line_number` lands and the worker
+    /// answers it — callers compare `StatusSnapshot::anchor` against what
+    /// they actually want before trusting `line`.
+    pub fn line_number(&self) -> StatusSnapshot {
+        self.status.as_ref().expect(NO_INDEX).line_number()
+    }
+    /// A fresh subscription to the status worker's snapshots, for the run
+    /// loop's repaint arm — the status-line twin of `index_frontier`.
+    pub fn status_snapshots(&self) -> tokio::sync::watch::Receiver<StatusSnapshot> {
+        self.status.as_ref().expect(NO_INDEX).status_snapshots()
+    }
+    /// A subscription to the background index's progress, for repaint-driven
+    /// consumers like the status line.
+    pub fn index_frontier(&self) -> tokio::sync::watch::Receiver<crate::index::Frontier> {
+        self.scheduler.as_ref().expect(NO_INDEX).frontier()
+    }
+    /// The file's total line count once the background index has finished
+    /// AND reached EOF — the status line's `L{n}/{total}` display. `None`
+    /// while indexing continues, and permanently `None` after an
+    /// error-shortened scan (a read error stopped it before EOF): a
+    /// partial prefix count is a real, useful number — `LineIndex::
+    /// total_lines` still returns it, and `goto_line`'s clamp still reads
+    /// that directly — but it is not the file's total, and displaying it
+    /// as one would claim an exactness the scan never earned.
+    pub fn index_total_lines(&self) -> Option<u64> {
+        let scheduler = self.scheduler.as_ref().expect(NO_INDEX);
+        let ix = scheduler.index().lock().unwrap();
+        if !ix.reached_eof() {
+            return None;
+        }
+        ix.total_lines()
     }
     /// The covered-index tail walk: one interactive step, then the
     /// standard pending continuation when the budget runs out first.
@@ -1325,6 +1396,514 @@ mod tests {
             Resolution::Ready(a) => assert_eq!(a, Anchor::at(2046)),
             Resolution::Pending(_) => panic!("index is done; the ask must resolve synchronously"),
         }
+    }
+    /// Waits until the status worker publishes a snapshot for `anchor`
+    /// satisfying `pred`, without sending a request itself — for tests that
+    /// need control over exactly when (or whether) `request_line_number` is
+    /// called relative to the wait, mirroring schedule.rs's `wait_done`.
+    async fn wait_for_line_number(
+        d: &Document,
+        anchor: u64,
+        pred: impl Fn(LineNumber) -> bool,
+    ) -> LineNumber {
+        let mut rx = d.status_snapshots();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snap = *rx.borrow();
+                if snap.anchor == anchor && pred(snap.line) {
+                    return snap.line;
+                }
+                rx.changed()
+                    .await
+                    .expect("status worker ended before resolving");
+            }
+        })
+        .await
+        .expect("status worker never reached the expected state")
+    }
+    /// Requests `a`'s line number and waits for it to settle — `Known` or
+    /// `Unavailable`, never left mid-`Converging` — the common case for
+    /// tests that only care about the final answer.
+    async fn resolved_line_number(d: &Document, a: Anchor) -> LineNumber {
+        d.request_line_number(a);
+        wait_for_line_number(d, a.offset(), |l| !matches!(l, LineNumber::Converging)).await
+    }
+    #[tokio::test]
+    async fn line_number_resolves_after_the_frontier_passes() {
+        let d = lined_doc(3000, 256);
+        // structural done-wait: a past-the-end jump joins only once the
+        // scan is finished.
+        let _ = d.goto_line(9999).await.unwrap().join().await;
+        assert_eq!(d.index_total_lines(), Some(3000));
+        assert_eq!(
+            resolved_line_number(&d, Anchor::TOP).await,
+            LineNumber::Known(1)
+        );
+        let a = d.goto_line(2000).await.unwrap().join().await;
+        assert_eq!(resolved_line_number(&d, a).await, LineNumber::Known(2000));
+    }
+    #[tokio::test]
+    async fn index_frontier_observes_done() {
+        // the run loop's repaint arm subscribes once via `index_frontier()`
+        // and polls `changed()` until `done`, disarming there — this pins
+        // that the eventually-done contract holds through the public
+        // accessor itself, not just the `ScanScheduler` it wraps (already
+        // covered in schedule.rs).
+        let d = lined_doc(3000, 256);
+        let mut frontier = d.index_frontier();
+        while !frontier.borrow().done {
+            frontier
+                .changed()
+                .await
+                .expect("index scan ended without ever sending a done frontier");
+        }
+        assert_eq!(frontier.borrow().lines_so_far, 3000);
+    }
+    #[tokio::test]
+    async fn line_number_converges_while_uncovered_and_the_scan_is_alive() {
+        // a fresh scanner has not been polled yet, so it has not covered
+        // anything; the latency keeps it from catching up before the first
+        // snapshot for this anchor is observed below. Ruled semantic
+        // change from the old design: an uncovered anchor used to report
+        // `Unavailable` unconditionally, since only an external frontier
+        // watcher would ever revisit it; the worker now waits on coverage
+        // itself, so a live scan means `Converging` — only a *dead* scan's
+        // uncovered anchor is `Unavailable` (see
+        // `line_number_stays_unavailable_past_a_dead_scan_frontier`).
+        let mut data = Vec::new();
+        for i in 0..4000u32 {
+            data.extend_from_slice(format!("line {i:04}\n").as_bytes());
+        }
+        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(2)));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 256,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        d.request_line_number(Anchor::at(34990));
+        let line = wait_for_line_number(&d, 34990, |_| true).await;
+        assert_eq!(line, LineNumber::Converging);
+    }
+    #[tokio::test]
+    async fn line_number_converges_across_many_budget_chunks() {
+        // one giant 8192-byte line then short lines; budget 256: the count
+        // from checkpoint 0 to an anchor past the giant line cannot finish
+        // in one internal step. Unlike the old design, convergence here is
+        // the worker's OWN loop resuming its CountScan across many chunks
+        // in the background — not something the caller drives call by
+        // call — so there is no caller-visible "number of tries" left to
+        // pin the way the pre-redesign version of this test did; every
+        // block in the window is already resident (the goto_line(9999)
+        // done-wait below reads the whole file), so convergence here is
+        // pure CPU across the worker's `yield_now` points, not I/O.
+        let mut data = vec![b'x'; 8192];
+        data.push(b'\n');
+        for _ in 0..10 {
+            data.extend_from_slice(b"y\n");
+        }
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        let _ = d.goto_line(9999).await.unwrap().join().await;
+        // offset 8193 is the first "y" line's start: the giant line spans
+        // [0, 8193) (8192 x's plus its newline at 8192).
+        let a = Anchor::at(8193);
+        assert_eq!(resolved_line_number(&d, a).await, LineNumber::Known(2));
+        // the resolved number stays published: an immediate re-read
+        // answers from the same snapshot without re-driving the scan.
+        assert_eq!(d.line_number().line, LineNumber::Known(2));
+    }
+    #[tokio::test]
+    async fn line_number_on_an_empty_file_is_line_one() {
+        let d = doc(b"", 64);
+        let _ = d.goto_line(9999).await.unwrap().join().await;
+        assert_eq!(
+            resolved_line_number(&d, Anchor::TOP).await,
+            LineNumber::Known(1)
+        );
+    }
+    #[tokio::test]
+    async fn line_number_stays_unavailable_past_a_dead_scan_frontier() {
+        // block 0 reads fine; every block from the second on fails on
+        // every attempt, not just the first — mirrors schedule.rs's
+        // error_shortened_scan_leaves_a_done_frontier_counting_the_frontier_line,
+        // but a persistent failure so a retry cannot mask the bug by
+        // succeeding on a second attempt at the same block.
+        struct FailsAfterFirstBlock;
+        #[async_trait::async_trait]
+        impl crate::source::BlockSource for FailsAfterFirstBlock {
+            fn size(&self) -> u64 {
+                20
+            }
+            async fn read_block(&self, offset: u64, _len: usize) -> anyhow::Result<bytes::Bytes> {
+                if offset == 0 {
+                    Ok(bytes::Bytes::from_static(b"a\nb\n"))
+                } else {
+                    Err(anyhow::anyhow!("boom"))
+                }
+            }
+        }
+        let d = Document::new(
+            Arc::new(FailsAfterFirstBlock),
+            Config {
+                block_size: 4,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        let mut frontier = d.index_frontier();
+        while !frontier.borrow().done {
+            frontier
+                .changed()
+                .await
+                .expect("index scan ended without ever sending a done frontier");
+        }
+        assert_eq!(
+            d.index_total_lines(),
+            None,
+            "an error-shortened scan's partial count must not display as the file's total"
+        );
+        // below the dead frontier (processed_up_to == 4): the count stays
+        // inside the successfully-scanned prefix and must resolve.
+        assert_eq!(
+            resolved_line_number(&d, Anchor::at(2)).await,
+            LineNumber::Known(2)
+        );
+        // past the dead frontier: coverage must never be granted by `done`
+        // alone, so this anchor stays Unavailable forever — never a wrong
+        // number, never an error surfaced from the dead scan's old read
+        // failure, since processed_up_to never moves again once the scan
+        // has died. Structurally guaranteed, not just observed: the
+        // coverage gate never touches the cache at all (only the index
+        // lock), so an anchor that never passes it can never reach a read.
+        assert_eq!(
+            resolved_line_number(&d, Anchor::at(8)).await,
+            LineNumber::Unavailable
+        );
+    }
+    /// An 8-line, 8-byte-per-line fixture over a 4-block cache (block_size
+    /// 8, cache_bytes 32: probation capacity 1) whose background scan —
+    /// warming sequentially through `warm()`, never promoting — evicts
+    /// every block behind itself, so by the time the index is done only
+    /// the last-scanned block remains resident. Anchor 8 (the second
+    /// line's start) then needs block 0, which the scan read successfully
+    /// once but which is now cold: the shared setup the worker tests below
+    /// build on (retry exhaustion, runtime-independence, supersession
+    /// under a slow re-fetch). Waits on the frontier directly rather than
+    /// done-waiting through a `goto_line` join: the latter's own clamped
+    /// walk would read block 0 a second time as part of resolving its
+    /// answer, double-counting reads a source that fails from the second
+    /// read on (see the retry-exhaustion test below) would not survive.
+    async fn cold_block_zero_doc(src: Arc<dyn BlockSource>) -> (Document, Anchor) {
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 8,
+                cache_bytes: 32,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        let mut frontier = d.index_frontier();
+        while !frontier.borrow().done {
+            frontier
+                .changed()
+                .await
+                .expect("index scan ended without ever sending a done frontier");
+        }
+        (d, Anchor::at(8))
+    }
+    #[tokio::test]
+    async fn line_number_converges_despite_viewport_eviction_pressure() {
+        // finding 2's shape (round 3): `draw` reads the viewport first
+        // (filling and evicting the shared cache) and the status query
+        // second, every frame; on a cache too small to hold both, the
+        // worker's own walk must keep making progress even though the
+        // viewport keeps evicting blocks behind it. Unlike the old
+        // design's managed-fetch pinning, there is nothing to pin here:
+        // the worker retains its own `CountScan` cursor across internal
+        // steps and consumes each block's bytes the instant it is warmed,
+        // within that same step — so it only ever needs the one block
+        // currently in hand, and a viewport read racing in between can
+        // never evict a block the walk still needs. The two reads are on
+        // disjoint blocks, matching `draw`'s real shape (the count's
+        // window sits strictly before the anchor; the viewport reads
+        // strictly at and after it).
+        let data = "aaaaaaa\n".repeat(4).into_bytes(); // four 8-byte lines
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 8,
+                cache_bytes: 16, // 2 blocks: 1 probationary, 1 protected
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        let _ = d.goto_line(9999).await.unwrap().join().await;
+        // the third line's start: the count's window [0, 16) needs blocks
+        // 0 and 1; the viewport reading forward from here needs blocks 2
+        // and 3 — disjoint from what the count needs.
+        let a = Anchor::at(16);
+        d.request_line_number(a);
+        let rx = d.status_snapshots();
+        let mut tries = 0usize;
+        let n = loop {
+            tries += 1;
+            assert!(tries < 500, "eviction livelock: query failed to converge");
+            let _ = d.viewport(a, 5, 80, HScroll::ZERO).await.unwrap();
+            let snap = *rx.borrow();
+            if snap.anchor != a.offset() {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            match snap.line {
+                LineNumber::Known(n) => break n,
+                LineNumber::Converging => tokio::task::yield_now().await,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(n, 3);
+    }
+    #[tokio::test]
+    async fn line_number_settles_on_the_latest_anchor_despite_rapid_requests() {
+        // finding 1's shape (round 3), inverted for the new design:
+        // spamming `request_line_number` for ten different anchors with no
+        // yields in between must not spawn ten walks — the worker can
+        // only ever act on the LAST anchor it was told about once it is
+        // next scheduled, so nothing before that point can have read
+        // anything. This is a structural guarantee, not a probabilistic
+        // one: no `.await` happens between the first send and the
+        // read-count check below, and a spawned task cannot run at all
+        // until this task yields — pileup is impossible to observe here,
+        // not just unlikely.
+        let data = "aaaaaaa\n".repeat(8).into_bytes();
+        let src =
+            Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(20)));
+        let (d, _) = cold_block_zero_doc(src.clone()).await;
+        let before = src.read_count();
+        for i in 0..10u64 {
+            d.request_line_number(Anchor::at(i));
+        }
+        let settled = Anchor::at(8); // second line's start; needs the cold block 0.
+        d.request_line_number(settled);
+        assert_eq!(
+            src.read_count(),
+            before,
+            "the worker ran before it could possibly have been scheduled"
+        );
+        let line = wait_for_line_number(&d, settled.offset(), |l| {
+            !matches!(l, LineNumber::Converging)
+        })
+        .await;
+        assert_eq!(line, LineNumber::Known(2));
+    }
+    #[tokio::test]
+    async fn line_number_stalls_at_unavailable_after_exhausting_retries() {
+        // findings 1 and 2's shared failure mode (round 3), pushed to its
+        // limit: a block that reads fine once (so the background scan
+        // covers past it) but fails every time it is re-fetched (a
+        // network mount that dropped after indexing) must retry a bounded
+        // number of times, then give up — permanently. The worker parks
+        // on the anchor channel after publishing `Unavailable`, so unlike
+        // the old per-call design there is no "next call" to keep
+        // retrying: read activity on the source must freeze too.
+        struct FailsOnRereadOfBlockZero {
+            data: bytes::Bytes,
+            block0_reads: std::sync::atomic::AtomicU64,
+            reads: std::sync::atomic::AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl BlockSource for FailsOnRereadOfBlockZero {
+            fn size(&self) -> u64 {
+                self.data.len() as u64
+            }
+            async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<bytes::Bytes> {
+                self.reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if offset == 0
+                    && self
+                        .block0_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                {
+                    return Err(anyhow::anyhow!("block 0 unreachable"));
+                }
+                let size = self.data.len() as u64;
+                let start = offset.min(size) as usize;
+                let end = offset.saturating_add(len as u64).min(size) as usize;
+                Ok(self.data.slice(start..end))
+            }
+        }
+        let src = Arc::new(FailsOnRereadOfBlockZero {
+            data: bytes::Bytes::from("aaaaaaa\n".repeat(8)),
+            block0_reads: std::sync::atomic::AtomicU64::new(0),
+            reads: std::sync::atomic::AtomicU64::new(0),
+        });
+        let (d, a) = cold_block_zero_doc(src.clone()).await;
+        let line = resolved_line_number(&d, a).await;
+        assert_eq!(line, LineNumber::Unavailable, "retries must exhaust");
+        let frozen_at = src.reads.load(std::sync::atomic::Ordering::Relaxed);
+        // well past the retry backoff (3 retries at 50/100/150ms): no
+        // further reads without a new anchor to kick the worker again.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            src.reads.load(std::sync::atomic::Ordering::Relaxed),
+            frozen_at,
+            "worker kept retrying after exhausting its budget"
+        );
+    }
+    #[tokio::test]
+    async fn line_number_request_and_read_need_no_runtime() {
+        // finding 3's shape (round 3), restated for the new API: the old
+        // design's bare `tokio::spawn` inside a sync `line_number_at`
+        // needed a runtime bound to the calling thread and panicked
+        // without one. `request_line_number`/`line_number` need nothing of
+        // the sort — they are a `watch` send and a `watch` borrow,
+        // thread-safe and allocation-free by construction, so a plain OS
+        // thread with no tokio runtime at all can drive both without
+        // panicking. The worker itself keeps running on the runtime that
+        // spawned it, wholly independent of whatever thread calls these
+        // two methods, and still resolves a request sent from the
+        // runtime-free thread once given a chance to run.
+        let data = "aaaaaaa\n".repeat(8).into_bytes();
+        let src = Arc::new(MockSource::new(data));
+        let (d, a) = cold_block_zero_doc(src).await;
+        let from_plain_thread = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    d.request_line_number(a);
+                    d.line_number()
+                })
+                .join()
+        });
+        assert!(
+            from_plain_thread.is_ok(),
+            "request_line_number/line_number must not panic without a runtime"
+        );
+        let line =
+            wait_for_line_number(&d, a.offset(), |l| !matches!(l, LineNumber::Converging)).await;
+        assert_eq!(
+            line,
+            LineNumber::Known(2),
+            "the worker still resolves a request sent from a runtime-free thread"
+        );
+    }
+    #[tokio::test]
+    async fn line_number_is_converging_for_a_covered_but_unresolved_count() {
+        // one of the four corner semantics `status_converging` used to
+        // pin at the render layer, now re-pinned engine-side: a budget too
+        // small to finish counting from the checkpoint to the anchor in
+        // one internal step is covered, but not yet resolved. A trailing
+        // line past the anchor is required for coverage itself: coverage
+        // needs `processed_up_to` strictly past the anchor, which a
+        // done-waited scan can never be true of when the anchor sits
+        // exactly at EOF. Every block in the window is warmed into cache
+        // first (the done-waited background scan reads the whole file),
+        // so the walk's own 33 chunked steps are back-to-back cache hits —
+        // each still followed by an explicit yield (see `crate::status`),
+        // giving this test's own task ample opportunity to observe the
+        // `Converging` snapshot before the walk finishes.
+        let mut data = vec![b'x'; 8192];
+        data.push(b'\n');
+        data.extend_from_slice(b"y\n");
+        let src = Arc::new(MockSource::new(data));
+        let d = Document::new(
+            src,
+            Config {
+                block_size: 64,
+                nav_scan_budget: 256,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        let _ = d.goto_line(9999).await.unwrap().join().await;
+        let a = Anchor::at(8193);
+        let mut rx = d.status_snapshots();
+        rx.borrow_and_update(); // a clean baseline before requesting.
+        d.request_line_number(a);
+        let mut saw_converging = false;
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snap = *rx.borrow();
+                if snap.anchor == a.offset() {
+                    match snap.line {
+                        LineNumber::Converging => saw_converging = true,
+                        other @ (LineNumber::Known(_) | LineNumber::Unavailable) => return other,
+                    }
+                }
+                rx.changed()
+                    .await
+                    .expect("status worker ended before resolving");
+            }
+        })
+        .await
+        .expect("status worker never resolved");
+        assert!(
+            saw_converging,
+            "a multi-step walk must publish an intermediate Converging snapshot"
+        );
+        assert_eq!(line, LineNumber::Known(2));
+    }
+    #[tokio::test]
+    async fn line_number_is_known_once_resolved() {
+        // the second of the four corner semantics: a count that finishes
+        // within its budget resolves to the real line number.
+        let d = lined_doc(10, 64);
+        let a = d.goto_line(5).await.unwrap().join().await;
+        assert_eq!(resolved_line_number(&d, a).await, LineNumber::Known(5));
+    }
+    #[tokio::test]
+    async fn dropping_the_document_stops_the_status_worker() {
+        // the round-4 Arc-ownership-cycle bug this redesign replaces,
+        // inverted as a regression test: the old design's fetch task
+        // strongly owned the very Arc holding its own abort handle, so a
+        // hung fetch survived dropping the Document entirely — a leaked
+        // background reader with nothing left to cancel it. The new
+        // worker holds only cache/index/channel handles, never a handle
+        // to itself, so Document's own drop (which drops the worker,
+        // whose `Drop` impl aborts its task) is sufficient on its own.
+        let mut data = vec![b'x'; 4096];
+        data.push(b'\n');
+        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(5)));
+        let d = Document::new(
+            src.clone(),
+            Config {
+                block_size: 64,
+                cache_bytes: 4 * 64,
+                nav_scan_budget: 64,
+                prefetch_depth: 0,
+                ..Config::default()
+            },
+        );
+        let mut frontier = d.index_frontier();
+        while !frontier.borrow().done {
+            frontier
+                .changed()
+                .await
+                .expect("index scan ended without ever sending a done frontier");
+        }
+        d.request_line_number(Anchor::at(4000));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let mid = src.read_count();
+        assert!(mid > 0, "walk should be re-reading evicted blocks by now");
+        drop(d);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            src.read_count(),
+            mid,
+            "the status worker kept reading after its Document was dropped"
+        );
     }
 }
 
