@@ -238,6 +238,88 @@ impl BackwardScan {
         }
     }
 }
+/// One chunk's outcome of a resumable newline count. The status worker (see
+/// `crate::status`) is the production consumer, stepping this directly
+/// inside its own `select!` loop rather than through a synchronous,
+/// cache-only sibling — a background task can afford to await a block a
+/// synchronous draw-time query never could.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CountStep {
+    /// Every byte of the window has been examined.
+    Done(u64),
+    /// The chunk is consumed; call `step` again to continue.
+    More,
+}
+/// A resumable count of the newlines in `[from, to)`. The window is captured
+/// at construction (an inverted window is empty); `step` consumes one budget
+/// chunk at a time, and out-of-contract positions clamp into the file like
+/// every scan object. Behavior after `Done` is unspecified; callers stop.
+pub struct CountScan {
+    pos: u64,
+    end: u64,
+    chunk: usize,
+    found: u64,
+    scanned: u64,
+}
+impl CountScan {
+    /// Counts newlines in `[from, to)`, reading at most `chunk` bytes per
+    /// step (clamped to one so every step makes progress).
+    pub fn new(from: u64, to: u64, chunk: usize) -> CountScan {
+        CountScan {
+            pos: from,
+            end: to.max(from),
+            chunk: chunk.max(1),
+            found: 0,
+            scanned: 0,
+        }
+    }
+    /// Bytes examined so far.
+    // dead on the lib target: the status worker, `step`'s production
+    // caller, tracks convergence through the published `StatusSnapshot`
+    // instead of bytes scanned, so this has no production caller — kept for
+    // the test suite, same as ForwardScan/BackwardScan's `scanned` would be
+    // if anything ever needed to build a progress bar over a count.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn scanned(&self) -> u64 {
+        self.scanned
+    }
+    /// Consumes up to one chunk of bytes counting newlines, reading through
+    /// `warm()` rather than `block()`: the status worker is a background
+    /// consumer racing the interactive viewport for the same cache, and
+    /// must not promote or reorder the working set any more than the index
+    /// scan does (see `crate::schedule::ScanScheduler`).
+    pub async fn step(&mut self, cache: &crate::cache::BlockCache) -> anyhow::Result<CountStep> {
+        let size = cache.size();
+        // computed windows past EOF degrade to the real bytes, mirroring
+        // the other scan objects' out-of-contract philosophy.
+        self.pos = self.pos.min(size);
+        self.end = self.end.min(size);
+        let bs = cache.block_size() as u64;
+        let mut spent = 0usize;
+        while self.pos < self.end && spent < self.chunk {
+            let block = cache.warm(self.pos / bs).await?;
+            let lo = (self.pos % bs) as usize;
+            // the outer clamp makes this unreachable; kept for sibling
+            // consistency (a bare range start would panic where take merely
+            // saturates).
+            let lo = lo.min(block.len());
+            let take = ((self.end - self.pos) as usize).min(block.len() - lo);
+            let slice = &block[lo..lo + take];
+            if slice.is_empty() {
+                break;
+            }
+            self.found += memchr::memchr_iter(b'\n', slice).count() as u64;
+            self.pos += slice.len() as u64;
+            self.scanned += slice.len() as u64;
+            spent += slice.len();
+        }
+        if self.pos >= self.end {
+            Ok(CountStep::Done(self.found))
+        } else {
+            Ok(CountStep::More)
+        }
+    }
+}
 /// Collects bytes from `from` up to and including the `rows`-th newline, EOF,
 /// or `budget`; the bool reports whether the scan stopped at EOF or budget.
 pub async fn fill_lines(
@@ -574,6 +656,74 @@ mod tests {
             other => panic!("expected Top, got {other:?} (no progress on an out-of-range window)"),
         }
     }
+    #[tokio::test]
+    async fn count_scan_counts_newlines_in_the_window() {
+        let c = cache(b"a\nb\nc\nd\n", 4);
+        let mut s = CountScan::new(0, 8, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(4));
+        let mut s = CountScan::new(2, 6, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(2));
+    }
+    #[tokio::test]
+    async fn count_scan_excludes_the_end_byte() {
+        // [2, 3): byte 3 is a newline and must not be counted.
+        let c = cache(b"a\nb\nc\n", 4);
+        let mut s = CountScan::new(2, 3, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(0));
+        let mut s = CountScan::new(2, 4, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(1));
+    }
+    #[tokio::test]
+    async fn count_scan_resumes_across_chunks() {
+        let data: &'static [u8] = Box::leak(b"x\n".repeat(512).into_boxed_slice());
+        let c = cache(data, 16);
+        let mut s = CountScan::new(0, 1024, 64);
+        let mut steps = 0usize;
+        let total = loop {
+            match s.step(&c).await.unwrap() {
+                CountStep::Done(n) => break n,
+                CountStep::More => steps += 1,
+            }
+        };
+        assert_eq!(total, 512);
+        assert!(steps >= 2, "must have taken multiple chunks");
+    }
+    #[tokio::test]
+    async fn count_scan_empty_and_inverted_windows_are_zero() {
+        let c = cache(b"a\nb\n", 4);
+        let mut s = CountScan::new(2, 2, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(0));
+        let mut s = CountScan::new(3, 1, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(0));
+    }
+    #[tokio::test]
+    async fn count_scan_out_of_range_window_clamps_into_the_file() {
+        let c = cache(b"a\nb\n", 4);
+        let mut s = CountScan::new(0, 999, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(2));
+        let mut s = CountScan::new(700, 999, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(0));
+    }
+    #[tokio::test]
+    async fn count_scan_scanned_counts_the_terminal_block() {
+        // same contract as the forward/backward twins: a terminal slice that
+        // ends mid-block counts only the window's bytes toward `scanned`,
+        // not the rest of the block sitting in hand (ERRATUM 3c#2's rule,
+        // applied to a window boundary instead of a found newline).
+        let data: &'static [u8] = Box::leak({
+            let mut v = vec![b'x'; 64];
+            v.extend_from_slice(b"\ny");
+            v.into_boxed_slice()
+        });
+        let c = cache(data, 16);
+        let mut s = CountScan::new(0, 65, 1 << 10);
+        assert_eq!(s.step(&c).await.unwrap(), CountStep::Done(1));
+        assert_eq!(
+            s.scanned(),
+            65,
+            "bytes 0..65 were examined, not byte 65 itself"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -647,6 +797,36 @@ mod props {
                     }
                 };
                 prop_assert_eq!(&got, &oracle, "chunked scan diverged from unbudgeted scan");
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+        #[test]
+        fn count_stepped_chunks_agree_with_one_giant_step(
+            data in proptest::collection::vec(
+                prop_oneof![2 => Just(b'\n'), 8 => any::<u8>()],
+                0..128,
+            ),
+            block_size in 1usize..32,
+            chunk in 1usize..24,
+            from in 0u64..128,
+            to in 0u64..128,
+        ) {
+            let c = crate::cache::BlockCache::new(
+                std::sync::Arc::new(MockSource::new(data.clone())),
+                block_size,
+                1 << 20,
+            );
+            rt().block_on(async {
+                let mut big = CountScan::new(from, to, usize::MAX);
+                let oracle = big.step(&c).await.unwrap();
+                let mut small = CountScan::new(from, to, chunk);
+                let got = loop {
+                    match small.step(&c).await.unwrap() {
+                        CountStep::More => {}
+                        terminal => break terminal,
+                    }
+                };
+                prop_assert_eq!(&got, &oracle, "chunked count diverged from unbudgeted count");
                 Ok::<(), TestCaseError>(())
             })?;
         }

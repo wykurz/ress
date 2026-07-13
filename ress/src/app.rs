@@ -2,6 +2,7 @@
 //! `run` is the thin async driver over crossterm events.
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use futures::StreamExt;
+use ratatui::layout::Rect;
 use ress_core::document::{Anchor, Document, HScroll};
 use ress_core::resolve::{PendingNav, Resolution};
 /// What the loop should do after handling an input event.
@@ -145,15 +146,44 @@ impl App {
         }
     }
 }
+/// Whether a terminal `rows` tall has a row to spare for chrome — the same
+/// threshold `content_rows` reserves a row below, extracted so a caller
+/// that needs to know in advance whether the chrome row will be visible
+/// (`draw`'s status-line skip, below) never drifts from it.
+fn has_chrome_row(rows: u16) -> bool {
+    rows > 1
+}
+/// Reserves the terminal's last row for chrome (the status line, or the
+/// progress row while a scan is pending): content gets the rest. Below two
+/// rows there is no room to spare — a 1- or 0-row terminal gets content
+/// only, with no reserved row at all, rather than losing its lone row to
+/// chrome. Applied both where terminal rows enter the loop (`run`'s size
+/// handling, for `apply_nav`/`handle_resize`/the viewport fetch) and again
+/// against the live frame area inside `draw`'s sync closure, mirroring the
+/// existing split between the pre-draw `rows` estimate and `f.area()`.
+fn content_rows(rows: u16) -> u16 {
+    if has_chrome_row(rows) { rows - 1 } else { rows }
+}
 /// Draws the current screen: compute the viewport for the terminal size, blit
-/// it, and overlay the transient progress row on the bottom line while a scan
-/// is pending. Viewport I/O happens before `draw` because the draw closure is
-/// sync.
+/// it into the reserved content rows, and overlay either the transient
+/// progress row (while a scan is pending) or the status line on the bottom
+/// row. Viewport I/O happens before `draw` because the draw closure is sync;
+/// the status line's queries sit right next to it for the same reason,
+/// though they are themselves synchronous and infallible — `request_line_number`
+/// is nothing but a `watch` send and `line_number` nothing but a `watch`
+/// borrow, so this can never stall on a cold read or kill the pager on a
+/// read error the way a foreground read on this path once could. Whether the
+/// status line keeps converging is no longer this function's concern to
+/// report back: the status worker publishes on its own schedule, and the run
+/// loop's `status_snapshots` arm notices every change independently, so a
+/// painted `L?` needs no help from this call's return value to eventually
+/// repaint as the real number.
 async fn draw(
     term: &mut crate::terminal::Term,
     doc: &Document,
     app: &App,
     pending: Option<&PendingNav>,
+    name: &str,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()> {
@@ -164,10 +194,65 @@ async fn draw(
         let prog = *p.progress.borrow();
         (p.label, prog.percent())
     });
+    // the real backend size, queried directly rather than threaded through
+    // as a parameter: `rows` above is already content rows, not raw
+    // terminal height, so it cannot answer "is there a chrome row at all"
+    // on its own. Nothing between here and the terminal draw call below
+    // awaits, so this can never observe a different height than the frame
+    // area `f.area()` resolves to inside that call.
+    let chrome = has_chrome_row(term.inner_mut().size()?.height);
+    // while a scan is pending its progress row claims the bottom row
+    // instead, so the status line's own budgeted queries would go unused;
+    // a terminal with no row to spare for chrome hides the status line the
+    // same way — either way the result would go unused, so skip computing
+    // it rather than spend an extra worker request on a number nobody will
+    // see this frame.
+    let status = if indicator.is_none() && chrome {
+        doc.request_line_number(app.top);
+        let snap = doc.line_number();
+        // the engine is the truth for what each outcome means, so the
+        // mapping here is display-only: `Known` shows its number, every
+        // other case (not yet answered for this anchor, `Converging`, or
+        // `Unavailable`) shows the formatter's uncovered/unresolved `L?`
+        // logic — see `ress_core::document::LineNumber`. A snapshot whose
+        // anchor does not match `app.top` is simply stale (the worker
+        // has not caught up to the latest request yet, indistinguishable
+        // from `Converging` here); the run loop's `status_snapshots` arm
+        // is what repaints once a fresher one lands, not this mapping.
+        let line = (snap.anchor == app.top.offset())
+            .then_some(match snap.line {
+                ress_core::document::LineNumber::Known(n) => Some(n),
+                _ => None,
+            })
+            .flatten();
+        let total = doc.index_total_lines();
+        let frontier = *doc.index_frontier().borrow();
+        // u128: an exact percent for huge (sparse) files; display-only.
+        let pct = (app.top.offset() as u128 * 100 / (doc.size().max(1) as u128)) as u64;
+        Some(crate::render::status_text(
+            name,
+            line,
+            total,
+            frontier.done,
+            frontier.lines_so_far,
+            pct,
+        ))
+    } else {
+        None
+    };
     term.inner_mut().draw(|f| {
-        crate::render::render_viewport(&view, f.area(), f.buffer_mut());
-        if let Some((label, pct)) = indicator {
-            crate::render::render_progress_row(label, pct, f.area(), f.buffer_mut());
+        let area = f.area();
+        let content_area = Rect {
+            height: content_rows(area.height),
+            ..area
+        };
+        crate::render::render_viewport(&view, content_area, f.buffer_mut());
+        if content_area.height < area.height {
+            if let Some((label, pct)) = indicator {
+                crate::render::render_progress_row(label, pct, area, f.buffer_mut());
+            } else if let Some(status) = &status {
+                crate::render::render_status_line(status, area, f.buffer_mut());
+            }
         }
     })?;
     Ok(())
@@ -229,17 +314,53 @@ async fn handle_resize(
 }
 /// Runs the event loop until the user quits. Pending navigation resolves in
 /// the background: a tick keeps the progress row fresh, completion moves the
-/// anchor, Esc cancels, and any new motion supersedes.
-pub async fn run(doc: Document) -> anyhow::Result<()> {
+/// anchor, Esc cancels, and any new motion supersedes. The background index
+/// frontier and the status worker's snapshots (`ress_core::status`) are both
+/// watched separately from all of that, in the same shape: each arm only
+/// marks the frame `dirty`, gated on `chrome` existing at all — a hidden row
+/// has nothing to repaint for — and the tick is the sole point that turns a
+/// dirty flag into a repaint, so a burst of index progress or status updates
+/// between two ticks still costs at most one extra draw. The status
+/// worker's own background convergence needs no help from a draw's return
+/// value to eventually repaint the real number the way an earlier design
+/// needed: every draw call site here just clears `dirty` itself immediately
+/// afterward, and the `status_snapshots` arm picks up whatever the worker
+/// publishes next on its own. The tick's other reason to redraw — a pending
+/// navigation's progress row needs refreshing — is chrome-gated the same
+/// way: that row is exactly as invisible on a chromeless terminal as the
+/// status line is, so redrawing for it there would fetch a viewport nobody
+/// can see anything new in. The one exception is the pending-completion arm:
+/// when a background scan finishes, the anchor itself moves, so its draw
+/// stays unconditional — visible content changed regardless of whether
+/// there is a chrome row to show progress in. `name` is the status line's
+/// display name for the file.
+pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
     let mut term = crate::terminal::Term::new()?;
     let mut app = App::new();
     let mut pending: Option<ActiveNav> = None;
-    let (mut cols, mut rows) = crossterm::terminal::size()?;
+    let (mut cols, raw_rows) = crossterm::terminal::size()?;
+    let mut rows = content_rows(raw_rows);
+    // hoisted so the frontier/status arms below never re-derive it
+    // independently of each other; updated on resize, alongside `rows`.
+    let mut chrome = has_chrome_row(raw_rows);
+    // subscribe before the first paint: a scan finishing (or a status
+    // resolution landing) in between must still trigger one repaint.
+    // `frontier_done`/`status_closed` seed from the current state rather
+    // than a fixed `false` because a tiny file's scan can finish before
+    // this line ever runs, and each arm below must start disarmed in that
+    // case rather than polling a channel that is (or is about to be)
+    // closed or permanently quiescent.
+    let mut frontier = doc.index_frontier();
+    let mut frontier_done = frontier.borrow().done;
+    let mut status_rx = doc.status_snapshots();
+    let mut status_closed = false;
+    let mut dirty = false;
     draw(
         &mut term,
         &doc,
         &app,
         pending.as_ref().map(|a| &a.p),
+        &name,
         cols,
         rows,
     )
@@ -260,10 +381,47 @@ pub async fn run(doc: Document) -> anyhow::Result<()> {
                     Err(e) if e.is_cancelled() => {}
                     Err(e) => tracing::warn!("background scan panicked: {e:?}"),
                 }
-                draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
+                // unconditional: the anchor may have just moved, so visible
+                // content can have changed regardless of chrome.
+                draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                dirty = false;
             }
-            _ = tick.tick(), if pending.is_some() => {
-                draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
+            changed = frontier.changed(), if !frontier_done && chrome => {
+                // no draw here: the tick arm below is the sole coalescing
+                // point, so a burst of frontier updates between two ticks
+                // still costs at most one extra repaint.
+                match changed {
+                    Ok(()) => {
+                        dirty = true;
+                        frontier_done = frontier.borrow().done;
+                    }
+                    // the scheduler's sender is gone — a teardown race only,
+                    // since `doc` outlives this loop; disarm like a done
+                    // frontier would, without drawing or exiting.
+                    Err(_) => frontier_done = true,
+                }
+            }
+            changed = status_rx.changed(), if !status_closed && chrome => {
+                // same shape as the frontier arm just above, including the
+                // same "teardown race only" reasoning for the Err case —
+                // unlike a finished scan, the status worker never reaches a
+                // legitimate permanent-done state on its own (a fresh
+                // request always wakes it again), so `status_closed` exists
+                // purely as that defensive disarm, not a real steady state.
+                match changed {
+                    Ok(()) => dirty = true,
+                    Err(_) => status_closed = true,
+                }
+            }
+            _ = tick.tick() => {
+                // a pending nav's progress row is exactly as invisible on a
+                // chromeless terminal as the status line is, so redrawing
+                // for it there would fetch a viewport nobody can see
+                // anything new in.
+                if dirty || (pending.is_some() && chrome) {
+                    draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                    dirty = false;
+                }
             }
             ev = events.next() => {
                 let Some(ev) = ev else {
@@ -281,13 +439,18 @@ pub async fn run(doc: Document) -> anyhow::Result<()> {
                         }
                         Action::Nav(nav) => {
                             apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
-                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                            dirty = false;
                         }
                         Action::Cancel => {
                             pending = None;
-                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                            dirty = false;
                         }
-                        Action::Redraw => draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?,
+                        Action::Redraw => {
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                            dirty = false;
+                        }
                         Action::None => {}
                     },
                     Event::Mouse(m) => {
@@ -298,14 +461,17 @@ pub async fn run(doc: Document) -> anyhow::Result<()> {
                         };
                         if let Some(nav) = nav {
                             apply_nav(&doc, &mut app, &mut pending, nav, rows).await?;
-                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
+                            draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                            dirty = false;
                         }
                     }
                     Event::Resize(c, r) => {
                         cols = c;
-                        rows = r;
+                        rows = content_rows(r);
+                        chrome = has_chrome_row(r);
                         handle_resize(&doc, &mut app, &mut pending, rows).await?;
-                        draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), cols, rows).await?;
+                        draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                        dirty = false;
                     }
                     _ => {}
                 }
@@ -334,6 +500,29 @@ mod tests {
         }
         let src = std::sync::Arc::new(ress_core::source::MockSource::new(data));
         Document::new(src, ress_core::Config::default())
+    }
+    #[test]
+    fn content_rows_reserves_the_bottom_row_but_not_below_two() {
+        // the reservation formula run() applies where terminal rows enter:
+        // apply_nav/handle_resize/draw all consume its result, so a bug here
+        // would misplace every row-dependent nav, not just the status line.
+        assert_eq!(content_rows(24), 23);
+        assert_eq!(content_rows(2), 1);
+        // below two rows there is no room to spare for chrome: content gets
+        // the lone row (or zero) instead of the status line claiming it.
+        assert_eq!(content_rows(1), 1);
+        assert_eq!(content_rows(0), 0);
+    }
+    #[test]
+    fn has_chrome_row_matches_content_rows_own_threshold() {
+        // draw's status-line skip gates on this directly (it cannot use
+        // content_rows(raw) < raw for the same check, since draw only ever
+        // sees the already-reduced content row count, never the raw one);
+        // it must never drift from the reservation formula above.
+        assert!(!has_chrome_row(0));
+        assert!(!has_chrome_row(1));
+        assert!(has_chrome_row(2));
+        assert!(has_chrome_row(24));
     }
     #[test]
     fn q_quits() {

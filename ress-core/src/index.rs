@@ -95,12 +95,30 @@ impl LineIndex {
             Some(_) => self.newlines + 1,
         })
     }
+    /// Whether the finished scan reached EOF, as opposed to stopping early
+    /// after a read error; always `false` before `finish` is called, same
+    /// as the unfinished default. `total_lines` is a real, useful number
+    /// either way — a best-known clamp for navigation — but only a
+    /// `true` here means it is the file's actual total; `Document::
+    /// index_total_lines` gates the status line's display total on this.
+    pub fn reached_eof(&self) -> bool {
+        self.reached_eof
+    }
     /// The greatest checkpoint at or below 0-based line `line0`: returns
     /// `(start_offset, line0_of_checkpoint)`. Callers guarantee
     /// `line0 <= newlines()`, so the checkpoint exists.
     pub fn nearest_checkpoint(&self, line0: u64) -> (u64, u64) {
         let j = (line0 / CHECKPOINT_INTERVAL) as usize;
         let j = j.min(self.checkpoints.len() - 1);
+        (self.checkpoints[j], j as u64 * CHECKPOINT_INTERVAL)
+    }
+    /// The greatest recorded checkpoint whose byte offset is at or below
+    /// `offset`: `(start_offset, line0)`. Total — the offset-zero checkpoint
+    /// always exists. Callers gate on the frontier having passed `offset`,
+    /// which guarantees the true bucket's checkpoint is recorded and the
+    /// walk from it is under one interval.
+    pub fn checkpoint_at_or_below(&self, offset: u64) -> (u64, u64) {
+        let j = self.checkpoints.partition_point(|&cp| cp <= offset) - 1;
         (self.checkpoints[j], j as u64 * CHECKPOINT_INTERVAL)
     }
 }
@@ -144,6 +162,19 @@ mod tests {
         assert_eq!(finished.total_lines(), Some(2));
     }
     #[test]
+    fn reached_eof_distinguishes_a_full_scan_from_an_error_shortened_one() {
+        let fresh = LineIndex::new();
+        assert!(!fresh.reached_eof());
+        let mut full = LineIndex::new();
+        full.ingest(b"a\nb\n");
+        full.finish(true);
+        assert!(full.reached_eof());
+        let mut shortened = LineIndex::new();
+        shortened.ingest(b"a\nb\n");
+        shortened.finish(false);
+        assert!(!shortened.reached_eof());
+    }
+    #[test]
     fn frontier_reports_progress_and_completion() {
         let mut ix = LineIndex::new();
         ix.ingest(b"a\nb");
@@ -167,6 +198,18 @@ mod tests {
         assert_eq!(ix.nearest_checkpoint(1023), (0, 0));
         assert_eq!(ix.nearest_checkpoint(1024), (2048, 1024));
         assert_eq!(ix.nearest_checkpoint(2049), (4096, 2048));
+    }
+    #[test]
+    fn checkpoint_lookup_by_offset_finds_the_greatest_at_or_below() {
+        // 2050 two-byte lines: checkpoints at offsets 0, 2048, 4096.
+        let data: Vec<u8> = std::iter::repeat_n(*b"x\n", 2050).flatten().collect();
+        let ix = ingested(&data, 313);
+        assert_eq!(ix.checkpoint_at_or_below(0), (0, 0));
+        assert_eq!(ix.checkpoint_at_or_below(2047), (0, 0));
+        assert_eq!(ix.checkpoint_at_or_below(2048), (2048, 1024));
+        assert_eq!(ix.checkpoint_at_or_below(4095), (2048, 1024));
+        assert_eq!(ix.checkpoint_at_or_below(4100), (4096, 2048));
+        assert_eq!(ix.checkpoint_at_or_below(u64::MAX), (4096, 2048));
     }
     #[test]
     fn chunk_boundary_straddling_newline_is_counted_once() {

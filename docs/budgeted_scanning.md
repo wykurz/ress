@@ -1,11 +1,12 @@
 # Budgeted scanning
 
-A pager for huge files must never let one keypress read an unbounded amount
-of data. `ress` enforces this structurally: the engine has exactly three
-read loops, they live in one module (`ress-core/src/scan.rs`), and each
-takes a **mandatory byte budget**. A scan without a bound cannot be written,
-which is the point — early revisions had five hand-rolled read loops, and
-"each loop manages its own bound" reliably decayed into "some loops forgot."
+A pager for huge files must never let one keypress — or one repaint — read
+an unbounded amount of data. `ress` enforces this structurally: the engine
+has exactly four read loops, they live in one module
+(`ress-core/src/scan.rs`), and each takes a **mandatory byte budget**. A
+scan without a bound cannot be written, which is the point — early
+revisions had five hand-rolled read loops, and "each loop manages its own
+bound" reliably decayed into "some loops forgot."
 
 ## The primitives
 
@@ -24,6 +25,16 @@ which is the point — early revisions had five hand-rolled read loops, and
   trailing newline that must not count as a line above. Each `step` returns
   `Found`, `Top` (fewer than `n` newlines exist in the window; the answer is
   anchor 0), or `More`.
+- `CountScan::new(from, to, chunk)` — a resumable count of the newlines in
+  `[from, to)`; the window is captured once, at construction, like
+  `BackwardScan`'s. Each `step` returns `Done(n)` (the whole window
+  examined; `n` newlines found) or `More` to continue, reading each block
+  through `warm()` rather than `block()`. Unlike the other three, it never
+  becomes a spawned pending completion; its production consumer is the
+  status line's background worker instead (see "The status line's count
+  runs in the background", below), stepping it directly inside its own
+  loop — a background task can await a block a synchronous, per-draw call
+  never could.
 
 `ForwardScan` and `BackwardScan` are the engine's only navigation read
 loops, and the cursor lives inside the object rather than being handed back
@@ -107,6 +118,41 @@ its cursor and origin to the file size at the start of every step
 regardless of what the caller already checked, so a checkpoint offset that
 lands out of contract degrades into an in-file answer instead of scanning
 past EOF.
+
+## The status line's count runs in the background
+
+The status line's current-line query used to run on `draw`'s own call
+stack every frame, which meant it could never await source I/O the way
+the other three scans do — a draw that stalled on a cold read would
+defeat the pager's whole first-paint guarantee. `StatusWorker` (see
+[architecture](architecture.md)) sidesteps the constraint instead of
+working around it on the same call stack: it is a separate background
+task per document, fed the anchor `draw` cares about through a `watch`
+channel and answering through another, so `draw` itself only ever sends
+and reads — never awaits a scan step at all.
+
+The worker's own loop steps a `CountScan` directly, exactly like any other
+budgeted scan: chunks stay bounded by the same `nav_scan_budget` config
+value, and a window wider than one chunk resumes the same scan object
+across internal steps rather than restarting from the checkpoint. Because
+the stepping happens in the background rather than on a per-draw call
+stack, a block the step needs but the cache does not have is simply
+awaited through `warm()` — there is no separate "block missing" outcome to
+manage, no detached fetch to track, and no holding area outside the
+shared cache to protect a delivered block from eviction before it is
+consumed: the worker consumes each block's bytes the instant `warm()`
+returns them, within that same step, so there is never a window in which
+a block it still needs could be evicted out from under it the way one
+could be evicted from underneath a synchronous, cache-only caller working
+one delivered block at a time. A block that fails to read is retried,
+after a short backoff, up to a bounded number of times before the anchor
+is given up on for good — a persistently unreadable block stops costing
+anything; requesting a new anchor starts the count, and its retry budget,
+fresh. A fresh anchor supersedes either a mid-walk step or a backing-off
+retry the same way: `select!` races the anchor channel against whichever
+the worker is doing, so the worker jumps straight to resolving the new
+anchor rather than racing the old walk to completion and throwing the
+result away.
 
 ## Layout is budgeted too
 
