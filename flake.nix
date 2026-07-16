@@ -53,6 +53,10 @@
             pkgs.inferno
             pkgs.tokio-console
             pkgs.gh
+            # local-only e2e perf harness (scripts/perf.sh): drives ress/less
+            # inside a tmux pane for its capture-pane methodology, never CI.
+            pkgs.tmux
+            pkgs.less
           ];
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/src";
           shellHook = ''

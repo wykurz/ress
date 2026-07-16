@@ -35,7 +35,7 @@ jobs:
     - name: Format
       run: cargo fmt --check
     - name: Clippy
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets --features ress-core/bench-internals -- -D warnings
     - name: Docs
       run: cargo doc --no-deps --workspace
 
@@ -68,6 +68,17 @@ jobs:
       run: cargo nextest run --workspace --release
     - name: Doctests (release)
       run: cargo test --doc --workspace --release
+    # cargo's bench profile inherits the release profile's settings and
+    # target/release output directory, so this reuses the dependency
+    # artifacts this job already built in release mode above instead of
+    # paying a second from-scratch release-profile compile in a job that
+    # otherwise never builds in release mode (lint/test/nix do not).
+    # --no-run is the bit-rot guard used locally (just bench-build): it
+    # never runs a single sample, so machine-dependent numbers still never
+    # gate a merge, but bench code that no longer compiles now fails CI
+    # the same way the local gate already catches it.
+    - name: Bench build (no run)
+      run: cargo bench --workspace --no-run --features ress-core/bench-internals
 
   nix:
     runs-on: ubuntu-latest

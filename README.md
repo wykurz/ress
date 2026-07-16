@@ -103,6 +103,18 @@ commands:
 
 A plain `cargo build` works too if you have a recent stable Rust.
 
+Measuring performance
+======================
+
+`just bench` runs the criterion benches against engine operations with
+injected network latency, isolating one component's cost — including
+cold-cache behavior — at a time; it never runs in CI. `just perf` (add
+`--quick` for a faster pass over smaller fixtures) races the release
+binary against `less` end-to-end inside `tmux` on deterministic fixtures,
+for the whole-binary, warm-cache number a user actually experiences. See
+[docs/perf.md](docs/perf.md) for the full methodology, scenario
+definitions, and caveats.
+
 Documentation
 =============
 
@@ -119,6 +131,8 @@ Design documents describing the internals live in the `docs/` directory:
   polluting the cache
 - [Concurrency](docs/concurrency.md) — the one-owned-task, watch-channel
   shape every background computation shares
+- [Measuring performance](docs/perf.md) — the criterion and end-to-end
+  harnesses, what each isolates, and how to run them
 
 Session-scoped specs and implementation plans are working artifacts and are
 deliberately not part of the repository.

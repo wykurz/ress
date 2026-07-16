@@ -964,6 +964,7 @@ pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
         rows,
     )
     .await?;
+    tracing::info!(target: "perf", "first paint");
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {

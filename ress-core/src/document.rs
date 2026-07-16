@@ -125,9 +125,13 @@ impl Document {
     /// scanner. `goto_line` and the status-line queries panic on such a
     /// document; every other navigation is index-free by design. No tokio
     /// runtime is required to construct one — unlike `new`, this spawns
-    /// nothing.
-    #[cfg(test)]
-    pub(crate) fn new_unindexed(source: Arc<dyn BlockSource>, config: Config) -> Self {
+    /// nothing. Also compiled under the `bench-internals` feature (and made
+    /// `pub` rather than `pub(crate)`, since a `[[bench]]` target is a
+    /// separate crate that cannot see crate-private items regardless of
+    /// cfg) so criterion benches can measure the cold, index-free walk
+    /// deterministically.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn new_unindexed(source: Arc<dyn BlockSource>, config: Config) -> Self {
         let size = source.size();
         let cache = Arc::new(crate::cache::BlockCache::new(
             source,
