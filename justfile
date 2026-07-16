@@ -8,7 +8,7 @@ default:
 # run all lints (fmt + clippy)
 lint:
     cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --features ress-core/bench-internals -- -D warnings
 
 # format code
 fmt:
@@ -46,8 +46,24 @@ build-release:
 doc:
     cargo doc --no-deps --workspace
 
+# run criterion benches locally (never in CI)
+bench:
+    cargo bench --workspace --features ress-core/bench-internals
+
+# compile benches without running them (bit-rot guard, used by ci)
+bench-build:
+    cargo bench --workspace --no-run --features ress-core/bench-internals
+
+# materialize the standard fixture set into ./fixtures/
+fixtures:
+    bash scripts/perf.sh --fixtures-only
+
+# end-to-end perf comparison, ress vs less (see docs/perf.md); try --quick
+perf *ARGS:
+    bash scripts/perf.sh {{ARGS}}
+
 # run all CI checks locally
-ci: lint doc test-all
+ci: lint doc test-all bench-build
     @echo "all CI checks passed"
 
 # clean build artifacts

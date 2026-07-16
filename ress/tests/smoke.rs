@@ -1,11 +1,11 @@
+struct TempFile(std::path::PathBuf);
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
 #[test]
 fn binary_starts_without_panicking_on_a_regular_file() {
-    struct TempFile(std::path::PathBuf);
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            std::fs::remove_file(&self.0).ok();
-        }
-    }
     let path = std::env::temp_dir().join(format!("ress-smoke-{}.txt", std::process::id()));
     std::fs::write(&path, b"hello\nworld\n").unwrap();
     // drop removes the file even when an assertion or spawn failure unwinds.
@@ -57,5 +57,161 @@ fn binary_starts_without_panicking_on_a_regular_file() {
     assert!(
         !stderr.contains("panicked"),
         "binary panicked on launch: {stderr}"
+    );
+}
+/// Closes a raw fd on drop. The pty master below (and, transiently, the
+/// parent's own copy of the slave) needs the same RAII discipline `TempFile`
+/// above gives the fixture/log paths — a leaked fd here would hold the pty's
+/// session open past the child's exit.
+struct FdGuard(std::os::unix::io::RawFd);
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+#[test]
+fn first_paint_event_reaches_the_log_file() {
+    let fixture = std::env::temp_dir().join(format!("ress-smoke-fp-{}.txt", std::process::id()));
+    std::fs::write(&fixture, b"hello\nworld\n").unwrap();
+    let _fixture_guard = TempFile(fixture.clone());
+    let log = std::env::temp_dir().join(format!("ress-smoke-fp-{}.log", std::process::id()));
+    let _log_guard = TempFile(log.clone());
+    // a real pty, unlike binary_starts_without_panicking_on_a_regular_file's
+    // setsid+pipes above: that mechanism exists specifically to DENY a
+    // controlling terminal (so it can prove headless ress fails gracefully),
+    // which is the opposite of what first paint needs — enable_raw_mode's
+    // /dev/tty open, and so run()'s first draw, only succeed against a real
+    // terminal device.
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let ws = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "openpty failed: {:?}",
+        std::io::Error::last_os_error()
+    );
+    let _master_guard = FdGuard(master);
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ress"));
+    command.arg(&fixture).arg("--log-file").arg(&log).arg("-v");
+    // this test's own point is exercising -v's contribution to the tracing
+    // level (cli.rs's init_logging), not RESS_LOG's — but RESS_LOG, if set
+    // in the environment this test happens to run under, wins over -v
+    // (init_logging tries it first) and can filter the info-level "first
+    // paint" event out entirely, leaving the log empty and this test timing
+    // out for a reason that has nothing to do with the binary (reproduced:
+    // RESS_LOG=warn set in the calling shell -> 10s timeout, empty log).
+    // removing it here isolates the test from whatever the caller happens
+    // to have exported, without changing which mechanism (-v) is under test.
+    command.env_remove("RESS_LOG");
+    // pre_exec does all of the child's stdio wiring itself (setsid, then its
+    // own dup2s, then TIOCSCTTY) rather than going through Command's own
+    // stdin/stdout/stderr builder methods — that sidesteps any question of
+    // which would run first, since there is no second, Rust-driven dup2 left
+    // to possibly race against or be overwritten by. setsid/dup2/close/ioctl
+    // are all thin, non-allocating syscall wrappers — the same async-signal-
+    // safety class as the setsid call in the test above, just a longer list
+    // of them.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(slave, 0) == -1
+                || libc::dup2(slave, 1) == -1
+                || libc::dup2(slave, 2) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // explicit acquire rather than relying on the open-after-setsid
+            // auto-acquire rule, whose timing versus the dup2s above is
+            // exactly the kind of ordering this closure exists to not
+            // depend on.
+            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if slave > 2 {
+                libc::close(slave);
+            }
+            libc::close(master);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    // the parent's own copy of the slave must not outlive spawn: held open,
+    // it would keep the pty's slave-side refcount above zero independent of
+    // the child, masking the child's real exit from the master-side reader
+    // below.
+    unsafe { libc::close(slave) };
+    // drains the pty so the small-but-nonzero stream of repaint bytes (the
+    // background indexer's frontier/status convergence redraws — see run()'s
+    // tick arm) can never backpressure the child while this test's own
+    // thread is busy polling the log file instead of the pty.
+    let pty_output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drain_output = pty_output.clone();
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            drain_output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..n as usize]);
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut first_seen = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(&log)
+            && contents.contains("perf")
+            && contents.contains("first paint")
+        {
+            first_seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // settles past a couple of the loop's 100ms ticks: a future edit that
+    // misplaced the event inside the loop (rather than once, before it)
+    // would show up as a second line in this window.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
+    let occurrences = log_contents
+        .lines()
+        .filter(|line| line.contains("perf") && line.contains("first paint"))
+        .count();
+    child.kill().ok();
+    child.wait().ok();
+    // with the child reaped, the kernel has already closed its fds (fd
+    // cleanup is part of process exit, which completes before a process
+    // becomes reapable), so the slave side now has zero references — the
+    // drain thread's blocked read returns (EIO is the conventional signal a
+    // pty master gets once its last slave reference closes) on its own.
+    drain.join().ok();
+    let pty_snapshot = String::from_utf8_lossy(&pty_output.lock().unwrap()).into_owned();
+    assert!(
+        first_seen,
+        "log never contained the first-paint event within 10s. log_contents={log_contents:?} pty_output={pty_snapshot:?}"
+    );
+    assert_eq!(
+        occurrences, 1,
+        "expected exactly one first-paint line, got {occurrences}. log_contents={log_contents:?}"
     );
 }

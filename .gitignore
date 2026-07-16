@@ -1,5 +1,6 @@
 /target
 /result
+/fixtures/
 .direnv/
 *.log
 # claude working files incl. session specs/plans — not committed

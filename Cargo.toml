@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ress", "ress-core"]
+members = ["ress", "ress-core", "ress-filegen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,9 +11,11 @@ edition = "2024"
 
 [workspace.dependencies]
 ress-core = { path = "ress-core" }
+ress-filegen = { path = "ress-filegen" }
 anyhow = "1.0"
 bytes = "1.8"
 async-trait = "0.1"
+clap = "4.5"
 tokio = "1.41"
 tracing = "0.1"
 unicode-width = "0.2"
