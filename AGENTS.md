@@ -41,6 +41,11 @@ Prefer `just` over direct `cargo`:
   ordering (`runner.rs`) — neither one an obviously wrong-shaped test until
   traced through to how a loaded host could make it pass for the wrong
   reason.
+  The oracle-hardening campaign is **closed** (2026-07-22 policy): the
+  `no_timing_oracles` guard is the floor, not a ratchet. A bounded absence
+  window layered over a structural fix is an accepted residual when no
+  positive terminal signal exists — mark it `ACCEPTED-RESIDUAL:` with the
+  reason, and do not sweep for new variants of the class.
 - Follow `CONVENTIONS.md` for comment/import/version style.
 
 ## Architecture & documentation
@@ -56,3 +61,9 @@ specs/plans there, never in `docs/`.
 architecture-level decision (cache policy, budget semantics, navigation
 invariants, concurrency rules) must update the relevant `docs/*.md` — in the
 same PR as the code.
+
+**Docs claim only enforced invariants** (2026-07-22 policy): a numeric
+bound, ordering, or resource guarantee stated in `docs/*.md` must be
+enforced by code (ideally pinned by a test); anything aspirational is
+labeled design intent or a known gap. Adopted after a doc claimed a read
+bound the code did not enforce.

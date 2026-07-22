@@ -558,6 +558,8 @@ impl PtyTransport for crate::pty::PtyChild {
 // own comment, and the tests below, for why). `Option<u64>`, not `bool`, since pass 5 (C2): a
 // confirmed tick now carries the generation `Screen::top_row_generation` reported AT that tick,
 // not just a bare "yes, matched" flag -- see this function's own checkpoint logic below for why.
+// Since the post-merge batch (fix #5) the seed carries the confirmation INSTANT too, because the
+// deadline branch now enforces the documented pair spacing against the wall.
 fn poll_predicate(
     child: &mut crate::pty::PtyChild,
     screen: &mut crate::screen::Screen,
@@ -565,7 +567,7 @@ fn poll_predicate(
     predicate: &Predicate,
     basis: std::time::Instant,
     deadline: std::time::Instant,
-    stable_confirmed_at_start: Option<u64>,
+    stable_confirmed_at_start: Option<(u64, std::time::Instant)>,
 ) -> anyhow::Result<PollOutcome> {
     poll_predicate_with_waiter(
         child,
@@ -651,7 +653,7 @@ fn poll_predicate_with_waiter(
     predicate: &Predicate,
     basis: std::time::Instant,
     deadline: std::time::Instant,
-    stable_confirmed_at_start: Option<u64>,
+    stable_confirmed_at_start: Option<(u64, std::time::Instant)>,
     waiter: &mut dyn FnMut(
         libc::c_int,
         std::time::Duration,
@@ -764,9 +766,20 @@ fn poll_predicate_with_waiter(
             // confirm are no longer bracketing a genuinely unchanged span. See `Screen::feed`'s
             // own doc comment for exactly what "observed" can and cannot see.
             let satisfied = match predicate {
-                Predicate::TopLineStableStartsWith(_) => {
-                    stable_confirmed == Some(screen.top_row_generation()) && predicate.eval(screen)
-                }
+                Predicate::TopLineStableStartsWith(_) => match stable_confirmed {
+                    // post-merge batch (2026-07-22), fix #5: the pair must ALSO span the
+                    // documented poll interval, measured against the wall itself (the branch
+                    // fires at the wall; measuring against a possibly-later `now()` would make
+                    // acceptance depend on scheduling). `saturating_duration_since` covers a
+                    // confirmation stamped at-or-after the wall by a descheduled checkpoint:
+                    // zero span, correctly refused.
+                    Some((generation, confirmed_at)) => {
+                        generation == screen.top_row_generation()
+                            && deadline.saturating_duration_since(confirmed_at) >= POLL_INTERVAL
+                            && predicate.eval(screen)
+                    }
+                    None => false,
+                },
                 _ => predicate.eval(screen),
             };
             if satisfied {
@@ -849,6 +862,14 @@ fn poll_predicate_with_waiter(
         // of any kind. A `0` snapshot now admits exactly zero bytes, always.
         let status = if pre_read_fionread == 0 {
             if child.try_wait()?.is_some() || child.hung_up()? {
+                if now() >= deadline {
+                    // post-merge batch 2 (2026-07-22), finding #2: death observation can lag the
+                    // wall -- the last clock check above predates the liveness syscalls, and the
+                    // post-mortem drain must never admit bytes the deadline branch's own rules
+                    // would exclude. Same discard idiom as the post-snapshot recheck above: loop
+                    // back and let FINALIZING spend only tracked pre-deadline evidence.
+                    continue;
+                }
                 // found in PR #44 pass 7 (P7-B): NOT an immediate `return Ok(Crashed)` -- the
                 // original shape of this fix did exactly that, and broke `completed_sample_
                 // measures_from_the_declared_basis` (a real regression, caught by running the
@@ -865,6 +886,41 @@ fn poll_predicate_with_waiter(
                 // decoupled-from-reading equivalent of that same signal -- falls through to the
                 // identical rest-of-loop-body ordering a real `Eof` from a read always used:
                 // predicate first, THEN (below) the Crashed return if it didn't already match.
+                //
+                // post-merge batch (2026-07-22), fix #4: the zero snapshot above and this death
+                // observation are two separate syscalls, and a subject can write its final
+                // frame and exit entirely inside that gap -- synthesizing Eof from the stale
+                // zero would judge a stale screen and report Crashed with matching bytes still
+                // queued. One fresh FIONREAD here is a THIRD legitimate snapshot class
+                // (post-mortem): the subject is dead OR has no remaining slave-side reference
+                // (a hung_up-only observation does not prove the subject exited), and subjects
+                // do not fork (docs/perf.md, "Scope and standing assumptions"), so no writer
+                // remains either way -- the value is final, and the bounded drain below can
+                // never admit a byte it did not prove queued before death. `buf` is cleared
+                // afterward: `drain_available` already fed everything it read into `screen`,
+                // and the shared feed site below this branch must not feed the last chunk a
+                // second time.
+                //
+                // post-merge batch 2 (2026-07-22), finding #1: re-snapshot until a zero round
+                // (or Eof), capped -- the subject is dead, so the queue only ever shrinks, and
+                // each round's read stays bounded by its own fresh snapshot. A 73,000-iteration
+                // probe on this project's target kernel never once observed a post-poll FIONREAD
+                // under-reporting recoverable bytes (0/73,000, incl. under 8-way CPU
+                // contention), so the single-snapshot shape this replaces was already correct
+                // here; the loop is timing-free defense-in-depth against theoretical
+                // flip-buffer -> line-discipline delivery lag on other kernels, and the cap
+                // keeps it provably terminating instead of trusting that theory either way.
+                for _ in 0..POST_MORTEM_DRAIN_ROUNDS {
+                    let post_exit_queued = child.queued_read_bytes()?;
+                    if post_exit_queued == 0 {
+                        break;
+                    }
+                    let status = drain_available(child, buf, screen, post_exit_queued)?;
+                    buf.clear();
+                    if matches!(status, crate::pty::ReadStatus::Eof) {
+                        break;
+                    }
+                }
                 crate::pty::ReadStatus::Eof
             } else {
                 // still alive, still nothing queued: `WouldBlock`, the same outcome the old
@@ -985,7 +1041,8 @@ fn poll_predicate_with_waiter(
             // with THIS tick if row 0's own generation has not moved since -- see the deadline
             // branch's own identical check, above, for the full derivation (the same property,
             // reached from the other of this predicate's two "final look" sites).
-            let prior_confirmation_still_holds = stable_confirmed == Some(current_generation);
+            let prior_confirmation_still_holds =
+                stable_confirmed.is_some_and(|(g, _)| g == current_generation);
             // found in PR #44 round 9: the SECOND confirming checkpoint (matched && the prior
             // one still holds) used to return Satisfied straight from the content match, with no
             // liveness check at all -- a subject that painted, was confirmed once while alive,
@@ -1024,7 +1081,15 @@ fn poll_predicate_with_waiter(
             // a match starts (or restarts, after a reset) a fresh potential pair anchored at
             // THIS tick's own generation; a non-match (or the pair having just been consumed,
             // above) leaves nothing to build on.
-            stable_confirmed = matched.then_some(current_generation);
+            //
+            // regular checkpoints are inherently interval-spaced (`next_checkpoint = now +
+            // POLL_INTERVAL` below), so only the deadline branch needs the explicit spacing
+            // check.
+            stable_confirmed = if matched {
+                Some((current_generation, now()))
+            } else {
+                None
+            };
             next_checkpoint = now() + POLL_INTERVAL;
         }
         // `Eof` is gone (see the zero-snapshot liveness check above) -- only `Data`/`WouldBlock`
@@ -1161,6 +1226,12 @@ fn poll_predicate_with_waiter(
 // (`default_run_uses_six_runs_over_the_large_fixture`, `quick_defaults_to_two_runs_over_the_
 // small_fixture`, this crate's own tests) stays comfortably under.
 const DRAIN_BUDGET: usize = 64;
+
+// post-merge batch 2 (2026-07-22), finding #1: how many post-mortem snapshot->drain rounds the
+// death arm attempts before concluding the queue is genuinely empty. One round sufficed in
+// 73,000 probed iterations on the target kernel; the extra rounds cover straggler delivery on
+// kernels where tty buffer flushing is more asynchronous, without ever waiting on time.
+const POST_MORTEM_DRAIN_ROUNDS: usize = 4;
 
 // drains `child`'s pty master to `WouldBlock`, `Eof`, `DRAIN_BUDGET` reads, or `byte_budget`
 // bytes (whichever comes first), feeding every chunk into `screen` as it arrives, rather than
@@ -2136,6 +2207,225 @@ mod tests {
         );
     }
 
+    // post-merge batch (2026-07-22), fix #4: a subject that writes its satisfying frame and
+    // exits entirely inside the gap between a zero FIONREAD snapshot and the liveness check
+    // must be judged on those final bytes, not on the stale screen the zero snapshot saw.
+    // `queued` scripts three calls: the pre-read snapshot (0), the post-exit snapshot (28 --
+    // the frame below), then a third, post-merge batch 2 (2026-07-22) finding #1's own
+    // re-snapshot loop's terminating zero round -- without it, the ScriptedTransport cursor
+    // would clamp to the LAST element and keep re-offering 28 with nothing left readable
+    // (harmless: drain returns WouldBlock and the loop simply spends its remaining rounds), but
+    // the explicit zero exercises the loop's clean, intentional termination instead.
+    #[test]
+    fn final_frame_written_between_zero_snapshot_and_exit_is_still_judged() {
+        let frame: &[u8] = b"\x1b[1;1H\x1b[2KFAKE-PAGER-PAINTED";
+        let mut child = ScriptedTransport {
+            queued: vec![0, frame.len(), 0],
+            readable: frame.iter().copied().collect(),
+            exit: vec![Some(exited_status())],
+            ..Default::default()
+        };
+        let mut screen = crate::screen::Screen::new(super::SCREEN_ROWS, super::SCREEN_COLS);
+        let mut buf = Vec::new();
+        let basis = std::time::Instant::now();
+        let outcome = super::poll_predicate_with_waiter(
+            &mut child,
+            &mut screen,
+            &mut buf,
+            &super::Predicate::Contains("FAKE-PAGER-PAINTED".to_string()),
+            basis,
+            basis + std::time::Duration::from_secs(1),
+            None,
+            &mut |_fd, _requested| Ok(crate::pty::PollReadiness::TimedOut),
+            &mut std::time::Instant::now,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, super::PollOutcome::Satisfied(_)),
+            "the final frame was queued at death -- it must be drained and judged, not \
+             discarded into a false Crashed: {outcome:?}"
+        );
+        assert!(
+            child.read_calls >= 1,
+            "the post-exit drain must have actually read the queued frame"
+        );
+    }
+
+    // the boundary preserved: death with genuinely nothing queued stays Crashed, still
+    // without a single read (invariant 2's own spirit, now with the post-mortem snapshot
+    // confirming emptiness instead of assuming it).
+    #[test]
+    fn zero_snapshot_death_with_nothing_queued_stays_crashed_without_reading() {
+        let mut child = ScriptedTransport {
+            queued: vec![0, 0],
+            exit: vec![Some(exited_status())],
+            ..Default::default()
+        };
+        let mut screen = crate::screen::Screen::new(super::SCREEN_ROWS, super::SCREEN_COLS);
+        let mut buf = Vec::new();
+        let basis = std::time::Instant::now();
+        let outcome = super::poll_predicate_with_waiter(
+            &mut child,
+            &mut screen,
+            &mut buf,
+            &super::Predicate::Contains("NEVER-PAINTED".to_string()),
+            basis,
+            basis + std::time::Duration::from_secs(1),
+            None,
+            &mut |_fd, _requested| Ok(crate::pty::PollReadiness::TimedOut),
+            &mut std::time::Instant::now,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, super::PollOutcome::Crashed),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            child.read_calls, 0,
+            "an empty post-mortem queue must never be read"
+        );
+    }
+
+    // found in post-merge batch 2 (2026-07-22), finding #2: the death arm used to admit
+    // whatever the post-mortem snapshot proved queued with no wall recheck of its own -- the
+    // last clock check before this arm is the top-of-loop's pre-read recheck, which predates
+    // the liveness syscalls (`try_wait`/`hung_up`) entirely, so a deadline expiring in that gap
+    // let late bytes through. RED pre-fix: this exact scenario used to observe `Satisfied(0)`,
+    // the marker wrongly admitted.
+    //
+    // now() calls: 1-3 are `next_checkpoint`'s own init, the loop's first top-of-loop deadline
+    // check, and the pre-read snapshot's own recheck -- all pre-deadline (mirrors `recheck_
+    // discards_a_snapshot_taken_after_the_clock_already_crossed_the_deadline`'s own calls 1-2,
+    // plus one more here for the pre-read recheck this scenario must actually pass through, to
+    // reach the zero-snapshot death arm at all). Call 4, the death arm's OWN new recheck, fires
+    // immediately after `try_wait` reports the scripted exit and reports PAST the wall --
+    // discarding the death observation before the post-mortem snapshot is ever taken. Every
+    // call after (the second top-of-loop check, which then drives FINALIZING) reports past the
+    // wall too.
+    //
+    // `exit` scripts a single call, `Some(exited_status())`: the ScriptedTransport cursor
+    // clamps to this LAST element forever (its own doc comment), so a child observed dead via
+    // `try_wait` stays dead for every later call too -- the honest shape, since a real
+    // transport cannot un-observe a death. That includes FINALIZING's own SEPARATE,
+    // unconditional `try_wait` revalidation (this file, the deadline branch's own tail), which
+    // this loop reaches via the new recheck's `continue` once the wall has passed: it sees the
+    // same latched death and reports `Crashed`, not `TimedOut` -- the outcome this test asserts.
+    // The refusal this test actually exists to pin is not which `PollOutcome` variant that
+    // (unrelated, pre-existing) tail decides on, but that NEITHER the post-mortem snapshot NOR
+    // any read ever happens once the wall has passed -- exactly what `read_calls == 0` and
+    // `queued_calls.get() == 1`, below, pin directly.
+    #[test]
+    fn post_mortem_drain_is_refused_once_the_wall_has_passed() {
+        let mut child = ScriptedTransport {
+            queued: vec![0, 99],
+            readable: b"SHOULD-NEVER-BE-ADMITTED".iter().copied().collect(),
+            exit: vec![Some(exited_status())],
+            ..Default::default()
+        };
+        let mut screen = crate::screen::Screen::new(super::SCREEN_ROWS, super::SCREEN_COLS);
+        let mut buf = Vec::new();
+        let basis = std::time::Instant::now();
+        let deadline = basis + std::time::Duration::from_secs(1);
+        let mut now_calls: u32 = 0;
+        let outcome = super::poll_predicate_with_waiter(
+            &mut child,
+            &mut screen,
+            &mut buf,
+            &super::Predicate::Contains("SHOULD-NEVER-BE-ADMITTED".to_string()),
+            basis,
+            deadline,
+            None,
+            &mut |_fd, _requested| {
+                panic!(
+                    "waiter must never be reached -- FINALIZING returns before this loop ever \
+                     reaches its own WouldBlock arm"
+                )
+            },
+            &mut || {
+                now_calls += 1;
+                if now_calls <= 3 {
+                    basis
+                } else {
+                    deadline + std::time::Duration::from_millis(1)
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, super::PollOutcome::Crashed),
+            "expected Crashed -- the child is genuinely dead (latched via the scripted exit), \
+             and once the wall has passed FINALIZING's own tail try_wait reports exactly that; \
+             the marker must never have been admitted either way, so the predicate can never \
+             match. Got {outcome:?}"
+        );
+        assert_eq!(
+            child.read_calls, 0,
+            "expected read_available_bounded to never be called -- the death arm's new recheck \
+             must discard the death observation before any post-mortem snapshot (let alone a \
+             read) is attempted"
+        );
+        assert_eq!(
+            child.queued_calls.get(),
+            1,
+            "expected exactly one queued_read_bytes call -- the pre-read snapshot itself. The \
+             post-mortem snapshot must never even be taken once the wall has passed"
+        );
+    }
+
+    // found in post-merge batch 2 (2026-07-22), finding #1: the post-mortem snapshot is now a
+    // capped re-snapshot loop rather than a single snapshot+drain, since a snapshot can
+    // theoretically under-report on kernels where tty buffer flushing is more asynchronous than
+    // this project's own target kernel (a 73,000-iteration probe there never reproduced it --
+    // see `POST_MORTEM_DRAIN_ROUNDS`'s own doc comment). `queued` scripts four post-zero-snapshot
+    // calls: 12 (round 1's own snapshot), 16 (round 2's), then 0 (round 3's, the terminating
+    // zero round that proves the loop stops on its own rather than spinning to the cap).
+    // `readable` is a 28-byte frame -- exactly 12 + 16 -- split at that same boundary: round 1
+    // reads a VT cursor-home + clear-line prefix plus two plain characters (bytes 0-11), round 2
+    // reads the rest (bytes 12-27). The needle "MARKER!!" sits at byte offset 20, entirely
+    // inside round 2's own chunk -- a regression that stopped after round 1 (or otherwise
+    // dropped round 2's bytes) would leave the needle absent from the screen, so this test would
+    // correctly fail via a non-`Satisfied` outcome, not merely via a `read_calls` count.
+    #[test]
+    fn post_mortem_drain_takes_multiple_rounds_when_bytes_land_between_snapshots() {
+        let frame: &[u8] = b"\x1b[1;1H\x1b[2KABPADPADPAMARKER!!";
+        let mut child = ScriptedTransport {
+            queued: vec![0, 12, 16, 0],
+            readable: frame.iter().copied().collect(),
+            exit: vec![Some(exited_status())],
+            ..Default::default()
+        };
+        let mut screen = crate::screen::Screen::new(super::SCREEN_ROWS, super::SCREEN_COLS);
+        let mut buf = Vec::new();
+        let basis = std::time::Instant::now();
+        let outcome = super::poll_predicate_with_waiter(
+            &mut child,
+            &mut screen,
+            &mut buf,
+            &super::Predicate::Contains("MARKER!!".to_string()),
+            basis,
+            basis + std::time::Duration::from_secs(1),
+            None,
+            &mut |_fd, _requested| {
+                panic!(
+                    "waiter must never be reached -- the death arm resolves this sample without \
+                     ever reaching the WouldBlock arm"
+                )
+            },
+            &mut std::time::Instant::now,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, super::PollOutcome::Satisfied(_)),
+            "expected Satisfied -- both rounds' bytes must be drained and fed before the \
+             post-mortem judgment is made. Got {outcome:?}"
+        );
+        assert!(
+            child.read_calls >= 2,
+            "expected at least two real drain rounds (12 bytes, then 16) -- got {}",
+            child.read_calls
+        );
+    }
+
     // found in PR #44 pass 7 (P7-B, RED for invariant 3): a waiter that times out on a wait
     // bounded by the deadline must leave FINALIZING with zero budget and no fresh FIONREAD of
     // its own -- asserted directly (queued_calls == 1, the ONE call from the zero-snapshot
@@ -2885,7 +3175,11 @@ mod tests {
             &super::Predicate::TopLineStableStartsWith("FAKE-PAGER-PAINTED".to_string()),
             basis,
             basis,
-            Some(confirmed_at_generation),
+            // this test's own property is the generation/content pair completing at the
+            // deadline, not the fix #5 spacing rule -- backdated a full poll interval so real
+            // setup time above (a bounded poll plus a manual drain) can never accidentally
+            // leave the pair under-spaced.
+            Some((confirmed_at_generation, basis - super::POLL_INTERVAL)),
         )
         .unwrap();
         assert!(
@@ -2970,7 +3264,11 @@ mod tests {
             &super::Predicate::TopLineStableStartsWith("FAKE-PAGER-PAINTED".to_string()),
             basis,
             basis,
-            Some(confirmed_at_generation),
+            // this test's own property is the liveness check, not the fix #5 spacing rule --
+            // backdated a full poll interval so real setup time above (a bounded poll for the
+            // child to become observably dead) can never accidentally leave the pair
+            // under-spaced.
+            Some((confirmed_at_generation, basis - super::POLL_INTERVAL)),
         )
         .unwrap();
         assert!(
@@ -3028,6 +3326,69 @@ mod tests {
         assert!(
             matches!(outcome, super::PollOutcome::TimedOut),
             "expected TimedOut, got {outcome:?}"
+        );
+    }
+
+    // post-merge batch (2026-07-22), fix #5: the deadline branch is this predicate's second
+    // "final look" site, and it used to accept a stability pair whose first confirmation
+    // landed ONE MILLISECOND before the wall -- bypassing the documented requirement that
+    // confirmations be spaced by the poll interval. The pair's spacing is measured against
+    // the WALL itself (deterministic), not against however late the branch actually runs.
+    #[test]
+    fn deadline_finalization_refuses_a_confirmation_younger_than_the_poll_interval() {
+        let mut screen = crate::screen::Screen::new(super::SCREEN_ROWS, super::SCREEN_COLS);
+        let mut buf = Vec::new();
+        screen.feed(b"\x1b[1;1H\x1b[2KFAKE-PAGER-PAINTED");
+        let generation = screen.top_row_generation();
+        let mut child = ScriptedTransport::default();
+        let basis = std::time::Instant::now();
+        // basis == deadline: the deadline branch is the ONLY look this call ever takes (the
+        // same trick the existing seeded deadline test uses).
+        let outcome = super::poll_predicate_with_waiter(
+            &mut child,
+            &mut screen,
+            &mut buf,
+            &super::Predicate::TopLineStableStartsWith("FAKE-PAGER-PAINTED".to_string()),
+            basis,
+            basis,
+            // confirmed 1ms before the wall: generation matches, content matches, but the
+            // pair spans less than POLL_INTERVAL -- must NOT satisfy.
+            Some((generation, basis - std::time::Duration::from_millis(1))),
+            &mut |_fd, _requested| Ok(crate::pty::PollReadiness::TimedOut),
+            &mut std::time::Instant::now,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, super::PollOutcome::TimedOut),
+            "an under-spaced pair at the wall must time out, not satisfy: {outcome:?}"
+        );
+    }
+
+    // the sibling boundary: a confirmation aged exactly one full poll interval at the wall IS
+    // a properly spaced pair -- the fix must not over-reject.
+    #[test]
+    fn deadline_finalization_accepts_a_confirmation_aged_a_full_poll_interval() {
+        let mut screen = crate::screen::Screen::new(super::SCREEN_ROWS, super::SCREEN_COLS);
+        let mut buf = Vec::new();
+        screen.feed(b"\x1b[1;1H\x1b[2KFAKE-PAGER-PAINTED");
+        let generation = screen.top_row_generation();
+        let mut child = ScriptedTransport::default();
+        let basis = std::time::Instant::now();
+        let outcome = super::poll_predicate_with_waiter(
+            &mut child,
+            &mut screen,
+            &mut buf,
+            &super::Predicate::TopLineStableStartsWith("FAKE-PAGER-PAINTED".to_string()),
+            basis,
+            basis,
+            Some((generation, basis - super::POLL_INTERVAL)),
+            &mut |_fd, _requested| Ok(crate::pty::PollReadiness::TimedOut),
+            &mut std::time::Instant::now,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, super::PollOutcome::Satisfied(_)),
+            "a properly spaced pair must still satisfy at the wall: {outcome:?}"
         );
     }
 
@@ -3106,7 +3467,9 @@ mod tests {
             &super::Predicate::TopLineStableStartsWith("FAKE-PAGER-PAINTED".to_string()),
             basis,
             basis,
-            Some(confirmed_at_generation),
+            // backdated a full poll interval so the new fix #5 spacing rule cannot shadow the
+            // generation check this test exists to pin.
+            Some((confirmed_at_generation, basis - super::POLL_INTERVAL)),
         )
         .unwrap();
         assert!(
@@ -3207,7 +3570,10 @@ mod tests {
             // far enough away that only the scripted death (via `try_wait`'s own sequence)
             // can end this call -- not a real timeout racing anything.
             basis + std::time::Duration::from_secs(2),
-            Some(confirmed_at_generation),
+            // this call's outcome is decided by the REGULAR checkpoint (the deadline is 2s
+            // away) plus the scripted death, neither of which consults the seeded instant --
+            // inert, so `basis` is as good as any other value here.
+            Some((confirmed_at_generation, basis)),
             &mut |_fd, _requested| Ok(crate::pty::PollReadiness::TimedOut),
             &mut std::time::Instant::now,
         )

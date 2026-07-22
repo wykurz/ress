@@ -581,13 +581,16 @@ mod tests {
         // parked mid-read on the gate; the other four are genuinely queued on the semaphore,
         // never having reached the source at all.
         wait_for_count(&mut started, |n| n >= FILL_CONCURRENCY as u64).await;
+        let mut fill_cancelled = p.fill_cancelled_events();
         drop(p);
-        // generous cooperative yields, giving a latent race (were the fix absent) every chance
-        // to manifest before the assertion below -- see this test's own doc comment for the
-        // actual numbers this margin was validated against.
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
+        // post-merge batch 2 (2026-07-22), finding #4: POSITIVE proof, all FILL_CONCURRENCY + 4
+        // -- every fill this test spawned signals its own Cancelled event once the abort
+        // reaches it (the same wait the sibling test above already uses), and once all of them
+        // have, no fill exists that could ever start a read, so the assertion below is final.
+        // This retires the yield-margin this wait replaces (and its ACCEPTED-RESIDUAL marker,
+        // whose "no positive signal exists" claim was itself a too-narrow inventory: the
+        // signal was in use forty lines up).
+        wait_for_count(&mut fill_cancelled, |n| n >= (FILL_CONCURRENCY + 4) as u64).await;
         assert_eq!(
             *started.borrow(),
             FILL_CONCURRENCY as u64,
@@ -623,11 +626,12 @@ mod tests {
         wait_for_count(&mut entered, |n| n >= (FILL_CONCURRENCY + 4) as u64).await;
         wait_for_count(&mut started, |n| n >= FILL_CONCURRENCY as u64).await;
         p.abort_and_join().await;
-        // generous cooperative yields -- see the sibling `drop`-based test's own doc comment for
-        // the actual numbers this margin was validated against.
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
+        // no manifestation margin here, deliberately (post-merge batch 2026-07-22, fix #7 --
+        // the previously deferred P3): unlike the drop-based sibling above (fire-and-forget
+        // `drop(p)`, which genuinely needs its window), `abort_and_join` is synchronous-complete
+        // -- `TaskOwner::abort_all_and_join` has its own separately-tested guarantee that it
+        // does not return until every task's teardown ran -- so the state asserted below is
+        // final the moment it returns; a margin would only imply otherwise.
         assert_eq!(
             *started.borrow(),
             FILL_CONCURRENCY as u64,

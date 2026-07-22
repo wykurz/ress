@@ -6,7 +6,10 @@ use clap::Parser;
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     let _guard = cli::init_logging(cli.log_file.as_deref(), cli.verbose)?;
-    let source = std::sync::Arc::new(ress_core::source::PreadSource::open(&cli.file)?);
+    let source = std::sync::Arc::new(ress_core::source::PreadSource::open_with_read_concurrency(
+        &cli.file,
+        cli.read_concurrency,
+    )?);
     let config = ress_core::Config {
         cache_bytes: (cli.cache_mib as usize) << 20,
         prefetch_depth: cli.prefetch_depth,

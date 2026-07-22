@@ -1,10 +1,10 @@
 # ress
 
 A fast terminal pager for huge files, optimized for high-latency network
-filesystems (NFS, Lustre, Weka). Linux-first — the roadmap embraces
-Linux-specific I/O (io_uring, fadvise) as it matures. Other Unix-likes may
-build but are untested; non-Unix platforms are unsupported (the file backend
-is Unix-only). Early development.
+filesystems (NFS, Lustre, Weka). **Linux-only** — the perf harness already
+uses Linux-only syscalls, and the roadmap embraces more Linux-specific I/O
+(io_uring, fadvise) as it matures; a root `cargo build` on other platforms
+fails deliberately with a clear error. Early development.
 
 [![CI](https://github.com/wykurz/ress/actions/workflows/ci.yml/badge.svg)](https://github.com/wykurz/ress/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -53,6 +53,7 @@ Usage
 | `-v` / `-vv` / `-vvv` | warn | log verbosity (info / debug / trace); `RESS_LOG` env filter overrides |
 | `--cache-mib <n>` | 256 | block cache size in MiB |
 | `--prefetch-depth <n>` | 8 | blocks to keep warm ahead of the viewport (0 disables) |
+| `--read-concurrency <n>` | 16 | max concurrent OS-level file reads (wedged-mount pile-up bound) |
 
 Key bindings
 ------------

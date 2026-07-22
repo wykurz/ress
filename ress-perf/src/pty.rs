@@ -966,7 +966,9 @@ impl PtyChild {
     /// Closed at the source by making the peek the ONLY liveness oracle, in a real three-state
     /// protocol rather than an ordering convention: **Armed** (registration set, nothing
     /// observed yet) -> **Observed** (a POSITIVE `WNOWAIT` peek found the exit and cleared the
-    /// registration, in the same instant) -> **Reaped** (the consuming wait, legal ONLY here,
+    /// registration, in the same instant), where the group sweep now also fires (post-merge
+    /// batch, fix #3) — the zombie still pins the pgid, so the sweep is recycle-safe here and
+    /// only here -> **Reaped** (the consuming wait, legal ONLY here,
     /// since the registration is already gone by construction -- a signal racing the ACTUAL
     /// kernel-level reap that follows finds no registration to act on, not a stale one). A
     /// NEGATIVE peek returns `Ok(None)` immediately, in the SAME call, without ever reaching
@@ -995,7 +997,15 @@ impl PtyChild {
     /// skip its own `kill()` entirely). Delegates to `try_wait_with_reap`, below, which takes
     /// the consuming reap as an injectable seam so a test can prove the retry deterministically.
     pub fn try_wait(&mut self) -> anyhow::Result<Option<std::process::ExitStatus>> {
-        self.try_wait_with_reap(&mut std::process::Child::try_wait)
+        self.try_wait_with_reap(
+            &mut std::process::Child::try_wait,
+            // pgid == pid (pre_exec called setsid); rc deliberately discarded -- ESRCH (group
+            // already fully gone) is a fine outcome for a best-effort, idempotent sweep. See
+            // the protocol doc comment above for why this kill lives in the peek window.
+            &mut |pgid| {
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            },
+        )
     }
 
     // found in PR #44 pass 6 S2 (#5): generalizes `try_wait`'s own consuming reap into an
@@ -1015,6 +1025,7 @@ impl PtyChild {
         reap: &mut dyn FnMut(
             &mut std::process::Child,
         ) -> std::io::Result<Option<std::process::ExitStatus>>,
+        kill_group: &mut dyn FnMut(i32),
     ) -> anyhow::Result<Option<std::process::ExitStatus>> {
         if self.reaped {
             // already reaped on an earlier call: nothing new to observe, no peek, no
@@ -1032,10 +1043,6 @@ impl PtyChild {
             reap_call_counter,
             || clear_registration_if_the_child_has_exited(registry, pid),
             || {
-                // Observed -> Reaped: the peek that authorized this closure just cleared the
-                // registration in the same instant it observed the exit -- checked, not merely
-                // trusted, the same "own the answer" discipline this file already applies to
-                // `siginfo_t`'s own unspecified-on-miss contents.
                 debug_assert_ne!(
                     registry.load(std::sync::atomic::Ordering::SeqCst),
                     pid,
@@ -1043,6 +1050,15 @@ impl PtyChild {
                      runs -- the positive peek that authorized this closure clears it in the \
                      same instant it observes the exit"
                 );
+                // post-merge batch (2026-07-22), fix #3: descendants die HERE, in the peek
+                // window -- after the positive observation, before the consuming reap below.
+                // The zombie leader still pins pid (and with it the pgid) against recycling
+                // until the reap consumes it, so this killpg can never signal a recycled,
+                // innocent group -- the exact hazard that forbids Drop's own kill once
+                // `reaped` is set. Subjects are assumed not to fork (docs/perf.md, "Scope and
+                // standing assumptions"): this sweep is defense-in-depth for that assumption,
+                // not a supported forking surface.
+                kill_group(pid);
                 reap(child)
             },
         );
@@ -2227,10 +2243,15 @@ mod tests {
         // faked to fail transiently -- the real kernel-level zombie is untouched by this call,
         // still there, still unreaped, for call 2 to find for real.
         let mut calls = 0u32;
-        let result = child.try_wait_with_reap(&mut |_real_child| {
-            calls += 1;
-            Err(std::io::Error::from_raw_os_error(libc::EINTR))
-        });
+        let result = child.try_wait_with_reap(
+            &mut |_real_child| {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(libc::EINTR))
+            },
+            // kill probe irrelevant here: a real zombie leader with no descendants; no-op keeps
+            // the focus on reap classification.
+            &mut |_pgid| {},
+        );
         assert!(
             result.is_err(),
             "the injected-EINTR call must still propagate that error to its own caller"
@@ -2244,8 +2265,12 @@ mod tests {
 
         // call 2: the real reap, this time -- the zombie left untouched by call 1 is still
         // there for it to find and genuinely consume.
-        let result =
-            child.try_wait_with_reap(&mut |real_child| std::process::Child::try_wait(real_child));
+        let result = child.try_wait_with_reap(
+            &mut |real_child| std::process::Child::try_wait(real_child),
+            // kill probe irrelevant here: a real zombie leader with no descendants; no-op keeps
+            // the focus on reap classification.
+            &mut |_pgid| {},
+        );
         let status = result
             .unwrap()
             .expect("the second, real call must find and reap the genuine zombie left behind");
@@ -2267,6 +2292,112 @@ mod tests {
             "expected no remaining zombie for this pid -- the real reap above must have fully \
              consumed it"
         );
+    }
+
+    // post-merge batch (2026-07-22), fix #3: descendants die in the PEEK WINDOW -- after the
+    // positive WNOWAIT observation, strictly before the consuming reap -- while the zombie
+    // leader still pins pid/pgid against recycling. Kill-after-reap would be the recycled-pid
+    // hazard `teardown_registered_child`'s `if !reaped` gate exists to prevent; kill-in-window
+    // is recycle-safe by construction. The probe pins the ORDER (kill then reap), that it fires
+    // exactly once, never on a negative peek, and never again on the already-reaped fast path.
+    #[test]
+    fn kill_group_fires_once_between_positive_peek_and_consuming_reap() {
+        static LOCAL_REGISTRY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+        let argv = fake_pager_argv("paint-hang");
+        let mut child =
+            super::PtyChild::spawn_with_registry(&argv, &[], (24, 80), &LOCAL_REGISTRY).unwrap();
+        let pid = child.pid();
+
+        let seq = std::cell::Cell::new(0u32);
+        let mut kill_at: u32 = 0;
+        let mut reap_at: u32 = 0;
+
+        // call 0: child alive -- a negative peek must consult NEITHER closure.
+        let result = child.try_wait_with_reap(
+            &mut |real_child| {
+                seq.set(seq.get() + 1);
+                std::process::Child::try_wait(real_child)
+            },
+            &mut |_pgid| {
+                seq.set(seq.get() + 1);
+                kill_at = seq.get();
+            },
+        );
+        assert!(matches!(result, Ok(None)), "alive child: {result:?}");
+        assert_eq!(
+            seq.get(),
+            0,
+            "a negative peek must never consult kill_group or reap"
+        );
+
+        // make the child observably dead (a real, unreaped zombie) -- same kill-then-WNOWAIT
+        // spin the EINTR test above establishes.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 && unsafe { info.si_pid() } == pid {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "child never became observably dead after SIGKILL"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // call 1: positive peek -> kill_group, then the consuming reap, in that order.
+        let status = child
+            .try_wait_with_reap(
+                &mut |real_child| {
+                    seq.set(seq.get() + 1);
+                    reap_at = seq.get();
+                    std::process::Child::try_wait(real_child)
+                },
+                &mut |pgid| {
+                    seq.set(seq.get() + 1);
+                    kill_at = seq.get();
+                    assert_eq!(pgid, pid, "pgid == pid: pre_exec called setsid()");
+                },
+            )
+            .unwrap()
+            .expect("the positive peek must reach and complete the consuming reap");
+        assert!(!status.success(), "expected the SIGKILL exit");
+        assert_eq!(
+            kill_at, 1,
+            "kill_group must fire first, inside the peek window"
+        );
+        assert_eq!(
+            reap_at, 2,
+            "the consuming reap must run strictly after kill_group"
+        );
+        assert!(child.reaped);
+
+        // call 2: the already-reaped fast path goes straight to the cached-status reap --
+        // no peek, no registration, and NO further kill (nothing is pinned anymore; killing
+        // here would be exactly the recycled-pid hazard).
+        let result = child.try_wait_with_reap(
+            &mut |real_child| {
+                seq.set(seq.get() + 1);
+                reap_at = seq.get();
+                std::process::Child::try_wait(real_child)
+            },
+            &mut |_pgid| {
+                seq.set(seq.get() + 1);
+                kill_at = seq.get();
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(reap_at, 3, "the fast path still consults the (cached) reap");
+        assert_eq!(kill_at, 1, "the fast path must never kill");
     }
 
     // found in PR #44 pass-5-review-followup (finding 1): the Drop-path half of A1's own
