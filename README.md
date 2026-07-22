@@ -70,7 +70,7 @@ the philosophy). Counts prefix motions: `12j` moves twelve lines.
 | `gg` / `ge` / `G` | top / end of file (`ge` and `G` are aliases) |
 | `<count>G` / `<count>gg` | jump to line N (past the end clamps to the last line) |
 | `<count>%` | jump to the line containing the byte at that percentage |
-| `:N` | jump to line N (Enter to go, Esc to cancel, Backspace to edit; needs 2+ rows, 3+ columns) |
+| `:N` | jump to line N (Enter to go — Ctrl+J works too, so a command typed before the first paint still commits; Esc to cancel, Backspace to edit; needs 2+ rows, 3+ columns) |
 | `h` / `l` / `←` / `→` | horizontal scroll (long lines are chopped) |
 | mouse wheel | scroll three lines (normal view only; a tick in command or help is ignored and never touches a running jump) |
 | `Ctrl-l` | force redraw |
@@ -110,10 +110,10 @@ Measuring performance
 injected network latency, isolating one component's cost — including
 cold-cache behavior — at a time; it never runs in CI. `just perf` (add
 `--quick` for a faster pass over smaller fixtures) races the release
-binary against `less` end-to-end inside `tmux` on deterministic fixtures,
-for the whole-binary, warm-cache number a user actually experiences. See
-[docs/perf.md](docs/perf.md) for the full methodology, scenario
-definitions, and caveats.
+binary against `less` end-to-end, each under its own pty, on
+deterministic fixtures, for the whole-binary, warm-cache number a user
+actually experiences. See [docs/perf.md](docs/perf.md) for the full
+methodology, scenario definitions, and caveats.
 
 Documentation
 =============

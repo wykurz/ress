@@ -14,6 +14,43 @@ fn fixture(mib: u64) -> bytes::Bytes {
     ress_filegen::generate(&spec, &mut out).expect("in-memory generate");
     bytes::Bytes::from(out)
 }
+// bench-local latency injection (U-delete): `MockSource::with_latency` was deleted from the
+// test-facing API entirely -- tests kept reaching for it as a COORDINATION shortcut (race a
+// second concurrent thing against a fixed sleep), a footgun the armable gate exists to close.
+// This bench's own use was always different: LATENCIES_MS below IS the thing under
+// measurement, not a mechanism this bench leans on to synchronize two concurrent things, so it
+// keeps its own latency knob -- but as a wrapper living entirely HERE, not a capability restored
+// to `MockSource` itself (even behind a feature flag): the fix is only complete if the shared
+// test-facing type is structurally incapable of latency injection again, not just gated behind
+// something a future test could still reach through for the wrong reason.
+//
+// A gotcha worth knowing before reaching for this SHAPE elsewhere (found reconciling a
+// status.rs comment, pass 8 U-guard sweep): this wrapper sleeps BEFORE delegating to the
+// inner source, so the inner source's own read-counting (`MockSource`'s own `reads` counter
+// increments inside `read_block` itself, via `BlockEventGuard::new`) only fires AFTER this
+// wrapper's own sleep completes. `with_latency`'s own deleted implementation counted BEFORE
+// its sleep (guard construction came first, in the SAME function) -- so an attempt aborted
+// mid-sleep (by, say, a `select!` racing a competing event) was still counted by the real
+// thing, but would be MISSED by a wrapper shaped like this one. Harmless here (this bench
+// never aborts an in-flight read mid-measurement), but a trap for a future test that wraps a
+// source for latency and then counts reads to detect a restart/abort signature -- the count
+// will undershoot relative to what the original `with_latency` mechanism would have reported.
+struct LatencySource {
+    inner: ress_core::source::MockSource,
+    latency: std::time::Duration,
+}
+#[async_trait::async_trait]
+impl ress_core::source::BlockSource for LatencySource {
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+    async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<bytes::Bytes> {
+        if !self.latency.is_zero() {
+            tokio::time::sleep(self.latency).await;
+        }
+        self.inner.read_block(offset, len).await
+    }
+}
 // builds a latency-injecting source over the shared fixture bytes; `Bytes::clone`
 // is a cheap refcount bump, so cloning it once per iteration is not the 64 MiB
 // memcpy `Vec<u8>::clone` would be.
@@ -21,10 +58,10 @@ fn source(
     bytes: &bytes::Bytes,
     latency_ms: u64,
 ) -> std::sync::Arc<dyn ress_core::source::BlockSource> {
-    std::sync::Arc::new(
-        ress_core::source::MockSource::new(bytes.clone())
-            .with_latency(std::time::Duration::from_millis(latency_ms)),
-    )
+    std::sync::Arc::new(LatencySource {
+        inner: ress_core::source::MockSource::new(bytes.clone()),
+        latency: std::time::Duration::from_millis(latency_ms),
+    })
 }
 // resolves a navigation outcome to its final anchor, joining a pending
 // background scan when the interactive budget was exceeded. the engine's own
@@ -59,38 +96,59 @@ fn first_paint(c: &mut criterion::Criterion) {
     for ms in LATENCIES_MS {
         group.bench_function(format!("latency_{ms}ms"), |b| {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            b.to_async(&rt).iter(|| async {
-                // a fresh document every iteration: first paint is the cost of
-                // opening a file that was never open before, not the warm,
-                // already-open path `scroll_warm` measures separately.
-                // prefetch_depth: 0 disables Prefetcher::note_viewport's spawn
-                // outright (its own first check) — Config::default()'s depth
-                // is 8, and Prefetcher has no cancel-on-drop: under injected
-                // latency, note_viewport's detached fill tasks (spawned by the
-                // viewport() call below) hold only Arc<BlockCache>/Arc<Semaphore>,
-                // not this Document, so they outlive it and keep sleeping into
-                // the NEXT iteration's fresh Document, contending for the
-                // runtime's worker threads while that one is being timed. This
-                // isolates the un-contended open path: in the real binary,
-                // prefetch runs asynchronously and never blocks the paint
-                // itself, so disabling it here does not change what "first
-                // paint" means — it removes an artifact of this tight
-                // per-iteration loop that production's spaced-out opens never hit.
-                let doc = ress_core::document::Document::new(
-                    source(&bytes, *ms),
-                    ress_core::Config {
-                        prefetch_depth: 0,
-                        ..ress_core::Config::default()
-                    },
-                );
-                doc.viewport(
-                    ress_core::document::Anchor::TOP,
-                    ROWS,
-                    COLS,
-                    ress_core::document::HScroll::ZERO,
-                )
-                .await
-                .expect("first viewport fetch");
+            // `iter_custom`, not the plain `iter` every other group in this file uses: this group
+            // needs an UNTIMED region between iterations (U-bench, finding 4, below), which `iter`
+            // has no way to express (its closure IS the timed span, start to finish, every call).
+            // criterion calls this outer closure repeatedly (warmup, then each sample), so `bytes`
+            // is cloned per CALL, once, outside the timed span -- `Bytes::clone` is a cheap
+            // refcount bump (see `source`'s own doc comment above), not the 64 MiB memcpy
+            // `Vec<u8>::clone` would be, and `async move` needs an owned value to move in.
+            b.to_async(&rt).iter_custom(|iters| {
+                let bytes = bytes.clone();
+                async move {
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        // a fresh document every iteration: first paint is the cost of
+                        // opening a file that was never open before, not the warm,
+                        // already-open path `scroll_warm` measures separately.
+                        // Config::default()'s prefetch stays on, matching production —
+                        // this group exists to measure the real per-open cost
+                        // production pays, prefetch included, not an idealized
+                        // prefetch-off number nothing in production ever sees.
+                        let start = std::time::Instant::now();
+                        let mut doc = ress_core::document::Document::new(
+                            source(&bytes, *ms),
+                            ress_core::Config::default(),
+                        );
+                        doc.viewport(
+                            ress_core::document::Anchor::TOP,
+                            ROWS,
+                            COLS,
+                            ress_core::document::HScroll::ZERO,
+                        )
+                        .await
+                        .expect("first viewport fetch");
+                        elapsed += start.elapsed();
+                        // UNTIMED, deliberately outside the `elapsed` span above (U-bench, finding
+                        // 4): `doc`'s three background owners (prefetcher, index scan, status
+                        // worker) each abort on drop via their own `TaskOwner`/`JoinSet`, but a
+                        // plain `drop` only REQUESTS that abort — it does not wait for the teardown
+                        // to actually finish. On a multi-thread Runtime (this group's own `rt`,
+                        // above), that teardown can still be unwinding when the NEXT iteration's
+                        // `Document::new` starts, and the two would then contend for the same
+                        // worker threads: a source of measurement noise, not a correctness bug (see
+                        // `docs/concurrency.md` and this module's own `abort_background_and_join`).
+                        // Measured, not assumed: in this crate's own fixture, the index scan alone
+                        // (unthrottled, running since construction) can take hundreds of
+                        // microseconds to actually stop once aborted — many times this group's own
+                        // tens-of-microseconds timed span at latency_0ms — so leaving it unawaited
+                        // would make a fast iteration's own timing partly a measurement of the
+                        // PREVIOUS iteration's teardown instead. `abort_background_and_join` awaits
+                        // all three explicitly, right here, before the loop's next iteration starts.
+                        doc.abort_background_and_join().await;
+                    }
+                    elapsed
+                }
             });
         });
     }
@@ -135,10 +193,14 @@ fn scroll_warm(c: &mut criterion::Criterion) {
                 // entirely instead of hoping it finishes before sampling
                 // starts.
                 //
-                // Config::default()'s prefetch stays on (unlike
-                // first_paint/goto_end_cold's fresh-per-iteration Documents)
-                // — re-derived here, not just carried over, now that the
-                // indexer is gone: Prefetcher (prefetch.rs) holds only a
+                // Config::default()'s prefetch stays on, as in every group in
+                // this file; what's different here is that this Document,
+                // unlike first_paint/goto_end_cold's fresh-per-iteration
+                // ones, is built once and lives across every sample, so
+                // whether its own fills cost anything needs its own
+                // reasoning below rather than those two groups' — re-derived,
+                // not just carried over, now that the indexer is gone:
+                // Prefetcher (prefetch.rs) holds only a
                 // cache handle, depth, and its own last-offset/direction
                 // state — no reference to the scheduler or status worker
                 // anywhere in it, confirmed by reading the struct and
@@ -214,18 +276,28 @@ fn goto_end_cold(c: &mut criterion::Criterion) {
                     // constructor this used to call) would contend for the
                     // runtime's worker threads during the timed routines —
                     // new_unindexed removes that source entirely rather than
-                    // just de-batching it. new_unindexed still builds a
-                    // Prefetcher, though, so prefetch_depth: 0 is needed here
-                    // too — see first_paint's comment for the carryover
-                    // mechanism (Prefetcher has no cancel-on-drop); this
-                    // group's own viewport() call below, after the tail jump,
-                    // would otherwise spawn the same detached fills.
+                    // just de-batching it. Config::default()'s prefetch stays
+                    // on, matching production, now that Prefetcher joins the
+                    // cancel-on-drop idiom (see first_paint's comment for the
+                    // carryover mechanism this closes off). Unlike first_paint,
+                    // turning it on here is a true no-op, not just a small
+                    // one: the routine's one note_viewport call (inside
+                    // viewport(), after the tail jump below) fires with
+                    // direction defaulting forward on a document that has
+                    // never seen a viewport before, and the tail anchor
+                    // goto_end lands on sits in this 16 MiB fixture's LAST
+                    // 1 MiB block (block_size default) — so the very first
+                    // forward fill target already exceeds total_blocks and
+                    // note_viewport's loop breaks before spawning a single
+                    // task, on or off. Measured to confirm rather than left
+                    // to this reasoning alone: latency_0ms/1ms/5ms medians
+                    // with prefetch on land at 31.751µs/2.2597ms/6.3094ms
+                    // against 31.871µs/2.2638ms/6.3202ms with it off — every
+                    // leg "no change in performance detected" (p = 0.42,
+                    // 0.24, 0.82), exactly what zero spawned fills predicts.
                     ress_core::document::Document::new_unindexed(
                         source(&bytes, *ms),
-                        ress_core::Config {
-                            prefetch_depth: 0,
-                            ..ress_core::Config::default()
-                        },
+                        ress_core::Config::default(),
                     )
                 },
                 |doc| async move {
@@ -281,10 +353,10 @@ fn goto_line_cold_vs_indexed(c: &mut criterion::Criterion) {
         // ever runs — every measured sample would then read a warm cache,
         // not a cold one. PerIteration forces a fresh, empty cache for
         // every sample instead of letting criterion batch several setups
-        // ahead of their routines. Config::default()'s prefetch stays on
-        // here (unlike first_paint/goto_end_cold): the routine below never
-        // calls viewport(), the only site that triggers
-        // Prefetcher::note_viewport, so there is no spawn to carry over.
+        // ahead of their routines. Config::default()'s prefetch stays on,
+        // like every leg in this file: the routine below never calls
+        // viewport(), the only site that triggers Prefetcher::note_viewport,
+        // so there is no fill to spawn here regardless.
         b.to_async(&rt).iter_batched(
             || {
                 ress_core::document::Document::new_unindexed(
@@ -349,41 +421,55 @@ fn goto_line_cold_vs_indexed(c: &mut criterion::Criterion) {
     // leg's cost happening off-camera?").
     group.bench_function("pending", |b| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        b.to_async(&rt).iter(|| async {
-            // a real Document::new (not new_unindexed): the background
-            // index scan it spawns is the thing under measurement, so it
-            // must run for real, on a real tokio runtime. latency 0: like
-            // index_throughput, the scan's own progress is the quantity
-            // under test here, not an injected read cost. prefetch_depth:
-            // 0 is a no-op for this leg specifically (goto_line's Pending
-            // path never calls viewport(), the only call site that
-            // reaches Prefetcher::note_viewport — confirmed by reading
-            // document.rs) but kept for consistency with this file's
-            // other fresh-per-iteration cold legs.
-            let doc = ress_core::document::Document::new(
-                source(&bytes, 0),
-                ress_core::Config {
-                    prefetch_depth: 0,
-                    ..ress_core::Config::default()
-                },
-            );
-            // TARGET_LINE is asked for immediately after construction (no
-            // other await point precedes this), so the background scan
-            // just spawned has had essentially no wall-clock time to reach
-            // a line 78% of the way through a 64 MiB fixture — this is
-            // what forces Resolution::Pending here instead of racing to
-            // Ready, and it lands on the identical 0-based line indexed's
-            // goto_line(TARGET_LINE) resolves to (same call, same
-            // argument, no off-by-one to derive). ScanScheduler/
-            // StatusWorker both abort their background task on Drop, so
-            // `doc` going out of scope at the end of this async block
-            // cancels the scan cleanly before the next iteration spawns a
-            // fresh one — no cross-iteration contention, the same
-            // guarantee the old setup-closure shape had, without needing
-            // iter_batched/PerIteration to get it: plain `iter()` already
-            // runs this whole block, construction included, exactly once
-            // per sample, with nothing else batched ahead of it.
-            resolve(doc.goto_line(TARGET_LINE).await.expect("pending goto_line")).await;
+        // iter_custom, not plain iter (U-bench, finding 4 -- see first_paint's own comment for
+        // the full mechanism): resolving Pending here only waits for the scan's frontier to
+        // reach TARGET_LINE's checkpoint, not for the scan itself to finish -- a 64 MiB fixture
+        // has far more file left past a line 78% of the way through it, so ScanScheduler's own
+        // task is still actively mid-scan, not idle, the instant this leg's own resolve() call
+        // above returns and `doc` drops. That is the identical exposure first_paint has (a
+        // still-running scan, abort-requested but not awaited, free to keep contending for the
+        // runtime's worker threads while the NEXT iteration's own Document::new + goto_line is
+        // timed), so it gets the identical fix: time construction-through-resolve exactly as
+        // plain `iter()` used to, then await doc.abort_background_and_join() afterward, outside
+        // the timed span, before the loop's next iteration starts.
+        b.to_async(&rt).iter_custom(|iters| {
+            let bytes = bytes.clone();
+            async move {
+                let mut elapsed = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    // a real Document::new (not new_unindexed): the background
+                    // index scan it spawns is the thing under measurement, so it
+                    // must run for real, on a real tokio runtime. latency 0: like
+                    // index_throughput, the scan's own progress is the quantity
+                    // under test here, not an injected read cost. Config::default()'s
+                    // prefetch stays on, matching this file's other fresh-per-iteration
+                    // cold legs (first_paint, goto_end_cold) now that Prefetcher joins
+                    // the cancel-on-drop idiom — though here it changes nothing to
+                    // measure either way: goto_line's Pending path never calls
+                    // viewport(), the only call site that reaches
+                    // Prefetcher::note_viewport (confirmed by reading document.rs),
+                    // so this leg's own number cannot move regardless of depth.
+                    let start = std::time::Instant::now();
+                    let mut doc = ress_core::document::Document::new(
+                        source(&bytes, 0),
+                        ress_core::Config::default(),
+                    );
+                    // TARGET_LINE is asked for immediately after construction (no
+                    // other await point precedes this), so the background scan
+                    // just spawned has had essentially no wall-clock time to reach
+                    // a line 78% of the way through a 64 MiB fixture — this is
+                    // what forces Resolution::Pending here instead of racing to
+                    // Ready, and it lands on the identical 0-based line indexed's
+                    // goto_line(TARGET_LINE) resolves to (same call, same
+                    // argument, no off-by-one to derive).
+                    resolve(doc.goto_line(TARGET_LINE).await.expect("pending goto_line")).await;
+                    elapsed += start.elapsed();
+                    // UNTIMED (see this bench_function's own comment above for why the scan is
+                    // still genuinely mid-flight here, unlike index_throughput's leg below).
+                    doc.abort_background_and_join().await;
+                }
+                elapsed
+            }
         });
     });
     group.bench_function("indexed", |b| {

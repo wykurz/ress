@@ -1,0 +1,23 @@
+[package]
+name = "ress-perf"
+description = "pty-driven perf harness for ress vs less — a dev tool, never published"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+publish = false
+# two binaries live here (this crate's own ress-perf plus the fake-pager test subject in
+# src/bin/) -- without this, `cargo run -p ress-perf --` (the justfile's perf/fixtures recipe
+# shape) is ambiguous and cargo refuses to guess.
+default-run = "ress-perf"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+libc = { workspace = true }
+ress-filegen = { workspace = true }
+vt100 = { workspace = true }
+
+[lints]
+workspace = true

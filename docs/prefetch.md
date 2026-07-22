@@ -47,9 +47,41 @@ consumer actually needs the block, with the real error surfacing there.
 Depth is tunable (`--prefetch-depth`, default 8; 0 disables prefetch
 entirely).
 
-## Shutdown
+## Cancellation and shutdown
 
-Fills run positioned reads on the blocking thread pool, and a read wedged on
-a dead network mount cannot be aborted. The binary therefore bounds runtime
-shutdown with a short timeout: quitting abandons stuck background fills
-rather than waiting for a filesystem that may never answer.
+Every fill is tracked in a `TaskOwner` the `Prefetcher` owns, never detached
+— a thin `JoinSet` wrapper kept only for `JoinSet`'s own cancel-on-drop
+`Drop` (see `task_owner.rs`'s own doc comment): dropping the `Prefetcher` —
+which happens exactly when its `Document` does, since it is a plain field,
+never shared — drops that `TaskOwner`, which aborts every handle its
+`JoinSet` holds. This is the same cancel-on-drop guarantee
+`ScanScheduler` and `StatusWorker` give their own background task (see
+[concurrency](concurrency.md)); prefetch joins only that ownership half of
+the idiom, since a fill has no answer to publish back through a `watch`
+channel the way those two do.
+
+What that abort actually reaches is three layers, not one uniform "aborts
+everything" (verified against tokio's own source, not assumed — `tokio::
+task::JoinSet::drop`'s doc, `spawn_blocking`'s own cancellation doc):
+
+- A fill still **queued** on the concurrency semaphore — never having
+  started a read at all — dies outright.
+- A fill **suspended at an ordinary `.await`** (the semaphore acquire
+  itself) dies the same way, at that await point.
+- A fill already **inside its own blocking read** — past `cache.warm` and
+  into `PreadSource::read_block`'s `spawn_blocking` closure — is a third
+  case, not a variant of the first two: tokio documents `spawn_blocking`
+  tasks as uncancellable once running, so the blocking positioned read
+  completes on its own (or, on a wedged network mount, hangs on its own)
+  regardless of the abort. Only the outer wrapper task, and whatever value
+  it would have produced, is gone.
+
+The third case is bounded, not open-ended: at most **`FILL_CONCURRENCY`**
+(4) fills can hold a semaphore permit — and so be actively reading — at
+once, so a drop leaves at most that many single-block reads outstanding,
+real-file sources only (`MockSource`'s own simulated latency is a plain
+async sleep, fully abortable — this residual is specific to a real
+`PreadSource`). The binary accounts for this at shutdown rather than
+assuming it away: the runtime itself is torn down with a short timeout
+after the event loop returns, so quitting abandons any stuck background
+fills rather than waiting for a filesystem that may never answer.

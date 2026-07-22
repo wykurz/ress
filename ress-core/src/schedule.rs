@@ -3,17 +3,33 @@
 //! file is read once at block granularity; interactive reads stay
 //! prioritized because the pass warms only the probationary segment and
 //! yields between blocks.
-/// Owns the background indexing task; dropping it aborts the scan, so a
-/// closed document never leaves a stray reader behind.
+/// Owns the background indexing task; dropping it aborts the scan at
+/// whichever ordinary `.await` it is currently suspended at (including the
+/// explicit yield between ingested blocks, below) — via `tasks`'s own
+/// `Drop` (`TaskOwner`, pass 7 P7-C), not a hand-written one: see
+/// `task_owner.rs`'s own doc comment for why `JoinSet`'s abort-on-drop
+/// (what `TaskOwner` wraps) replaces the hand-written `self.task.abort()`
+/// this struct used to need — the byte-for-byte same shape `StatusWorker`
+/// used to hand-roll too, both now sharing the identical mechanism instead
+/// of two copies that could drift apart. The one exception (found in PR
+/// #44 round 10, auditing `Prefetcher`'s own identical exposure — this
+/// task reads through the same `cache.warm` → `PreadSource::read_block` path):
+/// a scan step already inside `read_block`'s `spawn_blocking` closure is not
+/// reachable by the abort at all, since tokio documents `spawn_blocking`
+/// tasks as uncancellable once running — that one blocking `pread` (at most
+/// one, this task never has two reads in flight at once) completes on its
+/// own, real-file sources only. A closed document never leaves a stray
+/// reader RUNNING AS A TRACKED TASK behind; it can leave at most that one
+/// syscall finishing alone.
 pub struct ScanScheduler {
     index: std::sync::Arc<std::sync::Mutex<crate::index::LineIndex>>,
     frontier: tokio::sync::watch::Receiver<crate::index::Frontier>,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Drop for ScanScheduler {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    // never read explicitly -- that IS the point: its existence alone (and, transitively, its
+    // own `JoinSet`'s) is what provides the cancel-on-drop guarantee this struct's own doc
+    // comment describes, needing no method call anywhere to do it. See `task_owner.rs`'s own
+    // doc comment.
+    #[allow(dead_code)]
+    tasks: crate::task_owner::TaskOwner<()>,
 }
 impl ScanScheduler {
     /// Starts indexing immediately; progress arrives on `frontier`.
@@ -21,7 +37,8 @@ impl ScanScheduler {
         let index = std::sync::Arc::new(std::sync::Mutex::new(crate::index::LineIndex::new()));
         let (tx, rx) = tokio::sync::watch::channel(crate::index::Frontier::default());
         let ix = index.clone();
-        let task = tokio::spawn(async move {
+        let mut tasks = crate::task_owner::TaskOwner::new();
+        tasks.spawn(async move {
             let size = cache.size();
             let bs = cache.block_size() as u64;
             let mut idx = 0u64;
@@ -65,7 +82,7 @@ impl ScanScheduler {
         ScanScheduler {
             index,
             frontier: rx,
-            task,
+            tasks,
         }
     }
     /// The shared index, for query-time checkpoint lookups.
@@ -76,11 +93,22 @@ impl ScanScheduler {
     pub fn frontier(&self) -> tokio::sync::watch::Receiver<crate::index::Frontier> {
         self.frontier.clone()
     }
+    /// Aborts the scan task and awaits its own teardown to finish, rather
+    /// than the fire-and-forget abort-request `Drop` alone provides -- see
+    /// `TaskOwner::abort_all_and_join`'s own doc comment for the mechanism
+    /// and `Prefetcher::abort_and_join`'s own doc comment for why a
+    /// criterion bench needs this distinction at all. Bench-visible (test +
+    /// bench-internals, matching `Document::new_unindexed`'s own
+    /// precedent).
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) async fn abort_and_join(&mut self) {
+        self.tasks.abort_all_and_join().await;
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::MockSource;
+    use crate::source::{MockSource, wait_for_count};
     use std::sync::Arc;
     fn cache(data: Vec<u8>, block_size: usize) -> Arc<crate::cache::BlockCache> {
         Arc::new(crate::cache::BlockCache::new(
@@ -197,28 +225,35 @@ mod tests {
     }
     #[tokio::test]
     async fn dropping_the_scheduler_aborts_the_scan() {
-        // 60s per block cannot finish inside the 2s timeout below, so the
-        // channel closing only proves the scheduler dropped its sender —
-        // the done check below is what proves that happened via abort()
-        // rather than the scan actually running to completion.
-        let src = Arc::new(
-            MockSource::new(vec![b'x'; 1 << 20]).with_latency(std::time::Duration::from_secs(60)),
-        );
-        let c = Arc::new(crate::cache::BlockCache::new(src, 4096, 1 << 20));
+        // an armed gate holds the scan's very first read open forever (until released, which
+        // never happens in this test) -- unlike a fixed-latency read (this test's own pre-
+        // U-delete shape), which can complete and free whatever it holds on its own timeline,
+        // independent of when this test gets around to observing it, this is a structural
+        // guarantee: the read genuinely cannot complete on its own before the drop below.
+        // Armed immediately, unlike `status.rs`'s own use of the same mechanism: nothing here
+        // needs an earlier read to go through normally first, since the scan's own FIRST read
+        // is the one this test wants gated.
+        let src = Arc::new(MockSource::new(vec![b'x'; 1 << 20]).with_gate());
+        src.arm_gate();
+        let c = Arc::new(crate::cache::BlockCache::new(src.clone(), 4096, 1 << 20));
         let s = ScanScheduler::spawn(c);
-        let mut rx = s.frontier();
+        let fr = s.frontier();
+        let mut started = src.started_events();
+        wait_for_count(&mut started, |n| n > 0).await;
+        // the task is now genuinely, and PERMANENTLY (until released, which never happens in
+        // this test), suspended on the gate armed above.
+        let mut cancelled = src.cancelled_events();
+        let cancelled_baseline = *cancelled.borrow();
         drop(s);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while rx.changed().await.is_ok() {}
-        })
-        .await
-        .expect("scan task outlived its drop guard");
+        // POSITIVE proof: the in-flight read's own future was torn down, not left running or
+        // let finish on its own.
+        wait_for_count(&mut cancelled, |n| n > cancelled_baseline).await;
         // a watch receiver keeps the last value after its sender drops: an
         // abort mid-scan leaves the initial default frontier (done == false)
         // behind, while a natural finish would have sent one with done ==
         // true — this is the direct discriminator between the two.
         assert!(
-            !rx.borrow().done,
+            !fr.borrow().done,
             "the scan must have been aborted, not completed"
         );
     }

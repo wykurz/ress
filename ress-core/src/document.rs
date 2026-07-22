@@ -148,6 +148,39 @@ impl Document {
             status: None,
         }
     }
+    /// Aborts every background owner this document holds (the prefetcher,
+    /// the index scan, and the status worker) and awaits each one's own
+    /// teardown to finish, rather than the fire-and-forget abort-REQUEST a
+    /// bare `drop` alone provides (each owner's `TaskOwner`/`JoinSet` aborts
+    /// on drop, but does not wait for that abort to actually take effect).
+    /// Measured, not assumed (U-bench, finding 4): in this crate's own 64
+    /// MiB / 1 MiB-block fixture, `abort_and_join` on the index scan alone
+    /// (which starts scanning immediately and unconditionally at
+    /// construction, so it can be many blocks into an unthrottled pass by
+    /// the time a single `.viewport()` call returns) measured in the
+    /// hundreds of microseconds, and the status worker's in the tens to
+    /// low hundreds — both dwarfing `first_paint`'s own tens-of-microseconds
+    /// timed span at `latency_0ms`; the prefetcher's own teardown measured
+    /// far smaller (tens of microseconds) but is included for the same
+    /// reason. A criterion bench that builds a fresh `Document` every
+    /// iteration needs all three awaited explicitly, OUTSIDE the timed
+    /// region, before the next iteration starts — otherwise the previous
+    /// iteration's own still-unwinding teardown keeps contending for the
+    /// same runtime worker threads the next iteration's timed work needs.
+    /// Bench-visible (test + bench-internals, matching `new_unindexed`'s
+    /// own precedent — a `[[bench]]` target is a separate crate that cannot
+    /// see crate-private items regardless of cfg, so this one specifically
+    /// needs `pub`, unlike the three owner-level methods it calls).
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub async fn abort_background_and_join(&mut self) {
+        self.prefetcher.abort_and_join().await;
+        if let Some(scheduler) = self.scheduler.as_mut() {
+            scheduler.abort_and_join().await;
+        }
+        if let Some(status) = self.status.as_mut() {
+            status.abort_and_join().await;
+        }
+    }
     /// The shared cache, for the prefetcher.
     pub(crate) fn cache(&self) -> &Arc<crate::cache::BlockCache> {
         &self.cache
@@ -456,6 +489,17 @@ impl Document {
     pub fn status_snapshots(&self) -> tokio::sync::watch::Receiver<StatusSnapshot> {
         self.status.as_ref().expect(NO_INDEX).status_snapshots()
     }
+    /// A receiver a test can `wait_for`/`changed()` on to observe how many times the status
+    /// worker's own loop has begun a fresh resolution attempt -- see
+    /// `crate::status::StatusWorker::resolution_attempts_events`'s own doc comment for why this
+    /// exists.
+    #[cfg(test)]
+    pub(crate) fn resolution_attempts_events(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.status
+            .as_ref()
+            .expect(NO_INDEX)
+            .resolution_attempts_events()
+    }
     /// A subscription to the background index's progress, for repaint-driven
     /// consumers like the status line.
     pub fn index_frontier(&self) -> tokio::sync::watch::Receiver<crate::index::Frontier> {
@@ -552,7 +596,7 @@ fn percent_offset(size: u64, pct: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::MockSource;
+    use crate::source::{MockSource, wait_for_count};
     fn doc(data: &'static [u8], block_size: usize) -> Document {
         let src = Arc::new(MockSource::new(bytes::Bytes::from_static(data)));
         Document::new(
@@ -1186,14 +1230,15 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelled_pending_nav_leaves_the_engine_healthy() {
-        let src = Arc::new(
-            MockSource::new({
-                let mut data = vec![b'a'; 8192];
-                data.push(b'\n');
-                data
-            })
-            .with_latency(std::time::Duration::from_millis(5)),
-        );
+        // no injected latency: nav_scan_budget (256 bytes) forces Pending regardless, and
+        // `p.cancel()` below accepts EITHER race outcome (`let _ = p.handle.await` -- an aborted
+        // join error is fine) -- nothing here depends on the read still being in flight at
+        // cancel time (U-delete).
+        let src = Arc::new(MockSource::new({
+            let mut data = vec![b'a'; 8192];
+            data.push(b'\n');
+            data
+        }));
         let d = Document::new(
             src,
             Config {
@@ -1291,25 +1336,48 @@ mod tests {
     }
     #[tokio::test]
     async fn goto_line_beyond_the_frontier_pends_with_progress() {
-        // 2 ms latency per block keeps the background scan comfortably
-        // behind the query, so the goto must pend on the frontier.
+        // an armed gate holds the background scan's very first read open, so it provably
+        // cannot have advanced the index AT ALL by the time goto_line is asked below --
+        // deterministic, not "2ms per block is probably enough to stay behind" (U-delete).
+        // Stated honestly, not overclaimed: `Document::new` is fully synchronous and
+        // `goto_line`'s own Pending decision (document.rs, above) never awaits either, so
+        // TODAY there is in fact no yield point at all between construction and the query --
+        // the scan's task cannot get a single poll in either way, gate or not (confirmed: 20/20
+        // clean with the gate deliberately left unarmed). The gate is not closing an observed
+        // flake here, it is removing reliance on that being true FOREVER -- nothing in either
+        // function's own contract promises no yield point will ever appear between them, and a
+        // future fairness yield (`StatusWorker::run`'s own count-step loop already has one, for
+        // exactly this reason) would silently make this test racy again. Reproduced directly:
+        // temporarily inserted 2000 `yield_now`s here with the gate left unarmed, simulating
+        // exactly that -- the scan raced ahead and finished, flipping this to
+        // `Ready(34990)` and hitting the panic below. Reverted after confirming.
+        // Safe for the QUERY's own path too: `goto_line`'s Pending decision reads only the
+        // in-memory index Mutex, never the source, so gating the source cannot block the query
+        // itself from returning -- only the background scan it races against.
         let mut data = Vec::new();
         for i in 0..4000u32 {
             data.extend_from_slice(format!("line {i:04}\n").as_bytes());
         }
-        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(2)));
+        let src = Arc::new(MockSource::new(data).with_gate());
         let d = Document::new(
-            src,
+            src.clone(),
             Config {
                 block_size: 256,
                 prefetch_depth: 0,
                 ..Config::default()
             },
         );
+        src.arm_gate();
         match d.goto_line(3500).await.unwrap() {
             Resolution::Pending(mut p) => {
                 assert_eq!(p.label, "jumping to line");
                 let first = *p.progress.borrow();
+                // the discriminator: reaching this arm at all proves the scan was still
+                // uncovered when asked -- a scan that could race ahead (the risk the fixed
+                // latency only probabilistically avoided) would resolve Ready instead, hitting
+                // the panic in that arm below. Opened only now, having already proven Pending:
+                // the walk below needs real reads to actually resolve.
+                src.open_gate();
                 let a = (&mut p.handle).await.unwrap().unwrap();
                 assert_eq!(a, Anchor::at(34990));
                 let last = *p.progress.borrow();
@@ -1366,23 +1434,43 @@ mod tests {
     }
     #[tokio::test]
     async fn goto_line_phantom_clamp_holds_through_the_pending_path() {
-        // same shape, but the query races a slow scan so resolution goes
-        // through the pending closure's own coverage check.
-        let src = Arc::new(
-            MockSource::new(b"x\n".repeat(1024)).with_latency(std::time::Duration::from_millis(2)),
-        );
+        // same shape, but the query races the background scan so resolution goes
+        // through the pending closure's own coverage check -- unlike the
+        // neighbor above, this used to resolve via `Resolution::join`, which
+        // accepts EITHER variant transparently (see its own doc comment,
+        // resolve.rs): a future change that made this resolve synchronously
+        // as `Ready` instead -- skipping the pending path's own coverage
+        // check entirely, the exact mechanism this test claims to exercise
+        // -- would have kept passing, silently testing nothing about it.
+        //
+        // an armed gate, not a fixed latency (U-delete): same mechanism and same
+        // "stated honestly" caveat as `goto_line_beyond_the_frontier_pends_with_progress`'s own
+        // comment, above -- today there is no yield point between `Document::new` and this
+        // query either, so the gate isn't closing an observed flake, it's removing reliance on
+        // that staying true forever. Arm immediately, before any await, for the identical
+        // reason: `Document::new` is synchronous and a freshly spawned task cannot be polled
+        // until this task yields, so the scan cannot have read anything yet regardless.
+        let src = Arc::new(MockSource::new(b"x\n".repeat(1024)).with_gate());
         let d = Document::new(
-            src,
+            src.clone(),
             Config {
                 block_size: 64,
                 prefetch_depth: 0,
                 ..Config::default()
             },
         );
-        assert_eq!(
-            d.goto_line(1025).await.unwrap().join().await,
-            Anchor::at(2046)
-        );
+        src.arm_gate();
+        match d.goto_line(1025).await.unwrap() {
+            Resolution::Pending(p) => {
+                src.open_gate();
+                assert_eq!(p.handle.await.unwrap().unwrap(), Anchor::at(2046));
+            }
+            Resolution::Ready(a) => panic!(
+                "expected Pending -- the whole point of this test is the pending path's own \
+                 coverage check -- got Ready({})",
+                a.offset()
+            ),
+        }
     }
     #[tokio::test]
     async fn goto_line_phantom_clamp_resolves_synchronously_once_indexed() {
@@ -1465,20 +1553,21 @@ mod tests {
     }
     #[tokio::test]
     async fn line_number_converges_while_uncovered_and_the_scan_is_alive() {
-        // a fresh scanner has not been polled yet, so it has not covered
-        // anything; the latency keeps it from catching up before the first
-        // snapshot for this anchor is observed below. Ruled semantic
-        // change from the old design: an uncovered anchor used to report
-        // `Unavailable` unconditionally, since only an external frontier
-        // watcher would ever revisit it; the worker now waits on coverage
-        // itself, so a live scan means `Converging` — only a *dead* scan's
-        // uncovered anchor is `Unavailable` (see
-        // `line_number_stays_unavailable_past_a_dead_scan_frontier`).
-        let mut data = Vec::new();
-        for i in 0..4000u32 {
-            data.extend_from_slice(format!("line {i:04}\n").as_bytes());
-        }
-        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(2)));
+        // audit finding 1b (status.rs sibling: `stays_converging_while_the_scan_is_alive_and_
+        // uncovered`, whose own doc comment explains the discrimination in full): the status
+        // worker publishes Converging from TWO sites, one coverage-gated and one unconditional,
+        // so a test that only checks the published VALUE cannot tell a genuinely gated wait from
+        // an already-(mis-)covered anchor whose count-scan just also happens to publish
+        // Converging on its own way in. Gating block 0 forever (rather than betting a fixed
+        // latency keeps a live scan behind) makes coverage permanently, structurally
+        // unsatisfied; `BlockCache::coalesced_events` (pass 8, U-cache), read through
+        // `Document::cache` (already `pub(crate)`, used by the prefetcher), proves the status
+        // worker's own count-scan never even attempted a read -- see the status.rs sibling for
+        // why `in_flight_len` cannot serve this role, and why checkpoint `(0, 0)` is exactly
+        // where a wrongly-triggered count-scan would collide with the gated block.
+        let data: &'static [u8] = Box::leak(vec![b'x'; 4096].into_boxed_slice());
+        let src = Arc::new(MockSource::new(data).with_gate());
+        src.arm_gate();
         let d = Document::new(
             src,
             Config {
@@ -1487,9 +1576,28 @@ mod tests {
                 ..Config::default()
             },
         );
-        d.request_line_number(Anchor::at(34990));
-        let line = wait_for_line_number(&d, 34990, |_| true).await;
+        // captured BEFORE any request at all -- see the status.rs sibling's identical comment for
+        // the full reasoning (p6-review2, pass 8 U-worker review, point 1): the real risk is any
+        // yield before this capture, not specifically the worker's own default anchor-0 pass.
+        let coalesced = d.cache().coalesced_events();
+        let coalesced_baseline = *coalesced.borrow();
+        d.request_line_number(Anchor::at(2000)); // deep into the file; unreachable while block 0 is parked.
+        let line = wait_for_line_number(&d, 2000, |_| true).await;
         assert_eq!(line, LineNumber::Converging);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *coalesced.borrow(),
+            coalesced_baseline,
+            "the status worker's own count-scan must never even attempt a read while the \
+             anchor is genuinely uncovered"
+        );
+        assert_eq!(
+            d.line_number().line,
+            LineNumber::Converging,
+            "a genuinely uncovered anchor must never progress to Known while parked"
+        );
     }
     #[tokio::test]
     async fn line_number_converges_across_many_budget_chunks() {
@@ -1692,8 +1800,11 @@ mod tests {
         // until this task yields — pileup is impossible to observe here,
         // not just unlikely.
         let data = "aaaaaaa\n".repeat(8).into_bytes();
-        let src =
-            Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(20)));
+        // no injected latency: this test's own comment already states the pileup-avoidance
+        // property is structural (no await between send and check), and `cold_block_zero_doc`
+        // below gets its "block 0 is cold" guarantee from cache_bytes being too small to hold
+        // the whole 8-block scan, not from timing (U-delete).
+        let src = Arc::new(MockSource::new(data));
         let (d, _) = cold_block_zero_doc(src.clone()).await;
         let before = src.read_count();
         for i in 0..10u64 {
@@ -1755,12 +1866,33 @@ mod tests {
             reads: std::sync::atomic::AtomicU64::new(0),
         });
         let (d, a) = cold_block_zero_doc(src.clone()).await;
+        let attempts = d.resolution_attempts_events();
         let line = resolved_line_number(&d, a).await;
         assert_eq!(line, LineNumber::Unavailable, "retries must exhaust");
         let frozen_at = src.reads.load(std::sync::atomic::Ordering::Relaxed);
-        // well past the retry backoff (3 retries at 50/100/150ms): no
-        // further reads without a new anchor to kick the worker again.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let attempts_at_stall = *attempts.borrow();
+        // POSITIVE proof, not a bounded silence window -- but stated precisely about what
+        // discriminates what here (p6-review2, pass 8 U-worker review, point 2): in THIS test's
+        // own construction (`FailsOnRereadOfBlockZero` over a deliberately undersized cache,
+        // making every walk attempt a genuine cold read), the read-count assertion below is what
+        // actually does the discriminating work -- any re-kick, however caused, needs a real
+        // source read to advance a walk, so `src.reads` alone already catches it. `resolution_
+        // attempts` (see its own doc comment, status.rs) is kept as a secondary, defense-in-depth
+        // check: it counts loop *iterations* regardless of whether a given one hits the cache or
+        // the real source, so it would ALSO catch a subtler class this specific test does not
+        // happen to exercise -- a re-kick landing on an already-warm/cached block, needing no
+        // fresh read at all, which `src.reads` structurally cannot see. Unlike a downstream read
+        // count, this signal fires the instant the loop re-enters, before any retry backoff sleep
+        // would even begin, so a few cooperative yields (not real or virtual time) suffice to
+        // give either class of bug a genuine chance to run before the assertions below.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *attempts.borrow(),
+            attempts_at_stall,
+            "worker kept retrying after exhausting its budget"
+        );
         assert_eq!(
             src.reads.load(std::sync::atomic::Ordering::Relaxed),
             frozen_at,
@@ -1877,9 +2009,63 @@ mod tests {
         // worker holds only cache/index/channel handles, never a handle
         // to itself, so Document's own drop (which drops the worker,
         // whose `Drop` impl aborts its task) is sufficient on its own.
+        //
+        // found in PR #44 pass 6 S4 (#8, a user-review finding): this test proves Document's own
+        // drop genuinely reaches all the way through to the worker being torn down (the
+        // Arc-cycle regression above) -- it does NOT, on its own, discriminate whether `.abort()`
+        // specifically is what ends the worker's task, since dropping the worker ALSO drops its
+        // `anchor_tx`, and `status.rs`'s own `run` loop already exits on its own once that
+        // channel closes, whichever happens. Confirmed directly, not assumed: the identical
+        // confound is documented on `status.rs`'s own `dropping_the_worker_aborts_its_in_flight_
+        // step` (pass 7, P7-C rewrote that test to prove `.abort()`'s own contribution through
+        // `StatusWorker`'s REAL `Drop`, holding a cloned anchor sender alive throughout to isolate
+        // it from channel-close -- see its own doc comment for the full account) -- that is the
+        // test that isolates `.abort()`'s own contribution unconfounded. This test's own value
+        // stands regardless: Document's drop reaching the worker at all (not leaking it via the
+        // old Arc cycle) is exactly what it was written to pin, whichever mechanism the worker's
+        // own teardown then uses.
+        //
+        // found in PR #44 pass 7 (P7-C, a p6-review2 ruling, SUPERSEDED below): this test used to
+        // stay silence-based rather than converting to a positive `Cancelled`-event wait the way
+        // `status.rs`'s own test was, on the reasoning that this test's whole point is the
+        // Arc-ownership-cycle regression above -- an INTEGRATION-level claim that `Document`'s own
+        // drop cascade reaches all the way through to the worker being torn down at all, not
+        // `StatusWorker`'s own `Drop` mechanism in isolation (already covered directly, and more
+        // precisely, by `dropping_the_worker_aborts_its_in_flight_step`, status.rs) -- and a
+        // LEAKED worker (this test's own regression case) would keep reading, so silence alone
+        // would still catch it without needing to re-prove the SAME mechanism that other test
+        // already isolates.
+        //
+        // found in PR #44 pass 7's structural pass, re-review (codex P2): that premise no longer
+        // holds, once the gate below (added for the scheduling-race fix) entered the picture. A
+        // gated read PARKS instead of completing or retrying -- so a LEAKED worker (never torn
+        // down at all) also reads nothing further: it just sits there, parked, forever. Both
+        // silence checks this test used to make -- a `started.changed()` timeout, `read_count()
+        // == mid` holding -- passed IDENTICALLY whether the worker was genuinely torn down OR
+        // leaked-and-parked, unable to tell the two apart anymore (RED-verified directly: took
+        // `d`'s own `status` field out via `.take()` and `std::mem::forget`-ed it before the drop,
+        // simulating the original round-4 leak -- the OLD silence assertions passed anyway).
+        // Ruling revised: this test now waits for a POSITIVE `Cancelled` event on the one gated
+        // read, the same mechanism `status.rs`'s own test uses. The DISTINCTION between the two
+        // tests still holds exactly as before -- this one proves the DROP CASCADE reaches the
+        // worker at all; `status.rs`'s proves `StatusWorker`'s OWN `Drop` in isolation, anchor-tx
+        // held alive throughout -- only both now prove their own claim through a positive event
+        // rather than one of the two doing it through silence. Against the fix, the same
+        // simulated leak correctly fails (`wait_for_count`'s own 5s timeout, loud, not silent).
+        // Both reverted immediately after confirming.
         let mut data = vec![b'x'; 4096];
         data.push(b'\n');
-        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(5)));
+        // a gate, disarmed until armed below -- not a fixed latency (codex P2, PR #44 pass 7's
+        // structural pass, a 3rd re-review, the shared root of 3 findings at once, this one an
+        // audit find rather than one of the 3 codex flagged directly: identical shape to
+        // `status.rs`'s own `dropping_the_worker_aborts_its_in_flight_step`, including the SAME
+        // risk -- a fixed-latency read can complete on its own before `drop(d)` below,
+        // independent of this test's own scheduling). Unlike that test, nothing here reads
+        // through `src` again after the drop (the check below is a positive `cancelled_events`
+        // wait, which only watches a channel, never a fresh read), so there is no later,
+        // legitimate read to protect from the gate staying armed -- no `open_gate` call needed
+        // anywhere in this test.
+        let src = Arc::new(MockSource::new(data).with_gate());
         let d = Document::new(
             src.clone(),
             Config {
@@ -1897,17 +2083,30 @@ mod tests {
                 .await
                 .expect("index scan ended without ever sending a done frontier");
         }
+        src.arm_gate();
+        // found in PR #44 round 17 (a codex P2, sweep): this test used to sleep 30ms and expect
+        // that to have been enough real time for the walk to have started re-reading -- see
+        // status.rs's own `dropping_the_worker_aborts_its_in_flight_step` (this crate's own
+        // tests, identical shape, including the baseline-before-the-request derivation) for why.
+        // The baseline is captured before the request: the index scan above already performed
+        // its own reads, so waiting for merely "n >= 1" resolves trivially off THOSE, never
+        // actually confirming the WALK toward 4000 had started at all.
+        //
+        // found in PR #44 pass 6 S3 (codex, "bound the read-start handshake waits with a
+        // timeout"): that `wait_for` used to be raw and unbounded -- see
+        // `wait_for_count`'s own doc comment (source.rs) for why.
+        let mut started = src.started_events();
+        let baseline = *started.borrow();
         d.request_line_number(Anchor::at(4000));
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let mid = src.read_count();
-        assert!(mid > 0, "walk should be re-reading evicted blocks by now");
+        wait_for_count(&mut started, |n| n > baseline).await;
+        let mut cancelled = src.cancelled_events();
+        let cancelled_baseline = *cancelled.borrow();
         drop(d);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(
-            src.read_count(),
-            mid,
-            "the status worker kept reading after its Document was dropped"
-        );
+        // POSITIVE proof, pass 7's structural pass (superseding the P7-C silence ruling above):
+        // the drop cascade reached all the way through to the gated read's own future being torn
+        // down, not left parked forever by a leaked worker. See this test's own comment above for
+        // why silence stopped being able to tell the two apart once the gate landed.
+        wait_for_count(&mut cancelled, |n| n > cancelled_baseline).await;
     }
 }
 

@@ -56,11 +56,16 @@ bench-build:
 
 # materialize the standard fixture set into ./fixtures/
 fixtures:
-    bash scripts/perf.sh --fixtures-only
+    cargo run -p ress-perf --release -- --fixtures-only
 
 # end-to-end perf comparison, ress vs less (see docs/perf.md); try --quick
 perf *ARGS:
-    bash scripts/perf.sh {{ARGS}}
+    # ress-perf does not depend on ress (it drives the binary, not the library) and never builds
+    # it itself -- that's the harness's caller's job (see check_preconditions in main.rs) -- so
+    # this recipe, the caller, has to. ress-perf's own release build happens via its `cargo run`
+    # below, same as before.
+    cargo build --release -p ress
+    cargo run -p ress-perf --release -- {{ARGS}}
 
 # run all CI checks locally
 ci: lint doc test-all bench-build

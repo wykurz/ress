@@ -38,9 +38,19 @@ itself owns.
   question and is then done: there is no inbound channel to re-target it,
   because a superseding motion drops it and spawns a new one instead.
 
-Prefetch fills are deliberately outside this shape — many small,
-uncoordinated, fire-and-forget reads rather than one task with an answer to
-publish (see [prefetch](prefetch.md)).
+Prefetch fills join half of this shape and stay deliberately outside the
+other half. Many small, uncoordinated reads (never one task with a single
+answer to publish) means there is no `watch` channel — a fill's only
+observable effect is warming the shared cache, not a value a consumer reads
+back, so there is nothing to publish. But every fill is still owned: they
+live in one `TaskOwner` (a thin `JoinSet` wrapper kept only for
+`JoinSet`'s own cancel-on-drop `Drop`) the `Prefetcher` holds, so dropping
+the `Prefetcher` — which happens exactly when its `Document` does — drops
+that `TaskOwner`, aborting every handle its `JoinSet` holds, the same
+cancel-on-drop guarantee as the three background computations above — with
+the same one blocking-read exception those three tasks share too (see
+[prefetch](prefetch.md)'s own Cancellation section for the full
+three-layer account and its `FILL_CONCURRENCY` bound, not restated here).
 
 ## Supersession is control flow
 
@@ -110,16 +120,27 @@ by a background pass touching a block on its way through.
 
 Every owned task is cancelled the same way: dropping its owner aborts the
 task's handle outright, with no cooperative shutdown protocol to get
-wrong. Aborting mid-read is safe by construction rather than by care taken
-at each call site — the block cache's own in-flight registration is
-guarded to clean up after a cancelled fetcher instead of leaving a stale
-entry behind (see [block cache](block_cache.md)), so an aborted background
-reader never wedges the block it was fetching for whoever asks next.
+wrong — a queued task never starts, and one suspended at any ordinary
+`.await` (a channel wait, a semaphore acquire, a between-blocks yield)
+unwinds right there. Aborting mid-read is safe by construction rather than
+by care taken at each call site — the block cache's own in-flight
+registration is guarded to clean up after a cancelled fetcher instead of
+leaving a stale entry behind (see [block cache](block_cache.md)), so an
+aborted background reader never wedges the block it was fetching for
+whoever asks next.
 
 The one read that cannot be aborted this way is a blocking positioned
-read already handed to the OS thread pool: a wedged network mount can
-leave that read outstanding past its owning task's own cancellation.
-Process exit accounts for this directly rather than assuming every
-background task unwinds cleanly — the runtime itself is shut down with a
-short timeout after the event loop returns, so quitting abandons a stuck
-read rather than waiting on a filesystem that may never answer.
+read already handed to the OS thread pool (`spawn_blocking`, which tokio
+itself documents as uncancellable once running): a wedged network mount
+can leave that read outstanding past its owning task's own cancellation,
+finishing (or hanging) entirely on its own — every one of the three
+background computations above, plus prefetch (outside the shape
+architecturally, per its own section above, but reading through this
+identical path), shares this exposure, real-file sources only, each
+bounded by how many reads it can have in flight at once (`ScanScheduler`,
+`StatusWorker`, and `PendingNav`: at most one each, being single tasks;
+prefetch: up to `FILL_CONCURRENCY`, see [prefetch](prefetch.md)). Process
+exit accounts for this directly rather than assuming every background
+task unwinds cleanly — the runtime itself is shut down with a short
+timeout after the event loop returns, so quitting abandons a stuck read
+rather than waiting on a filesystem that may never answer.
