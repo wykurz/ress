@@ -18,6 +18,9 @@ pub struct Cli {
     /// Blocks to prefetch ahead of the viewport (0 disables).
     #[arg(long, default_value_t = 8)]
     pub prefetch_depth: usize,
+    /// Max concurrent OS-level file reads (bounds wedged-mount thread pile-up; min 1).
+    #[arg(long, default_value_t = ress_core::source::DEFAULT_READ_CONCURRENCY)]
+    pub read_concurrency: usize,
 }
 
 /// Maps the `-v` count to a tracing level filter string.
@@ -80,15 +83,30 @@ mod tests {
     }
     #[test]
     fn parses_cache_and_prefetch_flags() {
-        let cli = Cli::try_parse_from(["ress", "--cache-mib", "64", "--prefetch-depth", "2", "f"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "ress",
+            "--cache-mib",
+            "64",
+            "--prefetch-depth",
+            "2",
+            "--read-concurrency",
+            "4",
+            "f",
+        ])
+        .unwrap();
         assert_eq!(cli.cache_mib, 64);
         assert_eq!(cli.prefetch_depth, 2);
+        assert_eq!(cli.read_concurrency, 4);
     }
     #[test]
     fn cache_and_prefetch_have_defaults() {
         let cli = Cli::try_parse_from(["ress", "f"]).unwrap();
         assert_eq!(cli.cache_mib, 256);
         assert_eq!(cli.prefetch_depth, 8);
+        assert_eq!(
+            cli.read_concurrency,
+            ress_core::source::DEFAULT_READ_CONCURRENCY
+        );
+        assert_eq!(ress_core::source::DEFAULT_READ_CONCURRENCY, 16); // pinned: README documents this default
     }
 }

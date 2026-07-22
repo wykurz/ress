@@ -14,6 +14,22 @@ row means something is eating the saving between the engine call and the
 pixels, which is exactly the kind of gap only the whole-binary harness can
 see.
 
+## Scope and standing assumptions
+
+`ress-perf` is an internal measuring instrument, not a product
+(2026-07-22 policy). Its numbers are **relative** — regression-spotting
+between runs on the same machine — never absolute benchmarks, and
+findings against the harness are judged by whether they could mislead a
+real decision. **Subjects do not fork:** every subject this harness
+drives (`ress`; `less` with no input preprocessors configured) runs as a
+single process in its own process group, so no surviving writer means
+the post-mortem FIONREAD queue only ever shrinks. The harness drains it
+in re-snapshot rounds until a zero round, a shape probe-verified on the
+supported kernel (73,000 iterations, zero under-reports) and guarded
+against theoretical delivery lag on other kernels by the extra rounds.
+The pty reap machinery's descendant handling is defense-in-depth, not a
+supported surface.
+
 ## Criterion benches (`just bench`)
 
 `ress-core/benches/engine.rs` measures engine operations — first paint,
@@ -392,20 +408,25 @@ screen-poll number.
   to agree are enough to call it settled, even if more redraws are
   still in flight underneath — it cannot tell "held steady" apart from
   "changed and happened to come back" between its own two samples. This
-  harness pairs a fixed-cadence needle match with a top-row generation
-  counter (bumped whenever row 0's own content differs across a
-  read-drain boundary — see `Screen::feed`'s own doc comment for the
-  exact granularity this can and cannot see): a stability pair requires
-  the expected content at one checkpoint *and* the generation still
-  unchanged at the next one, spaced by the poll interval — unrelated
-  output on other rows neither hurries nor delays the verdict, since
-  only row 0's own generation is watched. A redraw that lands row 0
-  back on the expected text after a genuine intermediate change does
-  not count as settled: the generation will have moved, so the pair is
-  discarded and confirmation restarts from that tick. That is the
-  concrete mechanism behind "stricter" — not a hoped-for property of
-  reconstructing the screen, but an explicit gate perf.sh's own
-  consecutive-sample oracle has no equivalent of.
+  harness pairs a fixed-cadence needle match with a top-row
+  generation counter (bumped whenever row 0's own content differs
+  across a read-drain boundary — see `Screen::feed`'s own doc
+  comment for the exact granularity this can and cannot see): a
+  stability pair requires the expected content at one checkpoint
+  *and* the generation still unchanged at the next one, spaced by
+  the poll interval — unrelated output on other rows neither
+  hurries nor delays the verdict, since only row 0's own
+  generation is watched. This spacing is enforced at the deadline
+  too (post-merge batch, fix #5): the ceiling branch is a second
+  "final look," and a first confirmation younger than one poll
+  interval at the wall is refused — the sample times out rather
+  than accepting an under-spaced pair. A redraw that lands row 0
+  back on the expected text after a genuine intermediate change
+  does not count as settled: the generation will have moved, so
+  the pair is discarded and confirmation restarts from that tick.
+  That is the concrete mechanism behind "stricter" — not a
+  hoped-for property of reconstructing the screen, but an explicit
+  gate perf.sh's own consecutive-sample oracle has no equivalent of.
 - **That gate did not explain why this port's own scroll-cadence
   number used to run 4-5x higher than perf.sh's — a dose-response
   investigation found the real cause was the reader, and it has since

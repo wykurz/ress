@@ -257,27 +257,74 @@ fn first_paint_event_reaches_the_log_file() {
     // once, ever" the way an in-process test can -- it is an improvement over a single guessed
     // sleep, not a full elimination of that class. The structural "fires exactly once" proof
     // lives in ress-core's own first-paint tests.
+    let count_first_paints = |contents: &str| {
+        contents
+            .lines()
+            .filter(|line| line.contains("perf") && line.contains("first paint"))
+            .count()
+    };
     let settle_deadline = std::time::Instant::now() + ASSUMED_REDRAW_TICK * 5;
     let mut occurrences = 0;
     while std::time::Instant::now() < settle_deadline {
         let contents = std::fs::read_to_string(&log).unwrap_or_default();
-        occurrences = occurrences.max(
-            contents
-                .lines()
-                .filter(|line| line.contains("perf") && line.contains("first paint"))
-                .count(),
-        );
+        occurrences = occurrences.max(count_first_paints(&contents));
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
-    child.kill().ok();
-    child.wait().ok();
+    // post-merge batch 2 (2026-07-22), finding #5: quit ress the same way a user would -- `q`
+    // from Normal mode (see README's keymap table; app.rs's handle_key_normal maps it to
+    // Action::Quit) -- rather than signaling it, using the identical master-write idiom
+    // colon_command_typed_before_first_paint_still_jumps uses below. Landing this write only now,
+    // after the settle window above has already closed, keeps the recount measuring that same
+    // window rather than one perturbed by the quit itself.
+    let quit_key = b"q";
+    let written = unsafe {
+        libc::write(
+            master,
+            quit_key.as_ptr() as *const libc::c_void,
+            quit_key.len(),
+        )
+    };
+    assert_eq!(
+        written as usize,
+        quit_key.len(),
+        "short write injecting quit key"
+    );
+    // post-merge batch 2 (2026-07-22), finding #5: the subject must exit GRACEFULLY before the
+    // authoritative read below -- ress logs via tracing_appender::non_blocking, whose worker
+    // only flushes on the WorkerGuard's drop at a normal main() return. A SIGKILL here used to
+    // discard any duplicate event still queued in that userspace channel, silently undercounting
+    // the exact duplicate this test exists to catch. Kill survives only as the loud-failure
+    // cleanup path.
+    let quit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        if std::time::Instant::now() >= quit_deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!(
+                "subject did not exit within 10s of 'q' -- killed as cleanup; the flush-dependent \
+                 recount below would not be authoritative. log so far: {:?}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     // with the child reaped, the kernel has already closed its fds (fd
     // cleanup is part of process exit, which completes before a process
     // becomes reapable), so the slave side now has zero references — the
     // drain thread's blocked read returns (EIO is the conventional signal a
     // pty master gets once its last slave reference closes) on its own.
     drain.join().ok();
+    // post-merge batch (2026-07-22), fix #8: the authoritative count comes from one final read
+    // taken strictly after the child is reaped and the drain thread joined -- a duplicate
+    // landing inside the window's last ~20ms sleep (or between the window closing and the kill)
+    // is visible to THIS read even though the windowed max above could not see it. The count is
+    // monotonic within a run (nothing un-logs a line), so max-ing it in is exact, never an
+    // undercount; the same read doubles as the failure diagnostic below.
+    let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
+    occurrences = occurrences.max(count_first_paints(&log_contents));
     let pty_snapshot = String::from_utf8_lossy(&pty_output.lock().unwrap()).into_owned();
     assert!(
         first_seen,

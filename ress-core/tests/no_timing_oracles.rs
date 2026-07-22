@@ -26,6 +26,12 @@
 //! already-seen-twice regressions living DIRECTLY inside test bodies (findings 5 and 6 of that
 //! audit) fail loudly and immediately instead of waiting for a third recurrence.
 //!
+//! The same disclosure covers bounded YIELD-LOOP absence windows (`for _ in 0..N {
+//! yield_now().await }` followed by a state assert): the same absence-inference family, and
+//! deliberately NOT scanned -- the oracle-hardening campaign is closed (AGENTS.md, 2026-07-22
+//! policy), and the live sites of this shape are policy-accepted residuals, each carrying an
+//! `ACCEPTED-RESIDUAL:` marker naming why no positive terminal signal can exist for them.
+//!
 //! The three checks, each independent, each producing its own violation list:
 //!
 //! 1. `with_latency` must never exist again. `MockSource::with_latency` was deleted entirely

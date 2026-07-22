@@ -64,10 +64,13 @@ const STATUS_RETRIES: u8 = 3;
 /// through the identical `cache.warm` → `PreadSource::read_block` path via
 /// `CountScan::step`): a step already inside `read_block`'s
 /// `spawn_blocking` closure keeps running regardless, tokio's own
-/// `spawn_blocking` tasks being uncancellable once started — at most one
-/// such syscall per worker, real-file sources only. A closed document
-/// never leaves a background counter running AS A TRACKED TASK; it can
-/// leave at most that one syscall finishing alone.
+/// `spawn_blocking` tasks being uncancellable once started. EACH
+/// supersession (a new anchor dropping `scan.step()` mid-read) can detach
+/// one such syscall, so repeated re-anchoring accumulates them (post-merge
+/// batch 2 (2026-07-22), finding #6); the bound is per-source, not
+/// per-worker — `PreadSource`'s in-flight read cap (`--read-concurrency`,
+/// see docs/concurrency.md), which detached reads keep holding permits of
+/// until the OS answers.
 pub struct StatusWorker {
     anchor_tx: watch::Sender<u64>,
     snapshot_rx: watch::Receiver<StatusSnapshot>,
@@ -544,6 +547,10 @@ mod tests {
         let mut rx = w.status_snapshots();
         let snap = wait_for(&mut rx, |s| s.anchor == 2000).await;
         assert_eq!(snap.line, LineNumber::Converging);
+        // ACCEPTED-RESIDUAL: a bounded absence window (AGENTS.md closed-campaign policy,
+        // 2026-07-22) -- the worker is parked on a coverage wait that never resolves, so no
+        // positive "will never read" signal can exist; the discriminator remains the
+        // coalesced_events baseline below.
         // a few cooperative yields give a hypothetically-bypassed coverage gate a genuine
         // chance to kick off a count-scan and attempt (and coalesce onto) the gated block --
         // not real or virtual time, just scheduler turns, matching the same reasoning as the

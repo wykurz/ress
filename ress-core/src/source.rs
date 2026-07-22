@@ -68,6 +68,15 @@ pub struct MockSource {
     started_tx: tokio::sync::watch::Sender<u64>,
     cancelled_tx: tokio::sync::watch::Sender<u64>,
     released_tx: tokio::sync::watch::Sender<u64>,
+    // post-merge batch (2026-07-22), fix #6: the gate's own safety-bound panic used to unwind
+    // through `BlockEventGuard::drop`'s two-way completed/cancelled split and emit `Cancelled`
+    // -- the exact positive event ownership tests accept as proof of a torn-down future. Both
+    // that bound and `wait_for_count`'s ceiling default to the same `DIAGNOSTIC_CEILING`, and
+    // the gate's timer starts first (at read entry), so a LEAKED task panicking at the bound
+    // could satisfy a cancellation wait that should have failed. A third, distinct event keeps
+    // the diagnostic backstop from counterfeiting the proof.
+    gate_timeouts: AtomicU64,
+    gate_timeout_tx: tokio::sync::watch::Sender<u64>,
     // found in PR #44 pass 7 re-review (codex P2, "dropping_the_prefetcher_cancels_in_flight_
     // and_queued_fills" flake), extended in pass 7's structural pass (a 3rd re-review, the same
     // class recurring): `None` (the default) means `read_block` never parks -- every other
@@ -101,6 +110,7 @@ impl MockSource {
         let (started_tx, _) = tokio::sync::watch::channel(0);
         let (cancelled_tx, _) = tokio::sync::watch::channel(0);
         let (released_tx, _) = tokio::sync::watch::channel(0);
+        let (gate_timeout_tx, _) = tokio::sync::watch::channel(0);
         Self {
             data: data.into(),
             reads: AtomicU64::new(0),
@@ -109,6 +119,8 @@ impl MockSource {
             started_tx,
             cancelled_tx,
             released_tx,
+            gate_timeouts: AtomicU64::new(0),
+            gate_timeout_tx,
             gate_tx: None,
             gate_armed: std::sync::atomic::AtomicBool::new(false),
             gate_bound: DIAGNOSTIC_CEILING,
@@ -243,6 +255,12 @@ impl MockSource {
     pub fn released_events(&self) -> tokio::sync::watch::Receiver<u64> {
         self.released_tx.subscribe()
     }
+    /// A receiver for how many reads' own gate-wait hit `gate_bound` and panicked -- distinct
+    /// from `cancelled_events` so the gate's own diagnostic backstop can never counterfeit the
+    /// positive cancellation proof ownership tests wait on. See the field's own doc comment.
+    pub fn gate_timeout_events(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.gate_timeout_tx.subscribe()
+    }
 }
 
 /// RAII release for the gate `MockSource::park` installs: opens it (see `MockSource::open_gate`)
@@ -272,13 +290,17 @@ impl Drop for GateReleaseGuard<'_> {
 // inferred from silence. Constructed the instant a call enters `read_block` (folding the
 // existing `started` signal into construction, so a guard can never exist without one), it fires
 // `Released` from its own `Drop` if `complete()` was called first (the call reached its own
-// return, regardless of Ok/Err), or `Cancelled` otherwise (the future was torn down first --
-// an abort mid-gate-park being the only way that happens in this crate's own tests). Needs
-// no new Send/Sync reasoning: it holds only `&'a MockSource`, and `BlockSource: Send + Sync`
+// return, regardless of Ok/Err); a third, distinct gate-timeout event if `mark_gate_timeout` was
+// called first instead (the gate's own safety-bound panicking path in `read_block`'s gate-wait
+// arm -- post-merge batch (2026-07-22), fix #6); or `Cancelled` otherwise (the future was torn
+// down early with neither mark set -- an abort mid-gate-park being the only remaining way that
+// happens in this crate's own tests).
+// Needs no new Send/Sync reasoning: it holds only `&'a MockSource`, and `BlockSource: Send + Sync`
 // already requires `MockSource: Sync`, so `&'a MockSource` is `Send` on its own.
 struct BlockEventGuard<'a> {
     source: &'a MockSource,
     completed: bool,
+    gate_timed_out: bool,
 }
 impl<'a> BlockEventGuard<'a> {
     fn new(source: &'a MockSource) -> Self {
@@ -287,10 +309,14 @@ impl<'a> BlockEventGuard<'a> {
         Self {
             source,
             completed: false,
+            gate_timed_out: false,
         }
     }
     fn complete(&mut self) {
         self.completed = true;
+    }
+    fn mark_gate_timeout(&mut self) {
+        self.gate_timed_out = true;
     }
 }
 impl<'a> Drop for BlockEventGuard<'a> {
@@ -298,6 +324,9 @@ impl<'a> Drop for BlockEventGuard<'a> {
         if self.completed {
             let n = self.source.released.fetch_add(1, Ordering::Relaxed) + 1;
             publish_high_water_mark(&self.source.released_tx, n);
+        } else if self.gate_timed_out {
+            let n = self.source.gate_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+            publish_high_water_mark(&self.source.gate_timeout_tx, n);
         } else {
             let n = self.source.cancelled.fetch_add(1, Ordering::Relaxed) + 1;
             publish_high_water_mark(&self.source.cancelled_tx, n);
@@ -392,13 +421,16 @@ impl BlockSource for MockSource {
                 Ok(recv) => {
                     recv.expect("the sender lives on this same MockSource, alongside the receiver");
                 }
-                Err(_elapsed) => panic!(
-                    "MockSource's gate parked longer than {:?} without being opened -- \
-                     forgotten open_gate (or the `park` guard it returns)? This is a diagnostic \
-                     backstop, not a coordination oracle: a legitimate park-then-release \
-                     sequence should never come anywhere close to it.",
-                    self.gate_bound
-                ),
+                Err(_elapsed) => {
+                    guard.mark_gate_timeout();
+                    panic!(
+                        "MockSource's gate parked longer than {:?} without being opened -- \
+                         forgotten open_gate (or the `park` guard it returns)? This is a diagnostic \
+                         backstop, not a coordination oracle: a legitimate park-then-release \
+                         sequence should never come anywhere close to it.",
+                        self.gate_bound
+                    )
+                }
             }
         }
         let size = self.data.len() as u64;
@@ -414,20 +446,93 @@ impl BlockSource for MockSource {
 }
 
 use std::sync::Arc;
+
+/// Default cap on concurrent OS-level reads per `PreadSource` -- see `BoundedBlockingReads`.
+/// Far above legitimate steady-state concurrency (prefetch's FILL_CONCURRENCY of 4, plus three
+/// single-task background workers, plus the interactive attempt), far below the blocking pool's
+/// own ~512: a wedged mount piles up at most this many stuck threads, not the whole pool.
+pub const DEFAULT_READ_CONCURRENCY: usize = 16;
+
+/// post-merge batch (2026-07-22), fix #1 -- the P1: bounds how many blocking OS reads one
+/// source can have in flight AT THE OS, regardless of task choreography. The permit moves INTO
+/// the `spawn_blocking` closure, so it is released when the OS read actually returns -- never
+/// by a dropped future. Supersession (a `select!` arm dropping a scan mid-read, a pending nav
+/// slot replaced) detaches the *await* but never the *permit*: each detached read keeps its
+/// slot until the OS answers, and a new read past the cap waits at the acquire -- which is
+/// itself an ordinary cancellable await, so a superseded waiter consumes nothing at all.
+/// Deadlock-free with the block cache by construction: same-block requests coalesce on the
+/// cache's in-flight watch channel without ever reaching this semaphore, and the acquire never
+/// runs under the cache mutex. FIFO fairness comes from tokio's own semaphore.
+#[derive(Clone)]
+pub struct BoundedBlockingReads {
+    sem: Arc<tokio::sync::Semaphore>,
+}
+impl BoundedBlockingReads {
+    pub fn new(limit: usize) -> Self {
+        // clamped, not asserted, at both ends: a knob value of 0 means "no reads ever," which
+        // no caller can want, so 1 (fully serialized) is the honest minimum; and a bare
+        // `--read-concurrency` value above `Semaphore::MAX_PERMITS` would make `Semaphore::new`
+        // itself panic at startup, so the upper end is clamped too rather than trusted.
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(
+                limit.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+            )),
+        }
+    }
+    pub async fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let permit = self
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("this semaphore is never closed for the life of its source");
+        let value = tokio::task::spawn_blocking(move || {
+            // the permit lives exactly as long as the OS-level work: released on return,
+            // held across a caller's own cancellation -- the entire point of this type.
+            let _permit = permit;
+            work()
+        })
+        .await?;
+        Ok(value)
+    }
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.sem.available_permits()
+    }
+}
+
 /// A `BlockSource` backed by a real file using positioned reads (`pread`),
 /// so concurrent reads never contend a shared file offset. Blocking reads run
 /// on tokio's blocking pool; an io_uring backend can replace this later.
 pub struct PreadSource {
     file: Arc<std::fs::File>,
     size: u64,
+    reads: BoundedBlockingReads,
 }
 impl PreadSource {
     pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::open_with_read_concurrency(path, DEFAULT_READ_CONCURRENCY)
+    }
+    /// Opens with an explicit in-flight OS read cap (`--read-concurrency`; clamped into
+    /// [1, Semaphore::MAX_PERMITS] by `BoundedBlockingReads::new`). Construction-only BY DESIGN
+    /// (post-merge batch 2 (2026-07-22), finding #3): a post-use swap would mint a fresh
+    /// allowance while detached mid-flight reads still hold permits of the old pool, silently
+    /// breaking the "at most N OS reads per source, ever" invariant docs/concurrency.md
+    /// claims -- the pool's identity is fixed for the source's whole life, so the invariant
+    /// holds structurally, not by caller discipline.
+    pub fn open_with_read_concurrency(
+        path: &std::path::Path,
+        limit: usize,
+    ) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)?;
         let size = file.metadata()?.len();
         Ok(Self {
             file: Arc::new(file),
             size,
+            reads: BoundedBlockingReads::new(limit),
         })
     }
 }
@@ -439,24 +544,26 @@ impl BlockSource for PreadSource {
     async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
         let file = self.file.clone();
         let size = self.size;
-        let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Bytes> {
-            use std::os::unix::fs::FileExt;
-            let start = offset.min(size);
-            let end = offset.saturating_add(len as u64).min(size);
-            let n = (end - start) as usize;
-            let mut buf = vec![0u8; n];
-            let mut filled = 0;
-            while filled < n {
-                let read = file.read_at(&mut buf[filled..], start + filled as u64)?;
-                if read == 0 {
-                    break;
+        let bytes = self
+            .reads
+            .run(move || -> anyhow::Result<Bytes> {
+                use std::os::unix::fs::FileExt;
+                let start = offset.min(size);
+                let end = offset.saturating_add(len as u64).min(size);
+                let n = (end - start) as usize;
+                let mut buf = vec![0u8; n];
+                let mut filled = 0;
+                while filled < n {
+                    let read = file.read_at(&mut buf[filled..], start + filled as u64)?;
+                    if read == 0 {
+                        break;
+                    }
+                    filled += read;
                 }
-                filled += read;
-            }
-            buf.truncate(filled);
-            Ok(Bytes::from(buf))
-        })
-        .await??;
+                buf.truncate(filled);
+                Ok(Bytes::from(buf))
+            })
+            .await??;
         Ok(bytes)
     }
 }
@@ -567,15 +674,34 @@ mod tests {
             "expected the spawned read to PANIC once the gate's own safety bound elapsed \
              (a forgotten release), but it returned normally instead: {joined:?}"
         );
+        // post-merge batch (2026-07-22), fix #6: deterministic post-join reads -- the panicked
+        // task is fully unwound by the time `joined` resolved, so every Drop (the event guard
+        // included) has already run; no wait, no race.
+        assert_eq!(
+            *src.gate_timeout_events().borrow(),
+            1,
+            "the gate's own timeout must be its own positive, distinct event"
+        );
+        assert_eq!(
+            *src.cancelled_events().borrow(),
+            0,
+            "the gate's own timeout panic must never counterfeit a Cancelled event -- \
+             ownership tests accept Cancelled as proof a future was torn down, and a leaked \
+             task panicking at the bound is the opposite of that proof"
+        );
     }
     // (c) the OTHER legitimate shape (audit finding 1b: a block provably never read at all)
     // must keep working -- armed and parked forever, by design, with nothing in the test ever
     // awaiting that read's own completion. This test's own body finishes in milliseconds (well
     // under even the default multi-second `DIAGNOSTIC_CEILING`, never mind bothering to shrink
     // it), so the `#[tokio::test]` runtime tears down -- aborting the still-parked read along
-    // with it -- long before the bound could ever matter. If this regresses (the bound firing
-    // even when nothing awaits it), this test itself would panic or hang instead of completing
-    // cleanly.
+    // with it -- long before the bound could ever matter.
+    // stated honestly (post-merge batch (2026-07-22), fix #6): a panic inside the unawaited
+    // spawned task is structurally INVISIBLE to this test (nothing joins `_read`), so this test
+    // cannot detect "the bound fired when nothing awaited it." What it pins is narrower and
+    // still real: the no-awaiter shape stays legal and non-hanging -- the test body completes in
+    // milliseconds and the runtime teardown aborts the parked read long before the bound could
+    // matter.
     #[tokio::test]
     async fn a_permanently_parked_read_with_no_awaiter_never_trips_the_bound() {
         let src = Arc::new(MockSource::new(Bytes::from_static(b"0123456789")).with_gate());
@@ -616,5 +742,224 @@ mod tests {
         let src = PreadSource::open(&path).unwrap();
         let b = src.read_block(99, 4).await.unwrap();
         assert!(b.is_empty());
+    }
+    // post-merge batch (2026-07-22), fix #1 -- the P1. The bound's whole contract in one test,
+    // via real thread barriers (no scheduler timing): with N=2 permits held by parked blocking
+    // work, a third run() cannot start its work; releasing one holder is what lets it in; full
+    // release drains back to N. Every wait below is a positive rendezvous (Barrier::wait
+    // returns only when all parties arrived), so nothing here infers from absence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bound_admits_at_most_n_blocking_reads_and_releases_by_completion() {
+        let pool = BoundedBlockingReads::new(2);
+        let entry = Arc::new(std::sync::Barrier::new(3)); // two holders + the test
+        let (hold_a_tx, hold_a_rx) = std::sync::mpsc::channel::<()>();
+        let (hold_b_tx, hold_b_rx) = std::sync::mpsc::channel::<()>();
+        let a = tokio::spawn({
+            let pool = pool.clone();
+            let entry = entry.clone();
+            async move {
+                pool.run(move || {
+                    entry.wait();
+                    hold_a_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        let b = tokio::spawn({
+            let pool = pool.clone();
+            let entry = entry.clone();
+            async move {
+                pool.run(move || {
+                    entry.wait();
+                    hold_b_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        // rendezvous: both closures are INSIDE the blocking pool, each holding a permit.
+        let entry_wait = entry.clone();
+        tokio::task::spawn_blocking(move || entry_wait.wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            pool.available_permits(),
+            0,
+            "both permits held by parked reads"
+        );
+
+        // the third read: its own entry barrier proves when its closure actually runs.
+        let third_entry = Arc::new(std::sync::Barrier::new(2));
+        let c = tokio::spawn({
+            let pool = pool.clone();
+            let third_entry = third_entry.clone();
+            async move { pool.run(move || third_entry.wait()).await }
+        });
+        // release ONE holder; the third read's closure running (this rendezvous returning) is
+        // the positive, ordered proof it acquired the freed permit.
+        hold_a_tx.send(()).unwrap();
+        let third_wait = third_entry.clone();
+        tokio::task::spawn_blocking(move || third_wait.wait())
+            .await
+            .unwrap();
+
+        hold_b_tx.send(()).unwrap();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+        c.await.unwrap().unwrap();
+        assert_eq!(
+            pool.available_permits(),
+            2,
+            "all permits returned once the reads finished"
+        );
+    }
+
+    // supersession is the P1's trigger: a run() future dropped while parked AT THE ACQUIRE
+    // must consume nothing (no OS read started, no permit leaked). The positive proof is the
+    // aftermath: the released pool admits a later read and ends with its full permit count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_a_run_parked_at_the_acquire_leaks_no_permit() {
+        let pool = BoundedBlockingReads::new(1);
+        let entry = Arc::new(std::sync::Barrier::new(2));
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::spawn({
+            let pool = pool.clone();
+            let entry = entry.clone();
+            async move {
+                pool.run(move || {
+                    entry.wait();
+                    hold_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        let entry_wait = entry.clone();
+        tokio::task::spawn_blocking(move || entry_wait.wait())
+            .await
+            .unwrap();
+        assert_eq!(pool.available_permits(), 0);
+
+        // post-merge batch 2 (2026-07-22), finding #7: the future is polled to Pending HERE,
+        // proving it genuinely reached and parked at the acquire (the sole permit is held
+        // above, so a first poll cannot return Ready) -- the earlier spawn-then-abort shape
+        // could race the first poll and pass without ever exercising the acquire path at all.
+        // Dropped while provably parked; the aftermath below proves nothing leaked.
+        {
+            use std::future::Future;
+            let noop = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(noop);
+            let mut superseded = std::pin::pin!(pool.run(|| ()));
+            assert!(
+                superseded.as_mut().poll(&mut cx).is_pending(),
+                "with the sole permit held, a polled run() must park at the acquire"
+            );
+        } // <- superseded dropped here, parked at the acquire
+
+        hold_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        assert_eq!(
+            pool.run(|| 42).await.unwrap(),
+            42,
+            "the pool still admits work"
+        );
+        assert_eq!(
+            pool.available_permits(),
+            1,
+            "no permit leaked by the dropped acquire"
+        );
+    }
+
+    // the flagship discrimination the sibling tests cannot make (post-merge batch (2026-07-22),
+    // fix #1): dropping the owning future MID-READ -- after the acquire, while the blocking
+    // closure is parked inside spawn_blocking -- must NOT free the permit. A broken impl that
+    // kept the permit in the future's own frame (released on drop, while the detached OS read
+    // runs on) shows available_permits() == 1 at the assert below; the real impl shows 0 until
+    // the detached closure itself returns, which is the entire point of the type.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mid_read_drop_keeps_the_permit_until_the_os_read_returns() {
+        let pool = BoundedBlockingReads::new(1);
+        let entry = Arc::new(std::sync::Barrier::new(2));
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let owner = tokio::spawn({
+            let pool = pool.clone();
+            let entry = entry.clone();
+            async move {
+                pool.run(move || {
+                    entry.wait();
+                    hold_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        // rendezvous: the closure is provably inside spawn_blocking, holding the permit.
+        let entry_wait = entry.clone();
+        tokio::task::spawn_blocking(move || entry_wait.wait())
+            .await
+            .unwrap();
+        // supersession, mid-read: the owning future is torn down; the await ensures the
+        // task's own teardown fully ran before the assert reads the permit count.
+        owner.abort();
+        let _ = owner.await;
+        assert_eq!(
+            pool.available_permits(),
+            0,
+            "a dropped future must never free the permit while the detached OS read still runs"
+        );
+        hold_tx.send(()).unwrap();
+        // the detached closure returning is what frees the permit -- proven by a subsequent
+        // run completing and the count returning to full.
+        assert_eq!(pool.run(|| 7).await.unwrap(), 7);
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    // new(0) clamps to 1 rather than deadlocking every caller forever -- proven by a read
+    // actually completing, with a diagnostic ceiling so a broken clamp fails loud, not silent.
+    #[tokio::test]
+    async fn a_zero_limit_clamps_to_one_and_still_admits_reads() {
+        let pool = BoundedBlockingReads::new(0);
+        let value = tokio::time::timeout(std::time::Duration::from_secs(5), pool.run(|| 42))
+            .await
+            .expect("a clamped-to-one pool must admit a read, not park it forever")
+            .unwrap();
+        assert_eq!(value, 42);
+    }
+
+    // new(usize::MAX) clamps to Semaphore::MAX_PERMITS rather than panicking at startup --
+    // `Semaphore::new` itself panics above that ceiling, and a bare `usize` from
+    // `--read-concurrency` can carry any value including this one; same loud-ceiling idiom as
+    // the zero-limit sibling above, proving admission rather than merely that construction
+    // did not panic.
+    #[tokio::test]
+    async fn a_usize_max_limit_clamps_to_the_semaphore_ceiling_and_still_admits_reads() {
+        let pool = BoundedBlockingReads::new(usize::MAX);
+        let value = tokio::time::timeout(std::time::Duration::from_secs(5), pool.run(|| 42))
+            .await
+            .expect("a clamped-to-the-ceiling pool must admit a read, not park it forever")
+            .unwrap();
+        assert_eq!(value, 42);
+    }
+
+    // post-merge batch 2 (2026-07-22), finding #8 (PARTIALLY DECLINED -- the discriminating
+    // half declined as a banned shape): renamed from `pread_source_bound_of_one_serializes_
+    // without_deadlock`, which claimed to observe serialization but did not -- an
+    // implementation that bypassed `BoundedBlockingReads` entirely would also pass this. What
+    // this actually pins: routing through a bound-of-one pool compiles end to end, and both
+    // concurrent reads against a real file complete with the correct bytes, no deadlock. The
+    // discriminating coverage for the bound itself lives above, in `BoundedBlockingReads`'s own
+    // unit tests (`bound_admits_at_most_n_blocking_reads_and_releases_by_completion` and the
+    // mutation-verified `a_mid_read_drop_keeps_the_permit_until_the_os_read_returns`), plus the
+    // fact that `read_block` routes through `self.reads.run(..)` in three directly inspectable
+    // lines. The stronger shape here -- proving "the second read cannot enter until the first
+    // releases" against a real file -- was considered and declined: it needs
+    // timeout-as-proof-of-blocking, the exact absence shape
+    // `ress-core/tests/no_timing_oracles.rs` check 2 bans.
+    #[tokio::test]
+    async fn pread_source_reads_complete_correctly_through_a_bound_of_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let src = PreadSource::open_with_read_concurrency(&path, 1).unwrap();
+        let (a, b) = tokio::join!(src.read_block(0, 4), src.read_block(6, 4));
+        assert_eq!(&a.unwrap()[..], b"0123");
+        assert_eq!(&b.unwrap()[..], b"6789");
     }
 }

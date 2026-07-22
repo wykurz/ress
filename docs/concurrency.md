@@ -133,14 +133,24 @@ The one read that cannot be aborted this way is a blocking positioned
 read already handed to the OS thread pool (`spawn_blocking`, which tokio
 itself documents as uncancellable once running): a wedged network mount
 can leave that read outstanding past its owning task's own cancellation,
-finishing (or hanging) entirely on its own — every one of the three
-background computations above, plus prefetch (outside the shape
-architecturally, per its own section above, but reading through this
-identical path), shares this exposure, real-file sources only, each
-bounded by how many reads it can have in flight at once (`ScanScheduler`,
-`StatusWorker`, and `PendingNav`: at most one each, being single tasks;
-prefetch: up to `FILL_CONCURRENCY`, see [prefetch](prefetch.md)). Process
-exit accounts for this directly rather than assuming every background
-task unwinds cleanly — the runtime itself is shut down with a short
-timeout after the event loop returns, so quitting abandons a stuck read
-rather than waiting on a filesystem that may never answer.
+finishing (or hanging) entirely on its own. Supersession makes this
+repeatable — a status worker re-anchored by every motion, or a pending
+navigation replaced by the next one, drops its scan mid-read and starts
+a fresh one, while the dropped read's own pread keeps running detached —
+so the real bound cannot come from task structure alone. It is enforced
+at the source instead (real-file sources only): `PreadSource` routes
+every read through a per-source semaphore (`--read-concurrency`, default
+16) whose permit moves *into* the blocking closure and is released only
+when the OS read actually returns — a dropped future detaches the await
+but never the permit, and a read past the cap waits at the acquire,
+which is an ordinary cancellable suspend point that consumes nothing
+when superseded. At most N OS reads exist per source, ever, no matter
+how the tasks above churn. One known gap, stated rather than papered
+over: the *interactive* attempt awaits its own first uncached read
+inline in the event loop, so a fully wedged mount still hangs that one
+motion (bounded-work budgets bound read *count*, not a single read's
+latency) — a pre-existing behavior this bound neither causes nor fixes.
+Process exit accounts for stuck reads directly rather than assuming
+every background task unwinds cleanly — the runtime itself is shut down
+with a short timeout after the event loop returns, so quitting abandons
+a stuck read rather than waiting on a filesystem that may never answer.

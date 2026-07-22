@@ -1584,6 +1584,11 @@ mod tests {
         d.request_line_number(Anchor::at(2000)); // deep into the file; unreachable while block 0 is parked.
         let line = wait_for_line_number(&d, 2000, |_| true).await;
         assert_eq!(line, LineNumber::Converging);
+        // ACCEPTED-RESIDUAL: a bounded absence window (AGENTS.md closed-campaign policy,
+        // 2026-07-22) -- direct sibling of status.rs's own marked site: this test gates block 0
+        // forever (see its own doc comment above), so the worker is parked on a coverage wait
+        // that can never resolve and no positive "will never read" signal can exist here either;
+        // the discriminator remains the coalesced_events baseline below.
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -1885,6 +1890,11 @@ mod tests {
         // count, this signal fires the instant the loop re-enters, before any retry backoff sleep
         // would even begin, so a few cooperative yields (not real or virtual time) suffice to
         // give either class of bug a genuine chance to run before the assertions below.
+        // ACCEPTED-RESIDUAL: a bounded absence window (AGENTS.md closed-campaign policy,
+        // 2026-07-22) -- once retries are exhausted the worker parks silently, exposing no
+        // "retrying is now permanently over" signal to await, so these yields only give a
+        // hypothetical re-kick room to run before the src.reads/resolution_attempts baselines
+        // below do the actual discriminating work this test's own doc comment above describes.
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
