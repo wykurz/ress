@@ -43,6 +43,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    # ress-perf's screen tests capture a frame from a real `less` (see flake.nix's own
+    # nativeCheckInputs comment, which already assumed this job provides one). ubuntu-latest
+    # already ships it today -- codex flagged this job as missing it entirely (overstated: CI was
+    # green with these tests running, so it was never actually absent) -- but an implicit
+    # dependency on the runner image is still worth making explicit: it documents the real
+    # requirement here instead of only in the nix check, and survives a future image that drops
+    # it. Already-present makes this next to free (apt reports it up to date and exits).
+    - name: Install less
+      run: sudo apt-get install -y less
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
     - name: Install cargo-nextest
@@ -58,6 +67,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    # see the `test` job's own identical step above for why.
+    - name: Install less
+      run: sudo apt-get install -y less
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
     - name: Install cargo-nextest
@@ -89,9 +101,13 @@ jobs:
     # The cargo jobs above never touch Nix, so a flake.lock bump (Dependabot opens
     # grouped nix PRs) could break `nix build` or the dev shell while CI stays
     # green. Determinate Nix's `nix flake check` only *evaluates* outputs (it skips
-    # the builds), so it covers cross-platform eval here -- including the
-    # darwin/aarch64 outputs this linux runner can't build -- while the explicit
-    # build + dev-shell steps catch build-level breakage on this system.
+    # the builds), so it covers cross-arch eval here -- including the aarch64-linux
+    # output this x86_64 runner can't build -- while the explicit build + dev-shell
+    # steps catch build-level breakage on this system. flake.nix restricts its own
+    # outputs to Linux systems only (ress-perf's pty harness needs Linux-only
+    # pipe2/ppoll; see flake.nix's own comment) -- --all-systems no longer implies
+    # darwin, since eachDefaultSystem's darwin outputs were the actual bug, not a
+    # coverage gap this job needs to work around.
     - name: Flake check (evaluate all systems)
       # --no-update-lock-file makes CI fail (rather than silently regenerate the
       # lock in the writable checkout) if flake.nix and flake.lock drift apart,

@@ -84,14 +84,42 @@ tick firing every 100ms but painting nothing.
 
 The pending slot holds its scan behind a cancel-on-drop guard (see
 [concurrency](concurrency.md) for the shape this and the other background
-tasks share): `Esc`, a new motion superseding it, quitting, the event
-stream ending, and any error unwinding through the loop's `?` all drop
-the slot rather than detach the task, so every exit path aborts a live
-scan. A resize drops it the same way and re-applies the originating
-intent against the new dimensions (a `G` in flight must not finish
-positioned for the old screen height). Terminal state (alternate screen,
+tasks share, including the one blocking-read exception all four carry):
+`Esc`, a new motion superseding it, quitting, the event stream ending, and
+any error unwinding through the loop's `?` all drop the slot rather than
+detach the task, so every exit path aborts the scan at whichever ordinary
+`.await` it is currently suspended at. A resize drops it the same way and
+re-applies the originating intent against the new dimensions (a `G` in
+flight must not finish positioned for the old screen height). Terminal
+state (alternate screen,
 raw mode, mouse capture) is owned by a guard that restores it on every
 exit path, including panics.
+
+Keys typed before the first paint are not discarded — investigated for
+issue #30, where they looked discarded because the one key most likely to
+be typed pre-paint, Enter, silently is. `Term::new`'s `enable_raw_mode`
+call is the first thing `run` does, but a process still takes some nonzero
+time (dynamic linking, CLI parsing, opening the file) to get there, and a
+terminal typed into during that window is still in its default cooked
+mode: POSIX `ICRNL` translates Enter's CR byte to LF the instant the byte
+is *received*, not when it's later read. That translated LF sits in the
+kernel's tty buffer and survives the later raw-mode transition completely
+intact (confirmed empirically, not assumed — FIONREAD, a raw `poll`+`read`,
+and crossterm's own `EventStream` all see it, unmutated, once raw mode is
+on) — so nothing is actually lost at the kernel or crossterm-plumbing
+level, and every other key (digits, letters, arrows) survives the same
+transition unchanged, since `ICRNL` only touches CR. The break is
+downstream, in how that surviving LF gets interpreted: crossterm decodes a
+bare LF as `Enter` only when raw mode is *not currently* active at parse
+time (its own source cites its issue #371 on this), which is never true
+here, since parsing never starts before `Term::new` has already flipped
+raw mode on — so the byte decodes as Ctrl+J instead. `handle_key_command`
+binds Ctrl+J as an Enter alias for exactly this reason (Ctrl+J has no
+other meaning in ress), which is enough: a `:N` typed and submitted before
+first paint now commits exactly like one typed after. See
+`App::handle_key_command`'s Ctrl+J comment for the full mechanism and the
+regression pins (`ress::app::tests::command_ctrl_j_jumps_exactly_like_enter`,
+`smoke::colon_command_typed_before_first_paint_still_jumps`).
 
 Process exit is bounded rather than waiting on every background task (see
 [concurrency](concurrency.md)): a read the foreground is actively
@@ -349,7 +377,10 @@ seam already filled below; the rest are still ahead:
   file cannot evict the interactive working set. `Document` owns the
   scheduler, so dropping a document aborts its scan — the same
   cancel-on-drop discipline as pending navigation (see The event loop,
-  above) — and no closed document leaves a background reader running. The
+  above), with the same one blocking-read exception (see
+  [concurrency](concurrency.md)) — and no closed document leaves a
+  background reader running as a tracked task, though real files can leave
+  at most one already-in-flight positioned read finishing on its own. The
   scan feeds `LineIndex`: a sparse table of the byte offset of every
   1024th line start (~8 MB of checkpoints indexes a billion lines),
   publishing progress after every ingested block through a watch channel

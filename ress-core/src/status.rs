@@ -12,6 +12,7 @@
 use crate::cache::BlockCache;
 use crate::index::{Frontier, LineIndex};
 use crate::scan::{CountScan, CountStep};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
@@ -53,17 +54,59 @@ const STATUS_RETRIES: u8 = 3;
 
 /// One background task answering line-number queries for the status line:
 /// the anchor-in/snapshot-out twin of `ScanScheduler`. Dropping the worker
-/// aborts the task, so a closed document never leaves a background counter
-/// running.
+/// aborts the task at whichever ordinary `.await` it is currently suspended
+/// at (the coverage-gate `select!`, or between count steps) — via `tasks`'s
+/// own `Drop` (`TaskOwner`, pass 7 P7-C), not a hand-written one: see
+/// `task_owner.rs`'s own doc comment for why `JoinSet`'s abort-on-drop
+/// (what `TaskOwner` wraps) replaces the hand-written `self.task.abort()`
+/// this struct used to need. The one exception (same finding as
+/// `ScanScheduler`'s own doc comment — this worker's count walk reads
+/// through the identical `cache.warm` → `PreadSource::read_block` path via
+/// `CountScan::step`): a step already inside `read_block`'s
+/// `spawn_blocking` closure keeps running regardless, tokio's own
+/// `spawn_blocking` tasks being uncancellable once started — at most one
+/// such syscall per worker, real-file sources only. A closed document
+/// never leaves a background counter running AS A TRACKED TASK; it can
+/// leave at most that one syscall finishing alone.
 pub struct StatusWorker {
     anchor_tx: watch::Sender<u64>,
     snapshot_rx: watch::Receiver<StatusSnapshot>,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Drop for StatusWorker {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    // never read explicitly -- that IS the point: its existence alone (and, transitively, its
+    // own `JoinSet`'s) is what provides the cancel-on-drop guarantee this struct's own doc
+    // comment describes, needing no method call anywhere to do it. See `task_owner.rs`'s own
+    // doc comment.
+    #[allow(dead_code)]
+    tasks: crate::task_owner::TaskOwner<()>,
+    // found in PR #44 pass 8 (U-worker, 1a): a positive signal for `request_line_number`'s own
+    // SKIP decision (see that method's own doc comment on `send_if_modified`) -- an identical,
+    // already-current anchor is a genuine channel-level no-op that must never wake the worker's
+    // task at all. A test proving a stalled anchor stays stalled under repeated identical
+    // requests used to infer that from a bounded silence window on a downstream read counter (a
+    // timing oracle: the regression it guards against -- `send_if_modified` regressing to a bare
+    // `send` -- only becomes observable there after the worker's own retry backoff sleeps
+    // elapse). This exposes the decision itself, positively, at the instant it is made, with no
+    // dependency on the worker's task ever being scheduled.
+    request_skipped: AtomicU64,
+    request_skipped_tx: watch::Sender<u64>,
+    // found in PR #44 pass 8 (U-worker, 1a's document.rs sibling): a positive signal for how
+    // many times `run`'s own `'outer` loop has begun a fresh resolution attempt (every
+    // iteration, including the first). Unlike `request_skipped` above, this covers the case
+    // where NOTHING is ever re-requested at all -- proving the worker's retry-exhaustion state
+    // permanently sticks needs a signal on the WORKER's own side, since there is no request-side
+    // decision to observe when no request arrives. `run` owns the actual counter (it is a single
+    // sequential task; no atomic is needed), and only publishes its high-water mark here.
+    //
+    // `#[cfg(test)]` (p6-review2, pass 8 U-worker review, point 4): unlike `request_skipped` and
+    // `cache.rs`'s own `coalesced` (both fire only on a comparatively rare event), this increments
+    // and publishes on EVERY `'outer` iteration -- including ordinary supersession restarts from
+    // normal interactive scrolling, which can be frequent in real use. Gating this field (and, in
+    // `run`, the two loop-top statements that write it) removes that recurring per-iteration cost
+    // from the production status-worker loop entirely, leaving only a one-time, effectively-free
+    // unused-channel construction in `spawn` -- `run`'s own parameter and the channel that feeds
+    // it stay unconditional regardless, since conditionally changing `run`'s signature itself
+    // would be the "messier signature-level cfg" this amendment specifically avoids.
+    #[cfg(test)]
+    resolution_attempts_tx: watch::Sender<u64>,
 }
 impl StatusWorker {
     /// Starts the worker at anchor 0 (`Anchor::TOP`); its first pass through
@@ -83,12 +126,37 @@ impl StatusWorker {
             anchor: 0,
             line: LineNumber::Converging,
         });
-        let task = tokio::spawn(run(cache, index, frontier, anchor_rx, budget, snapshot_tx));
+        let (request_skipped_tx, _) = watch::channel(0u64);
+        let (resolution_attempts_tx, _) = watch::channel(0u64);
+        let mut tasks = crate::task_owner::TaskOwner::new();
+        tasks.spawn(run(
+            cache,
+            index,
+            frontier,
+            anchor_rx,
+            budget,
+            snapshot_tx,
+            resolution_attempts_tx.clone(),
+        ));
         StatusWorker {
             anchor_tx,
             snapshot_rx,
-            task,
+            tasks,
+            request_skipped: AtomicU64::new(0),
+            request_skipped_tx,
+            #[cfg(test)]
+            resolution_attempts_tx,
         }
+    }
+    /// A clone of the inbound anchor sender -- test-only. Holding this alive independently of
+    /// the `StatusWorker` itself lets a test drop the worker while keeping the anchor channel
+    /// open, isolating abort-via-Drop from channel-close (`run`'s own `anchor_rx.changed()`
+    /// returning `Err` the instant the last sender goes away, entirely apart from whether
+    /// `.abort()` ever ran -- see `dropping_the_worker_aborts_its_in_flight_step`'s own doc
+    /// comment, this module's own tests, for the full isolation this exists for).
+    #[cfg(test)]
+    pub(crate) fn anchor_sender_for_test(&self) -> watch::Sender<u64> {
+        self.anchor_tx.clone()
     }
     /// Asks the worker for `anchor`'s line number; the answer arrives later
     /// on `status_snapshots`/`line_number`. A request for an anchor the
@@ -108,13 +176,19 @@ impl StatusWorker {
     /// never letting a slow multi-block count finish. An unchanged anchor
     /// must be a true no-op at the channel itself, not just in spirit.
     pub fn request_line_number(&self, anchor: u64) {
-        self.anchor_tx.send_if_modified(|current| {
+        let changed = self.anchor_tx.send_if_modified(|current| {
             if *current == anchor {
                 return false;
             }
             *current = anchor;
             true
         });
+        // `send_if_modified` already returns exactly this decision -- see `request_skipped`'s
+        // own doc comment on this struct for why it is worth publishing, not just returning.
+        if !changed {
+            let n = self.request_skipped.fetch_add(1, Ordering::Relaxed) + 1;
+            publish_high_water_mark(&self.request_skipped_tx, n);
+        }
     }
     /// The latest snapshot the worker has published.
     pub fn line_number(&self) -> StatusSnapshot {
@@ -125,6 +199,50 @@ impl StatusWorker {
     pub fn status_snapshots(&self) -> watch::Receiver<StatusSnapshot> {
         self.snapshot_rx.clone()
     }
+    /// A receiver a test can `wait_for`/`changed()` on to observe how many
+    /// `request_line_number` calls found an already-current anchor and
+    /// correctly skipped -- never touching the anchor channel at all, so
+    /// the worker's own task never wakes for them -- rather than starting
+    /// or restarting a walk. See `request_skipped`'s own doc comment on
+    /// this struct for why this exists.
+    #[cfg(test)]
+    pub(crate) fn request_skipped_events(&self) -> watch::Receiver<u64> {
+        self.request_skipped_tx.subscribe()
+    }
+    /// A receiver a test can `wait_for`/`changed()` on to observe how many times `run`'s own
+    /// `'outer` loop has begun a fresh resolution attempt -- see `resolution_attempts_tx`'s own
+    /// doc comment on this struct for why this exists (proving a stalled worker's own retry
+    /// exhaustion permanently sticks when nothing is ever re-requested at all).
+    #[cfg(test)]
+    pub(crate) fn resolution_attempts_events(&self) -> watch::Receiver<u64> {
+        self.resolution_attempts_tx.subscribe()
+    }
+    /// Aborts the worker task and awaits its own teardown to finish, rather
+    /// than the fire-and-forget abort-request `Drop` alone provides -- see
+    /// `TaskOwner::abort_all_and_join`'s own doc comment for the mechanism
+    /// and `Prefetcher::abort_and_join`'s own doc comment for why a
+    /// criterion bench needs this distinction at all. Bench-visible (test +
+    /// bench-internals, matching `Document::new_unindexed`'s own
+    /// precedent).
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) async fn abort_and_join(&mut self) {
+        self.tasks.abort_all_and_join().await;
+    }
+}
+// `send_if_modified`, monotonic high-water-mark publish, no-op with no receivers -- the
+// identical contract `source.rs`'s own `publish_high_water_mark` documents at length (also
+// reimplemented locally in `prefetch.rs` and `cache.rs`); kept local here too rather than
+// imported, per the same P7-C layering principle: this is the status worker's own request-level
+// signal, not the block-source's.
+fn publish_high_water_mark(sender: &watch::Sender<u64>, value: u64) {
+    sender.send_if_modified(|current| {
+        if value > *current {
+            *current = value;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// The worker's whole life: pull the latest requested anchor, resolve it —
@@ -143,8 +261,25 @@ async fn run(
     mut anchor_rx: watch::Receiver<u64>,
     budget: usize,
     snapshot_tx: watch::Sender<StatusSnapshot>,
+    resolution_attempts_tx: watch::Sender<u64>,
 ) {
+    // acknowledges the parameter unconditionally: `run`'s own signature stays the same in every
+    // build (see `resolution_attempts_tx`'s own doc comment, `StatusWorker`, for why gating the
+    // signature itself is exactly the "messier" cfg this amendment avoids), but the ONLY use of
+    // this value below is inside the `#[cfg(test)]` block, so a non-test build would otherwise
+    // see it as unused.
+    let _ = &resolution_attempts_tx;
+    // a single sequential task drives this whole loop -- no atomic needed, unlike
+    // `StatusWorker::request_skipped` (genuinely concurrent callers of `request_line_number`).
+    // `#[cfg(test)]`: test-only instrumentation, see `resolution_attempts_tx`'s own doc comment.
+    #[cfg(test)]
+    let mut resolution_attempts: u64 = 0;
     'outer: loop {
+        #[cfg(test)]
+        {
+            resolution_attempts += 1;
+            publish_high_water_mark(&resolution_attempts_tx, resolution_attempts);
+        }
         let anchor = *anchor_rx.borrow_and_update();
         if cache.size() == 0 {
             let _ = snapshot_tx.send(StatusSnapshot {
@@ -297,7 +432,7 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::MockSource;
+    use crate::source::{MockSource, wait_for_count};
     fn cache(data: Vec<u8>, block_size: usize) -> Arc<BlockCache> {
         Arc::new(BlockCache::new(
             Arc::new(MockSource::new(data)),
@@ -366,22 +501,67 @@ mod tests {
     }
     #[tokio::test]
     async fn stays_converging_while_the_scan_is_alive_and_uncovered() {
-        // latency keeps the background scan well behind, so the anchor
-        // cannot possibly be covered yet — a live scan means Converging,
-        // never Unavailable (the old design's blanket "uncovered means
-        // Unavailable" is exactly the semantic this worker replaces).
-        let mut data = Vec::new();
-        for i in 0..4000u32 {
-            data.extend_from_slice(format!("line {i:04}\n").as_bytes());
-        }
-        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(2)));
+        // audit finding 1b: `run` publishes Converging from TWO sites -- the coverage-gated
+        // one (this test's own target, line ~204) and an UNCONDITIONAL one right after the
+        // coverage gate is satisfied (line ~240). A test that merely waits for "any Converging"
+        // cannot discriminate a genuinely gated wait from an already-(mis-)covered anchor whose
+        // count-scan just ALSO happens to publish Converging on its own way in -- a broken
+        // `covered` (e.g. always `true`) would be invisible regardless of how long the test
+        // waits, since BOTH paths publish the identical `{anchor, Converging}` payload.
+        //
+        // Gating block 0 forever (never opened) makes coverage PERMANENTLY, STRUCTURALLY
+        // unsatisfied -- not just "probably not yet, given enough real latency" -- so the scan
+        // is genuinely alive (its own task is still running, parked, not done) yet can never
+        // advance `processed_up_to` past 0. The discriminator: `BlockCache::coalesced_events`
+        // (pass 8, U-cache) proves the worker's own count-scan never even attempted a read. If
+        // `covered` incorrectly returned `true`, the resulting count-scan would need to walk
+        // from checkpoint `(0, 0)` -- the only checkpoint that can exist with zero progress,
+        // `LineIndex::new`'s own built-in first entry -- straight into the SAME still-in-flight,
+        // gated block 0, registering as a coalescing waiter on it. `in_flight_len` cannot serve
+        // this role (same reasoning as U-cache's own): it would show exactly 1 either way, since
+        // a waiter joining an existing fetch does not change the count of distinct in-flight
+        // BLOCKS.
+        let data: &'static [u8] = Box::leak(vec![b'x'; 4096].into_boxed_slice());
+        let src = Arc::new(MockSource::new(data).with_gate());
+        src.arm_gate();
         let c = Arc::new(BlockCache::new(src, 256, 1 << 20));
+        // captured BEFORE anything is spawned: the real risk is ANY yield before this baseline
+        // capture, not specifically "the worker's own default anchor-0 pass" (p6-review2, pass 8
+        // U-worker review, point 1, refining the earlier framing here) -- `request_line_number
+        // (2000)` below runs synchronously, with no yield, immediately after both spawns, so the
+        // worker's very first `run()` iteration likely never actually processes anchor 0 at all:
+        // by the time `run()`'s task gets its first chance to execute, `anchor_rx.borrow_and_
+        // update()` already reads 2000, not the seeded 0. Regardless of which anchor triggers the
+        // FIRST coverage check, checkpoint `(0, 0)` is the only one reachable with zero index
+        // progress, so the practical conclusion is identical either way: a baseline captured
+        // after any yield at all would silently absorb the coalescing event this test exists to
+        // catch.
+        let coalesced = c.coalesced_events();
+        let coalesced_baseline = *coalesced.borrow();
         let s = crate::schedule::ScanScheduler::spawn(c.clone());
-        let w = StatusWorker::spawn(c, s.index().clone(), s.frontier(), 1 << 20);
-        w.request_line_number(34990);
+        let w = StatusWorker::spawn(c.clone(), s.index().clone(), s.frontier(), 1 << 20);
+        w.request_line_number(2000); // deep into the file; unreachable while block 0 is parked.
         let mut rx = w.status_snapshots();
-        let snap = wait_for(&mut rx, |s| s.anchor == 34990).await;
+        let snap = wait_for(&mut rx, |s| s.anchor == 2000).await;
         assert_eq!(snap.line, LineNumber::Converging);
+        // a few cooperative yields give a hypothetically-bypassed coverage gate a genuine
+        // chance to kick off a count-scan and attempt (and coalesce onto) the gated block --
+        // not real or virtual time, just scheduler turns, matching the same reasoning as the
+        // 1a fixes above.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *coalesced.borrow(),
+            coalesced_baseline,
+            "the status worker's own count-scan must never even attempt a read while the \
+             anchor is genuinely uncovered"
+        );
+        assert_eq!(
+            w.line_number().line,
+            LineNumber::Converging,
+            "a genuinely uncovered anchor must never progress to Known while parked"
+        );
     }
     #[tokio::test]
     async fn becomes_unavailable_past_a_dead_scans_frontier() {
@@ -414,33 +594,125 @@ mod tests {
         let snap = wait_for(&mut rx, |s| s.anchor == 8).await;
         assert_eq!(snap.line, LineNumber::Unavailable);
     }
+    // found in PR #44 pass 6 S4 (#8, a user-review finding) and pass 7 (P7-C, a p6-review2
+    // delta-review rewrite, "go through real StatusWorker::drop"): proves `StatusWorker`'s own
+    // `Drop` genuinely aborts its task -- through the REAL `StatusWorker::spawn`/`Drop`, not by
+    // calling `run` directly and aborting a raw `JoinHandle` by hand the way this test used to.
+    // That older shape (`abort_ends_an_in_flight_step_with_anchor_tx_still_alive`, deleted here,
+    // itself the pass-6-S4 fix for an EARLIER test that only proved "drop stops reading, however
+    // that happens" without isolating `.abort()`'s own contribution) isolated `.abort()` cleanly
+    // but never touched `StatusWorker` at all -- it proved `abort()` works in isolation, not that
+    // `Drop` calls it. `w.anchor_sender_for_test()` clones `anchor_tx` and holds it alive for
+    // this whole test, so when `w` drops, its own internal `anchor_tx` dropping cannot close the
+    // channel (this clone keeps it open) -- the identical isolation idea the deleted test used,
+    // now applied to the type real callers actually use.
+    //
+    // found in PR #44 pass 6 S4 (validated before implementing, not assumed; carried forward
+    // unchanged -- the finding is about `run`'s own `select!`, not about which test drives it): a
+    // "hanging read" design -- a read that never resolves, specifically to put the task somewhere
+    // channel-close supposedly cannot reach -- was considered and directly, empirically disproven
+    // before being built: `tokio::select!` (this loop's own `select!` around `scan.step`, see
+    // `run`'s own body above) polls EVERY one of its arms independently on each wake,
+    // `anchor_rx.changed()` included, regardless of whether a SIBLING arm's own future is designed
+    // to never resolve. A throwaway experiment confirmed this directly: `run` driven with an
+    // hour-long read, then `anchor_tx` DROPPED (not aborted) -- the task still ended within 500ms,
+    // via `run`'s own ordinary `return` (a plain `Ok(())` join result, not a cancellation), exactly
+    // as fast as a normal-latency read would have. A hanging read does not, in fact, make a task
+    // unreachable by channel-close on this runtime; it would have been an equally confounded test,
+    // not a fix. The genuinely unconfounded approach is the one already used here: hold a clone of
+    // `anchor_tx` ALIVE so channel-close never happens at all, regardless of how long the in-flight
+    // read takes.
+    //
+    // The gated `MockSource` puts the task inside a REAL, suspended `.await` when this fires --
+    // parked there deterministically (see `source.rs`'s own doc comment on `gate_tx`), the same
+    // ordinary, cooperative await point a latency sleep would suspend at, fully abort-able at its
+    // own poll point (unlike `PreadSource`'s real `spawn_blocking` reads, the one documented
+    // exception `StatusWorker`'s own doc comment already names -- not what this test is about,
+    // and not reachable with a `MockSource` regardless).
+    //
+    // Cancelled is now a POSITIVE event (pass 7, P7-C: `MockSource`'s own `cancelled_events`, a
+    // scopeguard on `read_block`'s own future -- see `source.rs`'s own doc comment), not inferred
+    // from a bounded silence. The deleted test also checked `JoinError::is_cancelled` directly;
+    // this one can't -- `StatusWorker` does not expose a raw handle to check, an encapsulation
+    // improvement, not a loss -- `task_owner.rs`'s own dedicated probe test pins that tokio-level
+    // fact once, generically, so it does not need re-deriving here.
+    //
+    // Finally, confirms `BlockCache` itself survives an abort mid-fetch cleanly: a REAL, separate
+    // `.block(0)` call against the SAME cache, after the abort, must still succeed normally --
+    // proving the cache's `Mutex` isn't wedged by a fetch that will never finish, not that
+    // `InFlightGuard` specifically cleaned up its own registration (block 0 is never the block the
+    // aborted anchor-4000 walk registered, ~62). That guard-specific property is `cache.rs`'s
+    // `aborted_fetcher_does_not_leak_its_registration` to prove, via a direct `in_flight_len`
+    // assertion on the interrupted block itself.
+    //
+    // RED-verified: temporarily deleted `TaskOwner`'s field-drop-abort by swapping `StatusWorker`'s
+    // `spawn` to leak the task via `std::mem::forget` on a throwaway `TaskOwner` instead of storing
+    // the real one (simulating "the field never gets dropped, so nothing aborts") -- this test
+    // failed at its 5s timeout waiting for a `Cancelled` event that never arrived. Reverted
+    // immediately after confirming.
+    //
+    // The gate below (pass 7's structural pass, codex P2, a 3rd re-review) is NOT a RED-verified
+    // fix in that same sense, stated honestly rather than overclaimed: reverting just this test's
+    // own source construction to its pre-fix `.with_latency(Duration::from_millis(5))` shape (a
+    // method since deleted entirely, U-delete, pass 8 -- source.rs's own struct doc comment has
+    // the full history) and running it 30 times in a row never once failed on this system. The
+    // gate closes an undocumented-by-CONTRACT reliance on scheduling, not a reproduced flake --
+    // nothing in `tokio::time::sleep`'s own contract guarantees a fixed-duration sleep cannot
+    // elapse in the gap between this test's own `wait_for_count` resolving and `drop(w)` actually
+    // running, only that it usually does not on this system today. The gate makes the read's own
+    // inability to complete unaided into a structural fact instead, provable regardless of what
+    // any particular scheduler happens to do.
     #[tokio::test]
-    async fn dropping_the_worker_aborts_its_task() {
-        // a cache too small to hold the scan's own linear pass: by the time
-        // coverage is established, the blocks a walk toward a far anchor
-        // needs are cold again, so the walk must re-fetch through the same
-        // slow source — giving the drop below something real to interrupt.
+    async fn dropping_the_worker_aborts_its_in_flight_step() {
         let mut data = vec![b'x'; 4096];
         data.push(b'\n');
-        let src = Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(5)));
+        // a gate, disarmed until armed below -- not a fixed latency (codex P2, PR #44 pass 7's
+        // structural pass, a 3rd re-review, the shared root of 3 findings at once: a fixed-latency
+        // read can complete and free whatever it holds on its own timeline, independent of when
+        // this test gets around to observing it -- descheduled past that window, `drop(w)` below
+        // lands after the read already finished, leaving nothing in flight to cancel). Disarmed at
+        // construction rather than armed immediately, unlike `prefetch.rs`'s own use of the same
+        // mechanism: the SCAN just below shares this exact source and must read through it
+        // normally first -- arming happens only once that is done, right before the one read this
+        // test actually wants to gate.
+        let src = Arc::new(MockSource::new(data).with_gate());
         let c = Arc::new(BlockCache::new(src.clone(), 64, 4 * 64));
         let s = crate::schedule::ScanScheduler::spawn(c.clone());
         let mut fr = s.frontier();
         while !fr.borrow().done {
             fr.changed().await.unwrap();
         }
+        src.arm_gate();
+        // kept alongside the worker below, specifically to check the cache is still fully usable
+        // after the abort.
+        let cache_after = c.clone();
         let w = StatusWorker::spawn(c, s.index().clone(), s.frontier(), 64);
+        let anchor_keepalive = w.anchor_sender_for_test();
+        let mut started = src.started_events();
+        let baseline = *started.borrow();
         w.request_line_number(4000);
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let mid = src.read_count();
-        assert!(mid > 0, "walk should be re-reading evicted blocks by now");
+        wait_for_count(&mut started, |n| n > baseline).await;
+        // the task is now genuinely, and PERMANENTLY (until released, which never happens in this
+        // test), suspended mid-walk, parked on the gate armed above -- unlike a fixed-latency
+        // read, there is no window in which it could complete on its own before the drop below.
+        let mut cancelled = src.cancelled_events();
+        let cancelled_baseline = *cancelled.borrow();
         drop(w);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(
-            src.read_count(),
-            mid,
-            "worker kept reading after being dropped"
-        );
+        // POSITIVE proof: the in-flight read's own future was torn down, not left running or let
+        // finish on its own. `anchor_keepalive` is STILL alive here, proven by construction (it
+        // was never dropped, moved out of, or closed anywhere above) -- this cannot have been
+        // produced by channel closure.
+        wait_for_count(&mut cancelled, |n| n > cancelled_baseline).await;
+        drop(anchor_keepalive);
+        // the gate stays armed for every future read on this source, not just the one this test
+        // meant to gate -- opened here, now that the abort is already positively proven above, so
+        // the cache-still-usable check just below (a fresh, ungated read against a DIFFERENT
+        // block) does not itself park forever against a gate with no more purpose left to serve.
+        src.open_gate();
+        cache_after
+            .block(0)
+            .await
+            .expect("the cache must still be usable after an abort mid-fetch");
     }
     #[tokio::test]
     async fn repeated_identical_requests_do_not_restart_the_walk() {
@@ -454,8 +726,26 @@ mod tests {
         for _ in 0..8 {
             data.extend_from_slice(b"aaaaaaa\n"); // eight 8-byte lines.
         }
-        let src =
-            Arc::new(MockSource::new(data).with_latency(std::time::Duration::from_millis(50)));
+        // no injected latency: the discriminator is the structural read-count assertion below,
+        // not timing -- empirically confirmed (U-delete), not assumed: built the actual
+        // regression this test guards against (send_if_modified -> a plain send) and ran it at
+        // both the original 50ms and at 0ms latency -- it failed reliably at both (17 stray
+        // reads at 50ms, 80 at 0ms; more loudly at 0ms, since an unthrottled worker races
+        // through more restarts before the walk's own deadline), and the correct code passed
+        // cleanly 10/10 at 0ms. Both numbers confirmed against `with_latency`'s own real
+        // mechanism specifically (count-before-sleep -- `BlockEventGuard::new` fires, and so
+        // increments `read_count`, BEFORE the injected sleep, inside `read_block` itself), not
+        // a latency-injecting wrapper reproduction of it: a wrapper that sleeps BEFORE
+        // delegating to the wrapped source undercounts here, since an attempt aborted mid-sleep
+        // by this worker's own `select!` restart never reaches the wrapped source's own count
+        // at all -- reconciling a p6-review2 finding that used exactly such a wrapper and,
+        // for that reason alone, could not reproduce the 50ms number (see engine.rs's own
+        // `LatencySource` doc comment for the general gotcha this uncovered). Latency was
+        // genuinely incidental at either duration, not masked: send_if_modified already makes 9
+        // of these 10 requests unconditional no-ops at the channel level (see
+        // `request_skipped_events`), so the walk-restart signature this test catches shows up
+        // in the read count regardless of how fast any one read resolves.
+        let src = Arc::new(MockSource::new(data));
         // a cache too small to hold the scan's own pass: by the time
         // coverage is established, the blocks the walk needs are cold
         // again, so every one of them is a genuine, freshly-counted read.
@@ -613,11 +903,26 @@ mod tests {
         .await;
         assert_eq!(snap.line, LineNumber::Unavailable);
         let frozen_at = src.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let mut skipped = w.request_skipped_events();
+        let skip_baseline = *skipped.borrow();
         for _ in 0..10 {
             w.request_line_number(63);
             tokio::task::yield_now().await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        // POSITIVE proof, not a bounded silence window: `request_line_number`'s own
+        // `send_if_modified` decision is published the instant each call is made (see
+        // `request_skipped`'s own doc comment, this file) -- reaching skip_baseline + 10 here
+        // proves all ten identical re-requests were genuinely recognized as no-ops, without
+        // ever touching the anchor channel, rather than merely "nothing arrived within 60ms."
+        // The `yield_now()` calls above remain load-bearing regardless: a re-kick regression
+        // would still need the worker's own (woken) task to actually be polled before the
+        // read-count assertion below could observe it.
+        wait_for_count(&mut skipped, |n| n >= skip_baseline + 10).await;
+        assert_eq!(
+            *skipped.borrow(),
+            skip_baseline + 10,
+            "exactly ten identical re-requests must be recognized as skips, no more, no fewer"
+        );
         assert_eq!(
             src.reads.load(std::sync::atomic::Ordering::SeqCst),
             frozen_at,

@@ -166,7 +166,17 @@ impl App {
                 self.command.clear();
                 Action::Redraw
             }
-            (KeyCode::Enter, _) => {
+            // Ctrl+J is bound as Enter's alias (harmless: it has no other meaning here) because
+            // an Enter typed before Term::new()'s enable_raw_mode() call arrives while the tty
+            // is still cooked, where POSIX ICRNL translates Enter's CR byte to LF as it's
+            // received — and crossterm only decodes a bare LF as Enter when raw mode is NOT
+            // active at parse time, which by construction it always is by the time ress's loop
+            // parses anything. Without this alias, a `:N` typed and submitted before first
+            // paint would land exactly the misinterpreted LF produces: Ctrl+J, unhandled, so
+            // the command line is left stuck showing `:N_`, uncommitted (see issue #30's
+            // investigation report and docs/architecture.md's event loop section for the full
+            // mechanism, confirmed against crossterm 0.29's own source and its own issue #371).
+            (KeyCode::Enter, _) | (KeyCode::Char('j'), true) => {
                 self.mode = Mode::Normal;
                 let command = std::mem::take(&mut self.command);
                 if command.is_empty() {
@@ -1803,6 +1813,27 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
     }
     #[test]
+    fn command_ctrl_j_jumps_exactly_like_enter() {
+        // Ctrl+J is Enter's alias here for one specific reason: a physical Enter typed before
+        // Term::new()'s enable_raw_mode() call arrives while the tty is still cooked, where
+        // POSIX ICRNL translates the Enter key's CR byte to LF as it's received; crossterm
+        // only decodes a bare LF as Enter when raw mode is NOT active at parse time (it always
+        // is, by the time ress's loop starts parsing), so that LF decodes as Ctrl+J instead
+        // (see docs/architecture.md's event loop section and issue #30's investigation report
+        // for the full mechanism). This test pins the App-level half of the fix; the pty-level
+        // regression lives in ress/tests/smoke.rs.
+        let mut app = App::new();
+        app.handle_key(key(':'), AMPLE, AMPLE);
+        app.handle_key(key('1'), AMPLE, AMPLE);
+        app.handle_key(key('5'), AMPLE, AMPLE);
+        app.handle_key(key('0'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(ctrl('j'), AMPLE, AMPLE),
+            Action::Nav(Nav::Line(150))
+        );
+        assert_eq!(app.mode, Mode::Normal);
+    }
+    #[test]
     fn command_backspace_edits_and_esc_cancels() {
         let mut app = App::new();
         app.handle_key(key(':'), AMPLE, AMPLE);
@@ -2408,10 +2439,11 @@ mod tests {
         for i in 0..4000u32 {
             data.extend_from_slice(format!("line {i:04}\n").as_bytes());
         }
-        let src = std::sync::Arc::new(
-            ress_core::source::MockSource::new(data)
-                .with_latency(std::time::Duration::from_millis(2)),
-        );
+        // no injected latency: nav_scan_budget (256 bytes) is what forces Pending here,
+        // deterministically -- a byte budget, not a timing race against the background scan
+        // (U-delete; verified against resolve.rs/document.rs's own scan-budget plumbing before
+        // dropping this test's own with_latency call).
+        let src = std::sync::Arc::new(ress_core::source::MockSource::new(data));
         let doc = Document::new(
             src,
             ress_core::Config {
@@ -2432,6 +2464,18 @@ mod tests {
         let a = (&mut active.p.handle).await.unwrap().unwrap();
         assert_eq!(a.offset(), 34990);
     }
+    // `ress_core::source::wait_for_count` is `pub(crate)` to that crate, invisible from here --
+    // this is its own minimal, local equivalent (U-delete), same shape: a bounded diagnostic
+    // ceiling around the predicate wait, not a coordination window.
+    async fn wait_for_count(
+        rx: &mut tokio::sync::watch::Receiver<u64>,
+        pred: impl Fn(u64) -> bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.wait_for(|&n| pred(n)))
+            .await
+            .expect("the watched event count never satisfied the expected condition within 5s")
+            .expect("the MockSource sender lives alongside its receivers");
+    }
     #[tokio::test]
     async fn dropping_the_pending_slot_aborts_the_scan() {
         // the run loop's error-`?` paths rely on drop, not explicit cancel;
@@ -2441,12 +2485,9 @@ mod tests {
             data.extend_from_slice(b"y\n");
         }
         data.extend_from_slice(&[b'x'; 8192]);
-        let src = std::sync::Arc::new(
-            ress_core::source::MockSource::new(data)
-                .with_latency(std::time::Duration::from_millis(2)),
-        );
+        let src = std::sync::Arc::new(ress_core::source::MockSource::new(data).with_gate());
         let doc = Document::new(
-            src,
+            src.clone(),
             ress_core::Config {
                 block_size: 64,
                 nav_scan_budget: 256,
@@ -2461,11 +2502,28 @@ mod tests {
             .unwrap();
         let active = pending.take().expect("expected the percent jump to pend");
         let mut rx = active.p.progress.clone();
+        // armed only now, after the interactive attempt (bounded by nav_scan_budget) has
+        // already consumed whatever reads it legitimately needed -- the pending nav's own
+        // background walk, continuing from there, hits this on its very next read regardless
+        // of whether it has been polled even once yet (U-delete; the gate replaces a fixed
+        // 2ms-per-read latency, which could complete and free itself on its own timeline,
+        // independent of when this test gets around to observing it).
+        src.arm_gate();
+        let mut started = src.started_events();
+        let started_baseline = *started.borrow();
+        wait_for_count(&mut started, |n| n > started_baseline).await;
+        let mut cancelled = src.cancelled_events();
+        let cancelled_baseline = *cancelled.borrow();
         drop(active);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while rx.changed().await.is_ok() {}
-        })
-        .await
-        .expect("scan task outlived its drop guard");
+        // POSITIVE proof: the in-flight read's own future was torn down, not left running or
+        // let finish on its own.
+        wait_for_count(&mut cancelled, |n| n > cancelled_baseline).await;
+        // the direct discriminator this test's own name claims: the progress channel closing
+        // proves the background task's own sender -- and by extension the task itself -- is
+        // gone, not merely that the one read it was parked on was.
+        assert!(
+            rx.changed().await.is_err(),
+            "the pending nav's progress sender must be gone once its task is aborted"
+        );
     }
 }

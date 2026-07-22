@@ -7,6 +7,7 @@ use crate::source::BlockSource;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A cloneable read error that keeps the underlying chain traversable, so
@@ -30,6 +31,16 @@ pub struct BlockCache {
     source: Arc<dyn BlockSource>,
     block_size: usize,
     state: Mutex<State>,
+    // found in PR #44 pass 8 (U-cache): a positive "this call coalesced" signal.
+    // `in_flight_len` alone cannot serve this role -- it counts distinct in-flight
+    // BLOCKS, not waiters per block, so it cannot distinguish "one fetcher, zero
+    // waiters" from "one fetcher, many waiters," exactly the ambiguity a coalescing
+    // test must not paper over by inferring from `in_flight_len` staying put.
+    // Incremented+published from `get()`'s own waiter-discovery branch, already
+    // under the same lock that serializes every `in_flight` mutation -- see
+    // `coalesced_events`'s own doc comment for the test-facing accessor.
+    coalesced: AtomicU64,
+    coalesced_tx: tokio::sync::watch::Sender<u64>,
 }
 struct State {
     // first-touch blocks; a full-file scan lives and dies here.
@@ -78,6 +89,7 @@ impl BlockCache {
         let blocks = (capacity_bytes / block_size.max(1)).clamp(2, 1 << 16);
         let prob = NonZeroUsize::new((blocks / 4).max(1)).unwrap();
         let prot = NonZeroUsize::new((blocks - prob.get()).max(1)).unwrap();
+        let (coalesced_tx, _) = tokio::sync::watch::channel(0);
         Self {
             source,
             block_size: block_size.max(1),
@@ -86,6 +98,8 @@ impl BlockCache {
                 protected: lru::LruCache::new(prot),
                 in_flight: HashMap::new(),
             }),
+            coalesced: AtomicU64::new(0),
+            coalesced_tx,
         }
     }
     /// Total size of the underlying source in bytes.
@@ -136,6 +150,14 @@ impl BlockCache {
                     return Ok(b.clone());
                 }
                 if let Some(rx) = st.in_flight.get(&idx) {
+                    // this call found the block already being fetched: it is about to
+                    // become a coalescing WAITER (see `coalesced`'s own doc comment on
+                    // `BlockCache` for why this positive signal exists at all). Fired
+                    // here, still under `st`'s own lock, so concurrent discoveries --
+                    // on this block or any other -- can never race this increment
+                    // against each other.
+                    let n = self.coalesced.fetch_add(1, Ordering::Relaxed) + 1;
+                    Self::publish_high_water_mark(&self.coalesced_tx, n);
                     (None, rx.clone())
                 } else {
                     let (tx, rx) = tokio::sync::watch::channel(None);
@@ -235,10 +257,33 @@ impl BlockCache {
         Self::insert_protected(st, idx, b.clone());
         Some(b)
     }
+    /// `send_if_modified`, monotonic high-water-mark publish, no-op with no receivers --
+    /// the identical contract `source.rs`'s own `publish_high_water_mark` documents at
+    /// length (also reimplemented locally in `prefetch.rs`'s own `FillEventGuard::publish`);
+    /// kept local here too rather than imported, per the same P7-C layering principle:
+    /// this is the cache's own coalescing signal, not the block-source's.
+    fn publish_high_water_mark(sender: &tokio::sync::watch::Sender<u64>, value: u64) {
+        sender.send_if_modified(|current| {
+            if value > *current {
+                *current = value;
+                true
+            } else {
+                false
+            }
+        });
+    }
     /// Number of in-flight registrations; leak detection in tests.
     #[cfg(test)]
     pub(crate) fn in_flight_len(&self) -> usize {
         self.state.lock().unwrap().in_flight.len()
+    }
+    /// A receiver a test can `wait_for`/`changed()` on to observe how many `get()` calls
+    /// have coalesced onto an already in-flight fetch -- see `coalesced`'s own doc comment
+    /// on `BlockCache` for why this exists (a positive alternative to inferring coalescing
+    /// from `in_flight_len` staying put, which cannot tell "no waiters" apart from "many").
+    #[cfg(test)]
+    pub(crate) fn coalesced_events(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.coalesced_tx.subscribe()
     }
     /// Test-only view of the protected segment's population.
     #[cfg(test)]
@@ -262,7 +307,7 @@ impl BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::MockSource;
+    use crate::source::{MockSource, wait_for_count};
     fn cache(
         data: &'static [u8],
         block_size: usize,
@@ -271,6 +316,31 @@ mod tests {
         let src = Arc::new(MockSource::new(Bytes::from_static(data)));
         let c = BlockCache::new(src.clone(), block_size, capacity_bytes);
         (src, c)
+    }
+    // found in PR #44 round 17 (a codex P2, sweep): several tests below used to spawn a
+    // background fetcher and then sleep a guessed duration (5-10ms), hoping that was enough
+    // real time for it to have registered itself in `in_flight` before the test's own next
+    // step -- a correct implementation can fail that race under a loaded/parallel executor,
+    // the same "tests prove events, not scheduler timing" rule this workspace already states
+    // elsewhere (AGENTS.md; round 16's identical fix to `prefetch.rs`). `in_flight_len()` is
+    // already a real, synchronous fact (`BlockCache`'s own `std::sync::Mutex`-guarded map, not
+    // an async signal) -- polled here via `yield_now` (which costs no real wall-clock time
+    // itself, only a cooperative reschedule) rather than inferred from elapsed time, bounded by
+    // a generous 5s timeout purely as a hang backstop, matching this crate's own `wait_for`
+    // idiom (ress-core/src/status.rs).
+    async fn wait_for_in_flight_len_at_least(c: &BlockCache, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while c.in_flight_len() < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "in_flight_len never reached {n} (stuck at {})",
+                c.in_flight_len()
+            )
+        });
     }
     #[tokio::test]
     async fn returns_block_bytes_and_caches_them() {
@@ -287,16 +357,21 @@ mod tests {
     }
     #[tokio::test]
     async fn concurrent_misses_coalesce_into_one_read() {
-        let src = Arc::new(
-            MockSource::new(Bytes::from_static(b"0123456789"))
-                .with_latency(std::time::Duration::from_millis(20)),
-        );
+        let src = Arc::new(MockSource::new(Bytes::from_static(b"0123456789")).with_gate());
+        src.arm_gate();
         let c = Arc::new(BlockCache::new(src.clone(), 4, 64));
+        let mut coalesced = c.coalesced_events();
         let mut joins = Vec::new();
         for _ in 0..8 {
             let c = c.clone();
             joins.push(tokio::spawn(async move { c.block(0).await.unwrap() }));
         }
+        // exactly one of the 8 becomes the fetcher (parked on the gate below); the other 7
+        // must have genuinely JOINED as coalescing waiters -- not merely been spawned -- before
+        // the gate ever opens, or a not-yet-scheduled 8th task could slip in after release and
+        // hit a freshly-cached block instead of ever exercising concurrent-miss coalescing.
+        wait_for_count(&mut coalesced, |n| n >= 7).await;
+        src.open_gate();
         for j in joins {
             assert_eq!(&j.await.unwrap()[..], b"0123");
         }
@@ -341,17 +416,27 @@ mod tests {
     async fn foreground_read_coalescing_with_a_prefetch_still_promotes() {
         // an interactive read that coalesces with an in-flight prefetch fill
         // must promote just like one that arrives after the fill completes.
-        let src = Arc::new(
-            MockSource::new(Bytes::from_static(b"0123456789abcdef"))
-                .with_latency(std::time::Duration::from_millis(20)),
-        );
+        let src = Arc::new(MockSource::new(Bytes::from_static(b"0123456789abcdef")).with_gate());
+        src.arm_gate();
         let c = Arc::new(BlockCache::new(src.clone(), 4, 16));
         let warm = tokio::spawn({
             let c = c.clone();
             async move { c.warm(0).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let b = c.block(0).await.unwrap();
+        // waits for the fill to have genuinely REGISTERED (not merely spawned) as the fetcher --
+        // and, since nothing can progress past the gate, be genuinely PARKED there -- before the
+        // foreground read below; see `wait_for_in_flight_len_at_least`'s own doc comment.
+        wait_for_in_flight_len_at_least(&c, 1).await;
+        let mut coalesced = c.coalesced_events();
+        let interactive = tokio::spawn({
+            let c = c.clone();
+            async move { c.block(0).await }
+        });
+        // proves the interactive read genuinely JOINED the in-flight fill as a coalescing
+        // waiter -- not a maybe-already-done cache hit -- before the gate ever opens.
+        wait_for_count(&mut coalesced, |n| n >= 1).await;
+        src.open_gate();
+        let b = interactive.await.unwrap().unwrap();
         assert_eq!(&b[..], b"0123");
         let _ = warm.await.unwrap();
         // the interactive touch must have promoted block 0: streaming another
@@ -371,10 +456,8 @@ mod tests {
         // first from the size-1 probation segment before the coalesced
         // interactive waiter runs; fill + display must still land the block
         // in protected — never a churn-timing lottery.
-        let src = Arc::new(
-            MockSource::new(Bytes::from_static(b"0123456789abcdef"))
-                .with_latency(std::time::Duration::from_millis(20)),
-        );
+        let src = Arc::new(MockSource::new(Bytes::from_static(b"0123456789abcdef")).with_gate());
+        src.arm_gate();
         let c = Arc::new(BlockCache::new(src.clone(), 4, 16));
         let w0 = tokio::spawn({
             let c = c.clone();
@@ -384,8 +467,20 @@ mod tests {
             let c = c.clone();
             async move { c.warm(1).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let b = c.block(0).await.unwrap();
+        // waits for BOTH fills to have registered -- and, since nothing can progress past the
+        // gate, be genuinely PARKED there -- before the foreground read below; see
+        // `wait_for_in_flight_len_at_least`'s own doc comment, and its sibling use just above.
+        wait_for_in_flight_len_at_least(&c, 2).await;
+        let mut coalesced = c.coalesced_events();
+        let interactive = tokio::spawn({
+            let c = c.clone();
+            async move { c.block(0).await }
+        });
+        // proves the interactive read genuinely JOINED w0's in-flight fill as a coalescing
+        // waiter -- not a maybe-already-done cache hit -- before the gate ever opens.
+        wait_for_count(&mut coalesced, |n| n >= 1).await;
+        src.open_gate();
+        let b = interactive.await.unwrap().unwrap();
         assert_eq!(&b[..], b"0123");
         let _ = w0.await.unwrap();
         let _ = w1.await.unwrap();
@@ -450,17 +545,45 @@ mod tests {
     async fn cancelled_fetcher_does_not_wedge_the_block() {
         // aborting a fetcher mid-read must leave the block fetchable: the stale
         // in-flight entry is cleaned up and the next caller becomes the fetcher.
-        let src = Arc::new(
-            MockSource::new(Bytes::from_static(b"0123456789"))
-                .with_latency(std::time::Duration::from_millis(50)),
-        );
+        //
+        // found in PR #44 pass 7's structural pass (codex P2, a 3rd re-review, the shared root of
+        // 3 findings at once, this one an audit find rather than one of the 3 codex flagged
+        // directly): a gate, armed immediately -- not a fixed latency, which can complete on its
+        // own before `fetcher.abort()` below, independent of this test's own scheduling, letting
+        // the SECOND `c.block(0)` call below find the block already cached (a hit, not "the next
+        // caller becomes the fetcher" this test exists to prove) rather than genuinely racing a
+        // cancelled fetch. Opened again right after the abort: this test's own claim is bounded by
+        // the 2s timeout on the second call, not a positive Cancelled-event proof, so there is no
+        // reason to keep anything parked past that point, and the second call needs the gate open
+        // to complete at all.
+        //
+        // Checked, not assumed, whether this discriminates `InFlightGuard`'s own `Drop` cleanup
+        // specifically (the same way `aborted_fetcher_does_not_leak_its_registration`'s own gate
+        // fix was checked, its own comment above): with that `Drop` temporarily made a no-op, this
+        // test STILL passed. Not a leftover vacuity gap -- `get`'s own waiter path (this file,
+        // "the fetcher was cancelled mid-read: clean up its stale entry... and retry from the top
+        // as a fetcher candidate") is a second, independent cleanup route: a coalesced waiter whose
+        // watched channel closes without ever publishing a value cleans the stale entry itself and
+        // retries as a fresh fetcher. This test's own claim is black-box ("the block stays
+        // fetchable"), not "`InFlightGuard::drop` specifically fires" -- and that claim holds
+        // exactly because EITHER cleanup route satisfies it, a genuinely more robust property than
+        // pinning one internal mechanism. `aborted_fetcher_does_not_leak_its_registration` is the
+        // one that pins `InFlightGuard` itself, via a direct `in_flight_len` assertion; this one
+        // deliberately stays black-box.
+        let src = Arc::new(MockSource::new(Bytes::from_static(b"0123456789")).with_gate());
+        src.arm_gate();
         let c = Arc::new(BlockCache::new(src.clone(), 4, 64));
         let fetcher = tokio::spawn({
             let c = c.clone();
             async move { c.block(0).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // waits for the fetch to have genuinely registered before aborting it -- otherwise this
+        // could abort a task that never even started reading, not exercising a mid-read cancel
+        // at all. See `wait_for_in_flight_len_at_least`'s own doc comment for why this replaces
+        // a guessed sleep.
+        wait_for_in_flight_len_at_least(&c, 1).await;
         fetcher.abort();
+        src.open_gate();
         let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), c.block(0))
             .await
             .expect("second caller wedged on a cancelled fetcher")
@@ -471,16 +594,33 @@ mod tests {
     async fn aborted_fetcher_does_not_leak_its_registration() {
         // cancelling a scan mid-cold-read must clean the in-flight entry even
         // if that block is never requested again.
-        let src = Arc::new(
-            MockSource::new(Bytes::from_static(b"0123456789"))
-                .with_latency(std::time::Duration::from_millis(50)),
-        );
+        //
+        // found in PR #44 pass 7's structural pass (codex P2, a 3rd re-review, an audit find):
+        // a gate, armed immediately -- not a fixed latency, which can complete on its own before
+        // `fetcher.abort()` below fires, independent of this test's own scheduling. A read that
+        // completes NORMALLY also clears its own in-flight registration, so `in_flight_len() ==
+        // 0` afterward would hold vacuously either way -- proving nothing about the abort path
+        // this test's own name claims, if the race let the read finish first. Never opened again:
+        // nothing reads through `src` after the abort, only `fetcher.await` (which resolves once
+        // the aborted task's own Drop glue has genuinely run) and `in_flight_len()`.
+        //
+        // Vacuity checked directly, not assumed closed by the gate alone: temporarily made
+        // `InFlightGuard`'s own `Drop` a no-op (`if false && self.armed`), simulating "abort never
+        // cleans up the registration" -- this test failed exactly as expected (`left: 1, right:
+        // 0`), confirming it genuinely exercises the abort-cleanup path now that the gate rules
+        // out the race, not merely an assertion that happens to hold either way. Reverted
+        // immediately after confirming.
+        let src = Arc::new(MockSource::new(Bytes::from_static(b"0123456789")).with_gate());
+        src.arm_gate();
         let c = Arc::new(BlockCache::new(src, 4, 64));
         let fetcher = tokio::spawn({
             let c = c.clone();
             async move { c.block(0).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // see `wait_for_in_flight_len_at_least`'s own doc comment for why this replaces a
+        // guessed sleep; it already guarantees the count below by construction, not merely
+        // "probably by now".
+        wait_for_in_flight_len_at_least(&c, 1).await;
         assert_eq!(c.in_flight_len(), 1, "fetch should be registered");
         fetcher.abort();
         let _ = fetcher.await;
@@ -492,23 +632,58 @@ mod tests {
     }
     #[tokio::test]
     async fn concurrent_waiters_all_observe_the_same_error() {
-        struct FailingSlow;
+        // an armed gate holds the one real read open until this test has positively confirmed
+        // coalescing below, then releases it -- unlike a fixed sleep (this test's own pre-
+        // U-failingslow shape), which can complete and clear the in-flight registration on its
+        // own timeline, independent of when this test gets around to observing it. Measured
+        // directly (U-failingslow): removing the sleep entirely dropped coalesced_events from
+        // 3 (every run) to 0 (every run) -- the sleep was genuine coordination, not simulated
+        // realism, `with_latency`'s own shape reincarnated inline rather than through that
+        // (deleted) method. Unlike `MockSource`'s own general-purpose gate, this one-shot mock
+        // only ever has ONE real read to gate at all -- the other 3 callers coalesce as
+        // waiters and never call `read_block` themselves -- so a minimal, always-armed local
+        // gate is enough; no install/arm two-step needed.
+        struct FailingSlow {
+            gate: tokio::sync::watch::Sender<bool>,
+        }
         #[async_trait::async_trait]
         impl BlockSource for FailingSlow {
             fn size(&self) -> u64 {
                 8
             }
             async fn read_block(&self, _offset: u64, _len: usize) -> anyhow::Result<Bytes> {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let mut rx = self.gate.subscribe();
+                // `crate::source::DIAGNOSTIC_CEILING`, not a second independent literal
+                // (U-guard sweep, pass 8): the exact constant-drift risk that constant's own
+                // doc comment already exists to prevent -- see it for why this must stay one
+                // shared value, not a bound that happens to match today.
+                tokio::time::timeout(crate::source::DIAGNOSTIC_CEILING, rx.wait_for(|open| *open))
+                    .await
+                    .expect("FailingSlow's own gate parked longer than 5s -- forgotten release?")
+                    .expect("the sender lives alongside this receiver, in the same test");
                 Err(anyhow::anyhow!("boom"))
             }
         }
-        let c = Arc::new(BlockCache::new(Arc::new(FailingSlow), 4, 16));
+        let (gate_tx, _) = tokio::sync::watch::channel(false);
+        let c = Arc::new(BlockCache::new(
+            Arc::new(FailingSlow {
+                gate: gate_tx.clone(),
+            }),
+            4,
+            16,
+        ));
+        let mut coalesced = c.coalesced_events();
         let mut joins = Vec::new();
         for _ in 0..4 {
             let c = c.clone();
             joins.push(tokio::spawn(async move { c.block(0).await }));
         }
+        // exactly one of the 4 becomes the fetcher (parked on the gate above); the other 3
+        // must have genuinely JOINED as coalescing waiters -- not merely been spawned --
+        // before the gate ever opens (the identical shape
+        // `concurrent_misses_coalesce_into_one_read`, above, already established).
+        wait_for_count(&mut coalesced, |n| n >= 3).await;
+        let _ = gate_tx.send(true);
         for j in joins {
             let err = j.await.unwrap().unwrap_err();
             assert!(format!("{err:#}").contains("boom"));
@@ -517,5 +692,21 @@ mod tests {
                 "waiter lost the error chain: {err:#}"
             );
         }
+        // the discriminator this test's own name actually claims (U-failingslow): the two
+        // assertions above pass identically whether coalescing happened or not -- 4
+        // independent reads of the same always-failing source produce 4 qualitatively
+        // identical-looking wrapped errors. RED-verified in both directions: (a) breaking
+        // coalescing via never-match keys (each of the 4 requesting a distinct block index,
+        // so none can coalesce) makes the assertion below fail loud (0 != 3), exactly as
+        // intended; (b) with coalescing broken the SAME way but this assertion removed, the
+        // two assertions above still pass every time -- proof they alone cannot tell four
+        // independent-but-similar-looking errors apart from one shared one. Both reverted
+        // after confirming. This is what actually proves "concurrent waiters observed the
+        // SAME error," not four separate ones that merely look alike.
+        assert_eq!(
+            *coalesced.borrow(),
+            3,
+            "expected exactly 3 of the 4 concurrent callers to coalesce onto the one real fetch"
+        );
     }
 }

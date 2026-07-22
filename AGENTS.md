@@ -16,6 +16,31 @@ Prefer `just` over direct `cargo`:
 - **Error logging:** always log errors with `{:#}` or `{:?}`, never plain `{}`
   (plain `{}` hides the chain, e.g. "Permission denied").
 - **Error chains:** never use `anyhow::Error::msg()` — it destroys the chain.
+- **Tests prove events, not scheduler timing:** never assert on how fast the
+  OS happened to run a test (an elapsed `Duration` compared against a tuned
+  threshold, a call's own duration used as a stand-in for "did that block").
+  Assert on a kernel-verified fact, an injected answer, or a real handshake
+  instead — see `ress-perf/src/runner.rs`'s own `run_sample` doc comment for
+  two real bugs this caught. Not every `Duration` in a test is this rule,
+  and treating all three alike both over- and under-flags: a sleep that
+  GENERATES the subject's own behavior (a mock's injected latency, a fake
+  subject's paced writes) is not an oracle at all, nothing is being
+  discriminated; an `elapsed()` that IS the reported measurement (the actual
+  product a test exists to check) has nothing else to discriminate against;
+  and a bound wide enough that no plausible correct-but-slow run could cross
+  it — checking a qualitative "responded promptly" vs. "sat out the whole
+  timeout" gap, not a threshold tuned near the real mechanism's own latency
+  — cannot false-pass a genuine regression. The banned shape is narrower and
+  specific: a sleep or comparison whose OUTCOME decides whether the test can
+  tell buggy code from correct code, so that a slow host can make both pass
+  (or a fast one make both fail) for reasons unrelated to the property under
+  test. PR #44 rounds 16-17 found and fixed two of these hiding among
+  otherwise-correct-shaped, pre-existing tests — a stale sleep-then-assert
+  predating this rule (`prefetch.rs`), and a sleep-then-kill from a
+  SEPARATE THREAD racing a single-threaded poll loop's own internal
+  ordering (`runner.rs`) — neither one an obviously wrong-shaped test until
+  traced through to how a loaded host could make it pass for the wrong
+  reason.
 - Follow `CONVENTIONS.md` for comment/import/version style.
 
 ## Architecture & documentation
