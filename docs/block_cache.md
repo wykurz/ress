@@ -4,8 +4,10 @@ Every byte the engine reads flows through one shared `BlockCache`
 (`ress-core/src/cache.rs`). The viewport, navigation scans, prefetch, and
 the background line-index scan all read the same fixed-size,
 block-aligned `Bytes` — so a block fetched for any reason serves every
-consumer. Future analyzers (search, syntax highlighting) are designed to
-share the same path.
+consumer. The background match-summary sweep (`SweepAnalysis`, see
+[search](search.md)) shares the same path too — a real analyzer now, not a
+future one; syntax highlighting remains the one still-future analyzer
+designed to share it.
 
 ## Shape
 

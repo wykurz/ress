@@ -5,7 +5,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use futures::StreamExt;
 use ratatui::layout::Rect;
 use ress_core::document::{Anchor, Document, HScroll};
-use ress_core::resolve::{PendingNav, Resolution};
+use ress_core::resolve::{NavOutcome, PendingNav, Resolution};
+use ress_core::search::SearchPattern;
 /// What the loop should do after handling an input event.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -13,6 +14,13 @@ pub enum Action {
     Nav(Nav),
     Redraw,
     Cancel,
+    /// A search buffer was committed with Enter on a non-empty buffer (`raw` is the typed
+    /// pattern text). Compilation happens in the run loop, where `Document` lives — `handle_key`
+    /// itself stays IO- and regex-free, matching every other `Action` variant here.
+    CommitSearch {
+        raw: String,
+        backward: bool,
+    },
     None,
 }
 /// A navigation intent; the async loop turns it into `Document` calls.
@@ -26,6 +34,10 @@ pub enum Nav {
     Line(u64),
     Percent(u8),
     Horizontal(i64),
+    /// Advances to the next match in the ACTIVE search's own direction (vim's `n`).
+    SearchNext,
+    /// Advances to the next match in the REVERSE of the active search's direction (vim's `N`).
+    SearchPrev,
 }
 /// A live pending navigation and the intent that produced it. Dropping it
 /// cancels the background scan, so every exit from the run loop — quit,
@@ -40,12 +52,31 @@ impl Drop for ActiveNav {
         self.p.cancel();
     }
 }
+/// Which grammar `App::handle_key_command` applies to the shared `command` buffer: `Colon`'s
+/// digits-only line-jump (unchanged from before this type existed), or `Search`'s arbitrary-text
+/// regex pattern, remembering the direction (`/` vs `?`) it was entered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    Colon,
+    Search { backward: bool },
+}
 /// The input router's top-level state: which key table `handle_key` consults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    Command,
+    Command(CommandKind),
     Help,
+}
+/// A committed search: the compiled pattern, the background sweep's own generation stamp (so a
+/// stale `SearchSummary` snapshot is never mistaken for this search's — see `SearchSummary`'s own
+/// doc comment), and `current` — the byte offset of the match `n`/`N` last landed on (`None`
+/// until the first jump completes). `current` is the next search's own origin ingredient
+/// (`apply_nav`'s `SearchNext`/`SearchPrev` arm) AND the render-facing highlight target (`draw`'s
+/// own `viewport` call passes `search.current` directly); `apply_outcome` is its only writer.
+struct ActiveSearch {
+    pattern: std::sync::Arc<SearchPattern>,
+    generation: u64,
+    current: Option<u64>,
 }
 /// Pager state: the byte anchor of the top line, the horizontal column offset,
 /// the in-progress count prefix / `g` chord, and the current input mode.
@@ -53,10 +84,21 @@ pub struct App {
     pub top: Anchor,
     pub hscroll: HScroll,
     pub mode: Mode,
-    /// The in-progress `:` command line, live only in `Mode::Command`.
+    /// The in-progress `:`/`/`/`?` command line, live only in `Mode::Command(_)` — shared by
+    /// both `CommandKind`s (the digits-only `:` grammar and the arbitrary-text search grammar);
+    /// which grammar `handle_key_command` applies comes from `Mode::Command`'s own payload, not
+    /// a second buffer field.
     command: String,
     count: Option<usize>,
     pending_g: bool,
+    /// The committed search, if any: pattern, sweep generation, and the current match. `None`
+    /// until the first `Action::CommitSearch` is compiled successfully (the run loop's job); `n`/
+    /// `N` are notice-only no-ops while this is `None` (see `apply_nav`).
+    search: Option<ActiveSearch>,
+    /// A one-line transient notice ("search wrapped", "pattern not found", a bad-pattern error).
+    /// `apply_outcome`/the run loop's `CommitSearch` arm are its writers; `handle_key` clears it
+    /// as the first thing it does on every key, per its own doc comment.
+    notice: Option<String>,
 }
 impl App {
     pub fn new() -> Self {
@@ -67,6 +109,8 @@ impl App {
             command: String::new(),
             count: None,
             pending_g: false,
+            search: None,
+            notice: None,
         }
     }
     /// Test-only peek at the in-progress command buffer; production code
@@ -74,6 +118,11 @@ impl App {
     #[cfg(test)]
     pub(crate) fn command_buffer(&self) -> &str {
         &self.command
+    }
+    /// Sets a one-line transient notice. Bookkeeping only — Task 6 wires the
+    /// render path that displays and clears `notice`.
+    fn set_notice(&mut self, msg: &str) {
+        self.notice = Some(msg.to_string());
     }
     fn take_count(&mut self) -> usize {
         self.count.take().unwrap_or(1)
@@ -93,7 +142,7 @@ impl App {
     /// have entered in the first place.
     fn reconcile_mode(&mut self, rows: u16, cols: u16) {
         if self.mode != Mode::Normal && !ChromeLayout::can_enter(self.mode, rows, cols) {
-            if self.mode == Mode::Command {
+            if matches!(self.mode, Mode::Command(_)) {
                 self.command.clear();
             }
             self.mode = Mode::Normal;
@@ -111,6 +160,14 @@ impl App {
     /// previous call.
     pub fn handle_key(&mut self, key: KeyEvent, rows: u16, cols: u16) -> Action {
         self.reconcile_mode(rows, cols);
+        // a transient notice is exactly that -- transient: any key at all retires it, even one
+        // that itself produces `Action::None` (e.g. an unmapped key). Unconditional, not
+        // conditioned on whether one was actually set: the OBSERVABLE effect only shows up "when
+        // set", the statement itself is simplest left unconditional. The run loop is what turns
+        // this into a repaint even when the routed key's own action is `Action::None` -- it peeks
+        // `notice.is_some()` BEFORE calling this, since by the time this returns the clearing has
+        // already happened (see `run`'s own `Event::Key` arm).
+        self.notice = None;
         match self.mode {
             Mode::Help => {
                 // any key closes help; none of them reach Normal's table, so
@@ -118,8 +175,18 @@ impl App {
                 self.mode = Mode::Normal;
                 Action::Redraw
             }
-            Mode::Command => self.handle_key_command(key),
+            Mode::Command(kind) => self.handle_key_command(kind, key),
             Mode::Normal => self.handle_key_normal(key, rows, cols),
+        }
+    }
+    /// Routes a `Mode::Command(_)` key to the grammar its `kind` selects — `Colon`'s digits-only
+    /// line-jump (unchanged, see `handle_key_command_colon`'s own doc comment) or `Search`'s
+    /// arbitrary-text pattern buffer (`handle_key_command_search`). Both share the one `command`
+    /// buffer field; only which grammar interprets it differs.
+    fn handle_key_command(&mut self, kind: CommandKind, key: KeyEvent) -> Action {
+        match kind {
+            CommandKind::Colon => self.handle_key_command_colon(key),
+            CommandKind::Search { backward } => self.handle_key_command_search(backward, key),
         }
     }
     /// `:N` line jumps: digits accumulate (capped at 20 — a u64 line number
@@ -158,7 +225,7 @@ impl App {
     /// which has nothing left to pop. The digit arm carries Normal's
     /// `false` ctrl-guard for the same reason it exists there — Ctrl+digit
     /// is not a digit. Everything else is ignored — vim beeps, we no-op.
-    fn handle_key_command(&mut self, key: KeyEvent) -> Action {
+    fn handle_key_command_colon(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match (key.code, ctrl) {
             (KeyCode::Esc, _) => {
@@ -215,6 +282,54 @@ impl App {
             _ => Action::None,
         }
     }
+    /// `Search{backward}`'s grammar: unlike `Colon`'s digits-only line, the buffer holds
+    /// arbitrary regex text. Backspace pops (a no-op `Action::None` on an already-empty buffer,
+    /// same reasoning as `Colon`'s). Esc exits to `Normal` and clears the buffer. Enter commits
+    /// (Ctrl+J is its alias here too — same mechanism as `Colon`'s own alias arm, see the arm
+    /// below): an EMPTY buffer just closes (`Action::Redraw`, mirroring `Colon`'s empty-Enter
+    /// cancel — no `Action::CommitSearch` for a search nobody typed); a non-empty buffer
+    /// produces `Action::CommitSearch { raw, backward }` — compiling the pattern needs
+    /// `Document`, so it happens in the run loop, not here (`handle_key` stays IO- and
+    /// regex-free throughout). The push arm accepts `KeyCode::Char(c)` only when BOTH `c` is
+    /// not a control character AND the key carries no ctrl modifier — a ctrl-modified letter
+    /// (Ctrl+J foremost) must never be read as pattern text; skipping that guard here would be
+    /// strictly worse than `Colon`'s own stuck-buffer symptom, since the pattern would corrupt
+    /// silently instead of visibly refusing to commit (see the alias arm's own comment).
+    fn handle_key_command_search(&mut self, backward: bool, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (key.code, ctrl) {
+            (KeyCode::Esc, _) => {
+                self.mode = Mode::Normal;
+                self.command.clear();
+                Action::Redraw
+            }
+            // same alias as Colon's, same mechanism -- see the comment there; the push arm
+            // below must never see a ctrl-modified char as pattern text.
+            (KeyCode::Enter, _) | (KeyCode::Char('j'), true) => {
+                self.mode = Mode::Normal;
+                let raw = std::mem::take(&mut self.command);
+                if raw.is_empty() {
+                    Action::Redraw
+                } else {
+                    Action::CommitSearch { raw, backward }
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                if self.command.pop().is_some() {
+                    Action::Redraw
+                } else {
+                    Action::None
+                }
+            }
+            // ctrl-modified chars are never pattern text -- only a bare, non-control char is
+            // pushed (mirrors Colon's own digit arm's ctrl guard: "Ctrl+digit is not a digit").
+            (KeyCode::Char(c), false) if !c.is_control() => {
+                self.command.push(c);
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
     fn handle_key_normal(&mut self, key: KeyEvent, rows: u16, cols: u16) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // a refused entry is as if the key was never pressed: gates run
@@ -227,7 +342,21 @@ impl App {
         // are `handle_key`'s own parameters, not a field — see its doc
         // comment for why that is the whole point.
         let refused = match (key.code, ctrl) {
-            (KeyCode::Char(':'), false) => !ChromeLayout::can_enter(Mode::Command, rows, cols),
+            (KeyCode::Char(':'), false) => {
+                !ChromeLayout::can_enter(Mode::Command(CommandKind::Colon), rows, cols)
+            }
+            // `/`/`?` share `:`'s exact floor — `can_enter`'s `Command(_)` arm doesn't
+            // distinguish `CommandKind`, so either concrete kind asks the identical question.
+            (KeyCode::Char('/'), false) => !ChromeLayout::can_enter(
+                Mode::Command(CommandKind::Search { backward: false }),
+                rows,
+                cols,
+            ),
+            (KeyCode::Char('?'), false) => !ChromeLayout::can_enter(
+                Mode::Command(CommandKind::Search { backward: true }),
+                rows,
+                cols,
+            ),
             (KeyCode::F(1), _) => !ChromeLayout::can_enter(Mode::Help, rows, cols),
             _ => false,
         };
@@ -265,7 +394,21 @@ impl App {
                 // which then swallows every following keystroke silently.
                 // `refused` above already confirmed `can_enter`, so this
                 // always succeeds from here.
-                self.mode = Mode::Command;
+                self.mode = Mode::Command(CommandKind::Colon);
+                self.command.clear();
+                self.count = None;
+                Action::Redraw
+            }
+            // `/`/`?` mirror `:` exactly, modulo which `CommandKind` they enter — same gate
+            // (already confirmed via `refused` above), same buffer/count reset.
+            (KeyCode::Char('/'), false) => {
+                self.mode = Mode::Command(CommandKind::Search { backward: false });
+                self.command.clear();
+                self.count = None;
+                Action::Redraw
+            }
+            (KeyCode::Char('?'), false) => {
+                self.mode = Mode::Command(CommandKind::Search { backward: true });
                 self.command.clear();
                 self.count = None;
                 Action::Redraw
@@ -333,6 +476,19 @@ impl App {
             }
             (KeyCode::Char('l'), false) | (KeyCode::Right, _) => {
                 Action::Nav(Nav::Horizontal(self.take_count_i64()))
+            }
+            // a count is consumed/ignored-with-reset like other non-count motions in v1 (`d`/`u`/
+            // `f`/`b` above); no chrome gate, like `j`/`k` — `n`/`N` open no new UI surface, they
+            // just navigate. Whether there IS an active search to navigate against, and which
+            // effective direction `n`/`N` resolve to, are apply-time questions (`apply_nav`'s
+            // `SearchNext`/`SearchPrev` arm) — this table only knows the KEY, not the search.
+            (KeyCode::Char('n'), false) => {
+                self.count = None;
+                Action::Nav(Nav::SearchNext)
+            }
+            (KeyCode::Char('N'), false) => {
+                self.count = None;
+                Action::Nav(Nav::SearchPrev)
             }
             (KeyCode::Char('l'), true) => {
                 // vim aborts a pending count on unmapped input; a redraw
@@ -464,11 +620,31 @@ pub struct ChromeLayout {
     pub help_fits: bool,
 }
 /// What occupies the terminal's single bottom chrome row this frame, in
-/// `ChromeLayout::of`'s precedence order (`Command` beats `Progress` beats
-/// `Status`), or `None` when the terminal has no bottom row to spare at all.
+/// `ChromeLayout::of`'s precedence order (`Command` beats `Notice` beats
+/// `Progress` beats `Status`), or `None` when the terminal has no bottom row
+/// to spare at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BottomRow {
     Command,
+    /// A transient notice (`App.notice`) — outranks `Progress` (batch 3 (2026-07-23), finding
+    /// #13, swapped from the OLD order where `Progress` won: a notice is the direct response to
+    /// the user's LAST action -- typically committing a search -- and clears on the very next
+    /// key, at which point a still-running scan's progress row re-shows underneath it; the old
+    /// order instead hid a fresh regex-error notice behind an unrelated, older pending nav's
+    /// progress row while that nav kept moving the viewport underneath it, leaving a bad
+    /// pattern effectively invisible) and `Status` (there is something more urgent to say than
+    /// the ordinary status line), but still yields to `Command`: composing a command stays
+    /// uninterrupted either way.
+    ///
+    /// Traced edge, accepted rather than chased: `run`'s own periodic redraw tick gates a
+    /// pending nav's refresh on `progress_visible()` (see that method's own doc comment), which
+    /// is now false for the whole time a notice covers the row, so an UNRELATED still-running
+    /// pending nav shows no live progress update on screen until the next key -- unbounded, if
+    /// the user simply walks away. This is still strictly better than the invisible-error bug
+    /// this precedence swap fixes; auto-expiring notices (so a stale one cannot suppress
+    /// progress indefinitely) would close it properly, but that is a deeper UX change and
+    /// future work, not this fix's job.
+    Notice,
     Progress,
     Status,
     None,
@@ -478,12 +654,23 @@ impl ChromeLayout {
     /// `rows`/`cols` are the full terminal size, not already-reduced
     /// content dimensions; `chrome_rows`/`content_rows`/`has_gutter` apply
     /// that reduction internally, exactly as every other caller of those
-    /// functions already does.
-    pub fn of(mode: Mode, pending: bool, rows: u16, cols: u16, size: u64) -> ChromeLayout {
+    /// functions already does. `notice` is `app.notice.is_some()` — a plain
+    /// bool, the same shape `pending` already is, since this type has no
+    /// access to `App` itself.
+    pub fn of(
+        mode: Mode,
+        pending: bool,
+        notice: bool,
+        rows: u16,
+        cols: u16,
+        size: u64,
+    ) -> ChromeLayout {
         let bottom = if !has_bottom_row(rows) {
             BottomRow::None
-        } else if mode == Mode::Command {
+        } else if matches!(mode, Mode::Command(_)) {
             BottomRow::Command
+        } else if notice {
+            BottomRow::Notice
         } else if pending {
             BottomRow::Progress
         } else {
@@ -517,7 +704,9 @@ impl ChromeLayout {
     fn can_enter(mode: Mode, rows: u16, cols: u16) -> bool {
         match mode {
             Mode::Normal => true,
-            Mode::Command => has_bottom_row(rows) && cols >= 3,
+            // one shared floor for every `CommandKind` — `/`/`?` compose exactly as narrow a
+            // line as `:` does, so there is no reason for either to need a different bound.
+            Mode::Command(_) => has_bottom_row(rows) && cols >= 3,
             Mode::Help => help_overlay_fits(rows, cols),
         }
     }
@@ -527,11 +716,52 @@ impl ChromeLayout {
         matches!(self.bottom, BottomRow::Status)
     }
     /// Whether a pending navigation's progress row occupies the bottom row
-    /// this frame — false while `Mode::Command`'s line covers it, even if
-    /// a navigation is in fact pending underneath.
+    /// this frame — false while `Mode::Command`'s line OR a notice (batch 3
+    /// (2026-07-23), finding #13's precedence swap: `BottomRow::Notice`'s own
+    /// doc comment) covers it, even if a navigation is in fact pending
+    /// underneath.
     pub fn progress_visible(self) -> bool {
         matches!(self.bottom, BottomRow::Progress)
     }
+    /// Whether a fresh `SearchSummary` tick has anything to actually change on screen this
+    /// frame: the status line's own search segment (`status_visible()`) OR the scrollbar
+    /// gutter's match-density ticks (`gutter`) — a sweep tick feeds BOTH independently (`run`'s
+    /// own search-summary `select!` arm), and either alone is reason enough to wake and mark
+    /// the frame dirty. `status_visible()` ALONE under-gated this (search final review): a
+    /// Notice or the command line can cover the status segment while the gutter, a SEPARATE
+    /// column, stays fully visible, so a sweep completing then would leave stale ticks on
+    /// screen until the next key with the narrower gate.
+    pub fn search_summary_visible(self) -> bool {
+        self.status_visible() || self.gutter
+    }
+}
+/// The command line's prompt character for the given (already-confirmed-`Command`) mode: `:`
+/// for `CommandKind::Colon`, `/`/`?` for `CommandKind::Search` depending on direction. The
+/// catch-all is genuinely unreachable, not merely unexpected: this is only ever called from
+/// `paint_frame`'s `BottomRow::Command` arm, which `ChromeLayout::of` only ever produces from a
+/// `Mode::Command(_)` — the very same `app.mode` this function receives.
+fn command_prompt(mode: Mode) -> char {
+    match mode {
+        Mode::Command(CommandKind::Colon) => ':',
+        Mode::Command(CommandKind::Search { backward: false }) => '/',
+        Mode::Command(CommandKind::Search { backward: true }) => '?',
+        _ => unreachable!("BottomRow::Command implies Mode::Command(_)"),
+    }
+}
+/// The buckets this frame's scrollbar ticks are based on: `None` when there is no active search
+/// at all, or when `summary`'s own generation doesn't match `search`'s — a snapshot left over
+/// from a SUPERSEDED sweep must never paint ticks for a pattern that isn't the current one any
+/// more (the identical generation-stamping discipline `search_status_suffix`'s own doc comment
+/// establishes for the status line's search suffix, `render.rs`). A pure function of its two
+/// arguments — no `Document`/`doc.search_summary()` borrow inside — so the generation-match and
+/// -mismatch cases, and the no-active-search case, can each be pinned directly, the same way
+/// `search_status_suffix`'s own generation guard already is.
+fn gated_search_buckets(
+    search: Option<&ActiveSearch>,
+    summary: &ress_core::search::SearchSummary,
+) -> Option<std::sync::Arc<[u16; 1024]>> {
+    let search = search?;
+    (summary.generation == search.generation).then_some(summary.buckets.clone())
 }
 /// Draws the current screen: fetches the viewport for the terminal size,
 /// then hands everything paint-related to `paint_frame` inside the sync
@@ -577,7 +807,13 @@ async fn draw(
     // line was laid out for.
     let fetch_cols = content_cols(doc.size(), rows, cols);
     let view = doc
-        .viewport(app.top, rows as usize, fetch_cols as usize, app.hscroll)
+        .viewport(
+            app.top,
+            rows as usize,
+            fetch_cols as usize,
+            app.hscroll,
+            app.search.as_ref().map(|s| (&*s.pattern, s.current)),
+        )
         .await?;
     let indicator = pending.map(|p| {
         let prog = *p.progress.borrow();
@@ -602,6 +838,7 @@ async fn draw(
     let layout = ChromeLayout::of(
         app.mode,
         indicator.is_some(),
+        app.notice.is_some(),
         real.height,
         real.width,
         doc.size(),
@@ -643,17 +880,43 @@ async fn draw(
         let frontier = *doc.index_frontier().borrow();
         // u128: an exact percent for huge (sparse) files; display-only.
         let pct = (app.top.offset() as u128 * 100 / (doc.size().max(1) as u128)) as u64;
-        Some(crate::render::status_text(
+        let mut text = crate::render::status_text(
             name,
             line,
             total,
             frontier.done,
             frontier.lines_so_far,
             pct,
-        ))
+        );
+        // the search segment, appended when a search is active — `None` (no suffix) both when
+        // there's simply no active search and, transiently, when the latest published summary's
+        // generation hasn't caught up to it yet (self-correcting on the very next publish, which
+        // the run loop's own search-summary select! arm wakes a repaint for).
+        if let Some(search) = app.search.as_ref() {
+            let summary = doc.search_summary().borrow().clone();
+            let search_pct =
+                (summary.scanned_up_to as u128 * 100 / (doc.size().max(1) as u128)) as u64;
+            if let Some(suffix) = crate::render::search_status_suffix(
+                &search.pattern.raw,
+                &summary,
+                search.generation,
+                search_pct,
+            ) {
+                text.push_str(&suffix);
+            }
+        }
+        Some(text)
     } else {
         None
     };
+    // the scrollbar's own match-tick overlay: `gated_search_buckets` decides whether the
+    // freshest published summary actually applies (see its own doc comment); `paint_frame` turns
+    // whatever it returns into actual per-row ticks itself, against the live paint-time row
+    // count -- never this advisory `rows` -- for the identical resize-race reason
+    // `content_area`/`text_area` are always derived from the closure's own `f.area()` rather than
+    // a value queried before it (see `paint_frame`'s own doc comment below).
+    let summary = doc.search_summary().borrow().clone();
+    let search_buckets = gated_search_buckets(app.search.as_ref(), &summary);
     term.inner_mut().draw(|f| {
         let area = f.area();
         paint_frame(
@@ -664,6 +927,7 @@ async fn draw(
             indicator,
             status.as_deref(),
             doc.size(),
+            search_buckets.as_deref(),
         );
     })?;
     Ok(())
@@ -701,6 +965,20 @@ async fn draw(
 /// disagreement structurally impossible rather than merely unlikely: there
 /// is no second, separately-queried size left anywhere in this function
 /// for the paint decisions to disagree WITH.
+///
+/// `search_buckets` follows the identical discipline: `draw` hands over only the raw bucket
+/// snapshot (already gated on the active search's own generation, which needs `doc` and so can't
+/// happen down here), and this function turns it into actual per-row ticks itself
+/// (`crate::render::tick_rows`), against `content_area.height` -- THIS call's own, area-derived
+/// row count, never a count `draw` might have computed against a since-resized `area` -- right
+/// before handing them to `render_scrollbar`.
+// eight parameters, all independently sourced upstream in `draw` and none derivable from another
+// (see the doc comment above) -- plain data, not injectable test seams like
+// `poll_predicate_with_waiter`'s own (`ress-perf`'s `runner.rs`, the only other `#[allow]` of
+// this lint in the workspace, for a different reason). For a function with exactly one
+// production call site, grouping any subset of these behind a struct would only silence the
+// lint, not reduce any real complexity.
+#[allow(clippy::too_many_arguments)]
 fn paint_frame(
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
@@ -709,8 +987,16 @@ fn paint_frame(
     indicator: Option<(&str, u64)>,
     status: Option<&str>,
     size: u64,
+    search_buckets: Option<&[u16; 1024]>,
 ) {
-    let layout = ChromeLayout::of(app.mode, indicator.is_some(), area.height, area.width, size);
+    let layout = ChromeLayout::of(
+        app.mode,
+        indicator.is_some(),
+        app.notice.is_some(),
+        area.height,
+        area.width,
+        size,
+    );
     let content_area = Rect {
         height: content_rows(area.height),
         ..area
@@ -722,13 +1008,23 @@ fn paint_frame(
     };
     crate::render::render_viewport(view, text_area, buf);
     if layout.gutter {
-        crate::render::render_scrollbar(app.top.offset(), size, content_area, buf);
+        let ticks = search_buckets
+            .map(|buckets| crate::render::tick_rows(buckets, size, content_area.height));
+        crate::render::render_scrollbar(
+            app.top.offset(),
+            size,
+            content_area,
+            buf,
+            ticks.as_deref(),
+        );
     }
     if layout.hint_bar {
         crate::render::render_hint_bar(app.mode, layout.help_fits, area, buf);
     }
     match layout.bottom {
-        BottomRow::Command => crate::render::render_command_line(&app.command, area, buf),
+        BottomRow::Command => {
+            crate::render::render_command_line(command_prompt(app.mode), &app.command, area, buf)
+        }
         BottomRow::Progress => {
             if let Some((label, pct)) = indicator {
                 // Esc only cancels the scan in Mode::Normal — Mode::Help's
@@ -737,6 +1033,11 @@ fn paint_frame(
                 // BottomRow::Command always outranks Progress).
                 let esc_cancels = app.mode == Mode::Normal;
                 crate::render::render_progress_row(label, pct, esc_cancels, area, buf);
+            }
+        }
+        BottomRow::Notice => {
+            if let Some(notice) = app.notice.as_deref() {
+                crate::render::render_notice(notice, area, buf);
             }
         }
         BottomRow::Status => {
@@ -781,13 +1082,85 @@ async fn apply_nav(
             app.hscroll = app.hscroll.shift(n);
             None
         }
+        Nav::SearchNext | Nav::SearchPrev => match app.search.as_ref() {
+            None => {
+                app.set_notice("no previous search");
+                None
+            }
+            Some(search) => {
+                let forward = effective_search_forward(search.pattern.backward, nav);
+                // forward: `current + 1` skips past a known match (INCLUSIVE origin — a match
+                // starting exactly there must still be found, see `search_next`'s own doc
+                // comment); no current yet -> the viewport's own top. backward: `current`
+                // UNADJUSTED (no `- 1`) -- `search_next`'s backward leg treats its `origin` as an
+                // EXCLUSIVE upper bound already, so the self-hit exclusion falls out of THAT, not
+                // of any arithmetic here (pinned directly by
+                // `apply_nav_search_prev_after_a_backward_pattern_finds_the_earlier_match_without_a_self_hit`,
+                // below).
+                let origin = if forward {
+                    search.current.map(|m| m + 1).unwrap_or(app.top.offset())
+                } else {
+                    search.current.unwrap_or(app.top.offset())
+                };
+                let pattern = search.pattern.clone();
+                Some(doc.search_next(origin, &pattern, forward).await?)
+            }
+        },
     };
     match resolution {
-        Some(Resolution::Ready(a)) => app.top = a,
+        Some(Resolution::Ready(outcome)) => apply_outcome(app, outcome),
         Some(Resolution::Pending(p)) => *pending = Some(ActiveNav { nav, p }),
         None => {}
     }
     Ok(())
+}
+/// The effective scan direction for a search-navigation key: `Nav::SearchNext` (`n`) repeats the
+/// ORIGINAL search's own direction; `Nav::SearchPrev` (`N`) reverses it -- vim's algebra,
+/// independent of which prompt (`/` or `?`) produced the active pattern. Pure XOR, no Document/
+/// IO needed to exercise it -- `apply_nav`'s `SearchNext`/`SearchPrev` arm is its only caller.
+fn effective_search_forward(pattern_backward: bool, nav: Nav) -> bool {
+    !pattern_backward ^ (nav == Nav::SearchPrev)
+}
+/// Extracts the informative line from a failed pattern compile's own `Display` text, for the
+/// "bad pattern: ..." notice (batch 3 (2026-07-23), finding #13b): regex's own pretty
+/// multi-line syntax errors put the actual reason on their LAST non-empty line, never the
+/// first -- the first line is always the generic "regex parse error:" header, useless on its
+/// own (probe-verified against three real shapes: `(` -> "unclosed group", `a{` -> "unclosed
+/// counted repetition", a `\p{L}` pattern under this crate's own `unicode(false)` ruling, #8,
+/// with no `(?u)` opt-in -> "Unicode not allowed here"). `.unwrap_or(msg)` falls back to the
+/// whole message on a hypothetical empty one -- unreachable in practice (`to_string()` on any
+/// real error is non-empty), but costs nothing to keep this total rather than panicking.
+/// Truncation to the notice row's own width happens downstream, in `render_notice`'s existing
+/// `set_stringn` clamp -- not this function's job.
+fn last_notice_line(msg: &str) -> &str {
+    msg.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(msg)
+}
+/// The one place a completed navigation outcome mutates `App` — shared by the interactive path
+/// above and the run loop's pending-completion arm so wrap/exhausted notices and the
+/// current-match bookkeeping (while a search is active, `search.current` — both the next
+/// search's own origin AND the render-facing highlight target, `ActiveSearch`'s own doc
+/// comment) can never diverge between them.
+fn apply_outcome(app: &mut App, outcome: NavOutcome) {
+    match outcome {
+        NavOutcome::At(a) => app.top = a,
+        NavOutcome::FoundMatch {
+            top,
+            match_at,
+            wrapped,
+        } => {
+            app.top = top;
+            if let Some(search) = app.search.as_mut() {
+                search.current = Some(match_at);
+            }
+            if wrapped {
+                app.set_notice("search wrapped");
+            }
+        }
+        NavOutcome::Exhausted => app.set_notice("pattern not found"),
+    }
 }
 /// Restarts any pending operation against the new height: row-dependent
 /// jumps (G) captured the old one, and restarting the rest from the unmoved
@@ -852,42 +1225,50 @@ fn resample_size(app: &mut App) -> anyhow::Result<(u16, u16)> {
 /// Runs the event loop until the user quits. Pending navigation resolves in
 /// the background: a tick keeps the progress row fresh, completion moves the
 /// anchor, Esc cancels, and any new motion supersedes. The background index
-/// frontier and the status worker's snapshots (`ress_core::status`) are both
-/// watched separately from all of that, in the same shape: each arm only
-/// marks the frame `dirty`, gated on a freshly computed `ChromeLayout`
-/// saying the status line would actually be visible this frame
-/// (`layout.status_visible()`) — this one check absorbs both what used to
-/// be two separate conditions (a hidden row has nothing to repaint for; a
-/// `Mode::Command` line always wins the bottom row's precedence over the
-/// status line, so composing a command covers it exactly as a chromeless
-/// terminal would) because `ChromeLayout::of` already encodes both. `Mode::
-/// Help` keeps both arms armed — its overlay paints only over the content
-/// area, so the chrome rows stay visible underneath it (see `draw`), unlike
-/// Command's. A watch receiver that goes unpolled while an arm is disarmed
-/// for Command mode does not lose the update: `watch` retains only the
+/// frontier, the status worker's snapshots (`ress_core::status`), and the
+/// search sweep's own `SearchSummary` snapshots are all watched separately
+/// from all of that, in a related but not identical shape: each arm only
+/// marks the frame `dirty`. The frontier and status arms gate on a freshly
+/// computed `ChromeLayout` saying the status line would actually be visible
+/// this frame (`layout.status_visible()`) — this one check absorbs both what
+/// used to be two separate conditions (a hidden row has nothing to repaint
+/// for; a `Mode::Command` line always wins the bottom row's precedence over
+/// the status line, so composing a command covers it exactly as a
+/// chromeless terminal would) because `ChromeLayout::of` already encodes
+/// both. The search-summary arm gates on the wider
+/// `ChromeLayout::search_summary_visible()` instead — `status_visible() ||
+/// gutter` — since a sweep tick can move the scrollbar gutter's
+/// match-density ticks even while a notice or the command line covers the
+/// status segment itself; unlike the other two, it can stay armed straight
+/// through `Mode::Command` whenever the gutter alone is visible. `Mode::
+/// Help` keeps all three arms armed — its overlay paints only over the
+/// content area, so the chrome rows stay visible underneath it (see
+/// `draw`), unlike Command's. A watch receiver that goes unpolled while its
+/// own gate is disarmed does not lose the update: `watch` retains only the
 /// latest value, not a queue, so the receiver simply sees it on the next
-/// poll instead — the first one after `layout.status_visible()` next reads
-/// true, which happens no later than the `Action::Redraw`/`Cancel` a
-/// Command-mode Esc or Enter always produces, and that redraw's own draw
-/// call reads the frontier and the status snapshot fresh regardless of
-/// `dirty`. The seed behind the status worker's convergence, `draw`'s own
-/// `request_line_number` call, is gated on that same `ChromeLayout::
-/// status_visible` condition (see `draw`), so leaving Command mode always
-/// re-seeds a live request rather than resuming a stale one. The tick is
-/// the sole point that turns a dirty flag into a repaint, so a burst of
-/// index progress or status updates between two ticks still costs at most
-/// one extra draw. The tick's other reason to redraw — a pending
-/// navigation's progress row needs refreshing — asks the same `layout` for
-/// `progress_visible()` instead: unlike an earlier version of this gate,
-/// there is no exception for `Mode::Command` here anymore, because asking
-/// the model costs nothing extra (it is already computed for the two arms
-/// above) and a progress row `Mode::Command`'s line is covering has nothing
-/// to repaint for, exactly like the status line in that mode. The one
-/// exception to all of this is the pending-completion arm: when a
-/// background scan finishes, the anchor itself moves, so its draw stays
-/// unconditional — visible content changed regardless of whether there is a
-/// chrome row to show progress in, or what mode covered it. `name` is the
-/// status line's display name for the file.
+/// poll instead — for the frontier and status arms specifically, the first
+/// one after `layout.status_visible()` next reads true, which happens no
+/// later than the `Action::Redraw`/`Cancel` a Command-mode Esc or Enter
+/// always produces, and that redraw's own draw call reads the frontier and
+/// the status snapshot fresh regardless of `dirty`. The seed behind the
+/// status worker's convergence, `draw`'s own `request_line_number` call, is
+/// gated on that same `ChromeLayout::status_visible` condition (see
+/// `draw`), so leaving Command mode always re-seeds a live request rather
+/// than resuming a stale one. The tick is the sole point that turns a dirty
+/// flag into a repaint, so a burst of index, status, or search-summary
+/// progress between two ticks still costs at most one extra draw. The
+/// tick's other reason to redraw — a pending navigation's progress row
+/// needs refreshing — asks the same `layout` for `progress_visible()`
+/// instead: unlike an earlier version of this gate, there is no exception
+/// for `Mode::Command` here anymore, because asking the model costs nothing
+/// extra (it is already computed for the three arms above) and a progress
+/// row `Mode::Command`'s line is covering has nothing to repaint for,
+/// exactly like the status line in that mode. The one exception to all of
+/// this is the pending-completion arm: when a background scan finishes, the
+/// anchor itself moves, so its draw stays unconditional — visible content
+/// changed regardless of whether there is a chrome row to show progress in,
+/// or what mode covered it. `name` is the status line's display name for
+/// the file.
 pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
     let mut term = crate::terminal::Term::new()?;
     let mut app = App::new();
@@ -963,6 +1344,11 @@ pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
     let mut frontier_done = frontier.borrow().done;
     let mut status_rx = doc.status_snapshots();
     let mut status_closed = false;
+    // the status line's search twin: same shape, same seeding rationale, and disarmed the same
+    // way once a search has genuinely stopped publishing (a teardown race only, `doc` outlives
+    // this loop) — see `status_closed`'s own comment just above.
+    let mut search_summary_rx = doc.search_summary();
+    let mut search_summary_closed = false;
     let mut dirty = false;
     draw(
         &mut term,
@@ -982,7 +1368,14 @@ pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
         // that asks "is X visible right now" reads the same answer rather
         // than re-deriving (or drifting from) it independently — see run's
         // doc comment above for how each arm below uses it.
-        let layout = ChromeLayout::of(app.mode, pending.is_some(), raw_rows, cols, doc.size());
+        let layout = ChromeLayout::of(
+            app.mode,
+            pending.is_some(),
+            app.notice.is_some(),
+            raw_rows,
+            cols,
+            doc.size(),
+        );
         tokio::select! {
             done = async { (&mut pending.as_mut().unwrap().p.handle).await }, if pending.is_some() => {
                 pending = None;
@@ -990,7 +1383,7 @@ pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
                 // failures are logged so they stay diagnosable even before
                 // the status line exists.
                 match done {
-                    Ok(Ok(anchor)) => app.top = anchor,
+                    Ok(Ok(outcome)) => apply_outcome(&mut app, outcome),
                     Ok(Err(e)) => tracing::warn!("background scan failed: {e:#}"),
                     Err(e) if e.is_cancelled() => {}
                     Err(e) => tracing::warn!("background scan panicked: {e:?}"),
@@ -1030,6 +1423,18 @@ pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
                     Err(_) => status_closed = true,
                 }
             }
+            changed = search_summary_rx.changed(), if !search_summary_closed && layout.search_summary_visible() => {
+                // the sweep feeds TWO visible things, not one: the status line's own search
+                // segment AND the scrollbar gutter's match-density ticks — see
+                // `ChromeLayout::search_summary_visible`'s own doc comment for why a bare
+                // `status_visible()` gate (this arm's own first version) under-counted, leaving
+                // stale gutter ticks on screen until the next key whenever a Notice or the
+                // command line covered the status segment while the gutter stayed visible.
+                match changed {
+                    Ok(()) => dirty = true,
+                    Err(_) => search_summary_closed = true,
+                }
+            }
             _ = tick.tick() => {
                 // a pending nav's progress row needing a refresh only
                 // matters if it is this frame's bottom row occupant —
@@ -1058,6 +1463,12 @@ pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
                         // gates' actual source of truth.
                         (raw_rows, cols) = resample_size(&mut app)?;
                         rows = content_rows(raw_rows);
+                        // sampled BEFORE handle_key, whose first act (after reconcile) is
+                        // clearing it -- this is the run loop's own half of the "any key clears
+                        // the notice" contract: the row must repaint even when the routed key's
+                        // own action is Action::None (see the Action::None arm below and
+                        // handle_key's own doc comment).
+                        let notice_was_cleared = app.notice.is_some();
                         match app.handle_key(key, raw_rows, cols) {
                             Action::Quit => {
                                 pending.take();
@@ -1077,7 +1488,41 @@ pub async fn run(doc: Document, name: String) -> anyhow::Result<()> {
                                 draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
                                 dirty = false;
                             }
-                            Action::None => {}
+                            Action::CommitSearch { raw, backward } => {
+                                // compilation happens HERE, not in handle_key: this is where
+                                // Document lives, and handle_key stays IO- and regex-free.
+                                match ress_core::search::SearchPattern::compile(&raw, backward) {
+                                    Err(e) => {
+                                        let msg = e.to_string();
+                                        app.set_notice(&format!(
+                                            "bad pattern: {}",
+                                            last_notice_line(&msg)
+                                        ));
+                                    }
+                                    Ok(p) => {
+                                        let pattern = std::sync::Arc::new(p);
+                                        let generation = doc.start_search_sweep(pattern.clone());
+                                        app.search = Some(ActiveSearch {
+                                            pattern,
+                                            generation,
+                                            current: None,
+                                        });
+                                        apply_nav(&doc, &mut app, &mut pending, Nav::SearchNext, rows).await?;
+                                    }
+                                }
+                                draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                                dirty = false;
+                            }
+                            Action::None => {
+                                // every OTHER arm above already redraws unconditionally, so a
+                                // cleared notice needs no special handling there — only here,
+                                // where nothing else would otherwise trigger the repaint that
+                                // makes the clearing visible.
+                                if notice_was_cleared {
+                                    draw(&mut term, &doc, &app, pending.as_ref().map(|a| &a.p), &name, cols, rows).await?;
+                                    dirty = false;
+                                }
+                            }
                         }
                     }
                     Event::Mouse(m) => {
@@ -1213,40 +1658,51 @@ mod tests {
         for rows in 0u16..=7 {
             for cols in [2u16, 4, 5, 6, 80] {
                 for size in [0u64, 1] {
-                    for mode in [Mode::Normal, Mode::Command, Mode::Help] {
+                    for mode in [
+                        Mode::Normal,
+                        Mode::Command(CommandKind::Colon),
+                        Mode::Command(CommandKind::Search { backward: false }),
+                        Mode::Command(CommandKind::Search { backward: true }),
+                        Mode::Help,
+                    ] {
                         for pending in [false, true] {
-                            let layout = ChromeLayout::of(mode, pending, rows, cols, size);
-                            let has_bottom = !matches!(rows, 0 | 1);
-                            let expected_bottom = if !has_bottom {
-                                BottomRow::None
-                            } else if mode == Mode::Command {
-                                BottomRow::Command
-                            } else if pending {
-                                BottomRow::Progress
-                            } else {
-                                BottomRow::Status
-                            };
-                            assert_eq!(
-                                layout.bottom, expected_bottom,
-                                "bottom at rows={rows} cols={cols} size={size} mode={mode:?} pending={pending}"
-                            );
-                            assert_eq!(layout.hint_bar, rows >= 4, "hint_bar at rows={rows}");
-                            let content = content_rows(rows);
-                            assert_eq!(
-                                layout.overlay,
-                                mode == Mode::Help && content >= 5 && cols >= 5,
-                                "overlay at rows={rows} cols={cols} mode={mode:?}"
-                            );
-                            assert_eq!(
-                                layout.gutter,
-                                size > 0 && content > 0 && cols >= 2,
-                                "gutter at rows={rows} cols={cols} size={size}"
-                            );
-                            assert_eq!(
-                                layout.help_fits,
-                                content >= 5 && cols >= 5,
-                                "help_fits at rows={rows} cols={cols} — mode-independent, unlike overlay"
-                            );
+                            for notice in [false, true] {
+                                let layout =
+                                    ChromeLayout::of(mode, pending, notice, rows, cols, size);
+                                let has_bottom = !matches!(rows, 0 | 1);
+                                let expected_bottom = if !has_bottom {
+                                    BottomRow::None
+                                } else if matches!(mode, Mode::Command(_)) {
+                                    BottomRow::Command
+                                } else if notice {
+                                    BottomRow::Notice
+                                } else if pending {
+                                    BottomRow::Progress
+                                } else {
+                                    BottomRow::Status
+                                };
+                                assert_eq!(
+                                    layout.bottom, expected_bottom,
+                                    "bottom at rows={rows} cols={cols} size={size} mode={mode:?} pending={pending} notice={notice}"
+                                );
+                                assert_eq!(layout.hint_bar, rows >= 4, "hint_bar at rows={rows}");
+                                let content = content_rows(rows);
+                                assert_eq!(
+                                    layout.overlay,
+                                    mode == Mode::Help && content >= 5 && cols >= 5,
+                                    "overlay at rows={rows} cols={cols} mode={mode:?}"
+                                );
+                                assert_eq!(
+                                    layout.gutter,
+                                    size > 0 && content > 0 && cols >= 2,
+                                    "gutter at rows={rows} cols={cols} size={size}"
+                                );
+                                assert_eq!(
+                                    layout.help_fits,
+                                    content >= 5 && cols >= 5,
+                                    "help_fits at rows={rows} cols={cols} — mode-independent, unlike overlay"
+                                );
+                            }
                         }
                     }
                 }
@@ -1257,16 +1713,75 @@ mod tests {
     fn chrome_layout_gutter_needs_at_least_two_columns() {
         // a nonzero size and a content row exist at rows=5, so only the
         // cols dimension is under test here.
-        assert!(ChromeLayout::of(Mode::Normal, false, 5, 2, 1).gutter);
-        assert!(!ChromeLayout::of(Mode::Normal, false, 5, 1, 1).gutter);
-        assert!(!ChromeLayout::of(Mode::Normal, false, 5, 0, 1).gutter);
+        assert!(ChromeLayout::of(Mode::Normal, false, false, 5, 2, 1).gutter);
+        assert!(!ChromeLayout::of(Mode::Normal, false, false, 5, 1, 1).gutter);
+        assert!(!ChromeLayout::of(Mode::Normal, false, false, 5, 0, 1).gutter);
+    }
+    #[test]
+    fn chrome_layout_notice_outranks_status_and_progress_but_not_command() {
+        // batch 3 (2026-07-23), finding #13: the precedence rung, pinned directly --
+        // Command(_) > Notice > Progress > Status (swapped from Notice/Progress's old order;
+        // see BottomRow::Notice's own doc comment for why).
+        assert_eq!(
+            ChromeLayout::of(Mode::Normal, false, true, 5, 80, 0).bottom,
+            BottomRow::Notice
+        );
+        assert_eq!(
+            ChromeLayout::of(Mode::Normal, false, false, 5, 80, 0).bottom,
+            BottomRow::Status,
+            "no notice: falls through to Status, unchanged"
+        );
+        assert_eq!(
+            ChromeLayout::of(Mode::Normal, true, true, 5, 80, 0).bottom,
+            BottomRow::Notice,
+            "a notice set while a pending nav still runs must render over its progress row -- \
+             the notice is the direct response to the user's LAST action, e.g. a regex compile \
+             error from a just-committed search, and must not hide behind an unrelated older \
+             nav's progress row while that nav keeps moving the viewport underneath it"
+        );
+        assert_eq!(
+            ChromeLayout::of(Mode::Normal, true, false, 5, 80, 0).bottom,
+            BottomRow::Progress,
+            "no notice: a pending scan still outranks Status, unchanged"
+        );
+        assert_eq!(
+            ChromeLayout::of(Mode::Command(CommandKind::Colon), true, true, 5, 80, 0).bottom,
+            BottomRow::Command,
+            "composing a command still outranks both"
+        );
+    }
+    #[test]
+    fn search_summary_visible_wakes_on_either_the_status_segment_or_the_gutter() {
+        // regression (search final review): a bare `status_visible()` gate on the
+        // search-summary select! arm left the gutter's own match-density ticks stale
+        // whenever a Notice/the command line covered the status segment but the gutter
+        // (a SEPARATE column) stayed visible -- `search_summary_visible` must say `true`
+        // whenever EITHER is visible, not just when both/status alone is.
+        assert!(
+            ChromeLayout::of(Mode::Normal, false, false, 5, 80, 0).search_summary_visible(),
+            "status visible, no gutter (empty file): still relevant via status"
+        );
+        assert!(
+            ChromeLayout::of(Mode::Normal, false, true, 5, 80, 1).search_summary_visible(),
+            "a Notice hides the status segment, but the gutter (nonzero size) stays visible"
+        );
+        assert!(
+            !ChromeLayout::of(Mode::Normal, false, true, 5, 80, 0).search_summary_visible(),
+            "a Notice hides status AND an empty file has no gutter: genuinely nothing to wake for"
+        );
+        assert!(
+            ChromeLayout::of(Mode::Normal, false, false, 5, 80, 1).search_summary_visible(),
+            "both visible at once: trivially true"
+        );
     }
     #[test]
     fn wheel_nav_navigates_only_in_normal_mode() {
         // the wheel bypasses handle_key's router entirely, so this is the
         // only place mode ever gates it — see wheel_nav's own doc comment
         // for why Command/Help need a true no-op, not just a withheld nav.
-        for mode in [Mode::Normal, Mode::Command, Mode::Help] {
+        // `wheel_nav` never inspects `CommandKind` (only "is this Normal or
+        // not"), so one representative Command variant is enough here.
+        for mode in [Mode::Normal, Mode::Command(CommandKind::Colon), Mode::Help] {
             let down = wheel_nav(mode, MouseEventKind::ScrollDown);
             let up = wheel_nav(mode, MouseEventKind::ScrollUp);
             if mode == Mode::Normal {
@@ -1280,7 +1795,7 @@ mod tests {
     }
     #[test]
     fn wheel_nav_ignores_non_scroll_mouse_events_in_every_mode() {
-        for mode in [Mode::Normal, Mode::Command, Mode::Help] {
+        for mode in [Mode::Normal, Mode::Command(CommandKind::Colon), Mode::Help] {
             for kind in [
                 MouseEventKind::Moved,
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -1305,12 +1820,13 @@ mod tests {
         let app = App::new();
         let view = ress_core::document::ViewportRender {
             rows: vec!["ab".to_string()],
+            marks: vec![ress_core::document::RowMarks::default()],
         };
         // cols=1: has_gutter needs cols>=2, so no gutter at all — the lone
         // column must show the viewport's own content.
         let area = Rect::new(0, 0, 1, 3);
         let mut buf = ratatui::buffer::Buffer::empty(area);
-        paint_frame(area, &mut buf, &view, &app, None, None, 100);
+        paint_frame(area, &mut buf, &view, &app, None, None, 100, None);
         assert_eq!(
             buf[(0, 0)].symbol(),
             "a",
@@ -1321,7 +1837,7 @@ mod tests {
         // room for it, both decided from this same, single `area`.
         let area2 = Rect::new(0, 0, 2, 3);
         let mut buf2 = ratatui::buffer::Buffer::empty(area2);
-        paint_frame(area2, &mut buf2, &view, &app, None, None, 100);
+        paint_frame(area2, &mut buf2, &view, &app, None, None, 100, None);
         assert_eq!(
             buf2[(0, 0)].symbol(),
             "a",
@@ -1343,6 +1859,7 @@ mod tests {
         let app = App::new();
         let view = ress_core::document::ViewportRender {
             rows: vec!["only line".to_string()],
+            marks: vec![ress_core::document::RowMarks::default()],
         };
         let area = Rect::new(0, 0, 20, 1);
         let mut buf = ratatui::buffer::Buffer::empty(area);
@@ -1354,6 +1871,7 @@ mod tests {
             None,
             Some("must never show"),
             100,
+            None,
         );
         let row: String = (0..20).map(|x| buf[(x, 0)].symbol().to_string()).collect();
         assert!(
@@ -1362,12 +1880,92 @@ mod tests {
         );
     }
     #[test]
+    fn paint_frame_threads_search_buckets_into_scrollbar_ticks() {
+        // the call-site wiring: paint_frame must turn whatever buckets draw threads through into
+        // actual per-row ticks against ITS OWN live content_area height (never a count the caller
+        // might have computed against a since-resized area) before handing them to
+        // render_scrollbar.
+        let app = App::new();
+        let view = ress_core::document::ViewportRender {
+            rows: vec!["x".to_string()],
+            marks: vec![ress_core::document::RowMarks::default()],
+        };
+        // rows=5 -> chrome_rows(5) == 2 -> content_area height 3, distinct from the raw 5 so a
+        // bug threading area.height instead of content_area.height into tick_rows would show up
+        // as a wrongly-placed (or missing) tick rather than passing by accident.
+        let area = Rect::new(0, 0, 10, 5);
+        let mut buckets = [0u16; 1024];
+        buckets[1023] = 1; // last bucket, [1023,1024) of a 1024-byte file
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        paint_frame(
+            area,
+            &mut buf,
+            &view,
+            &app,
+            None,
+            None,
+            1024,
+            Some(&buckets),
+        );
+        // 3 content rows over 1024 bytes: row 2 spans [682,1024) and so covers byte 1023 -- the
+        // anchor is 0 (App::new()'s default top), so the thumb sits at row 0 and cannot mask it.
+        assert_eq!(
+            buf[(9, 2)].symbol(),
+            "·",
+            "the last content row must carry the tick for the last bucket"
+        );
+        assert_eq!(buf[(9, 0)].symbol(), "█", "the thumb still sits at row 0");
+    }
+    fn search_summary(generation: u64, buckets: [u16; 1024]) -> ress_core::search::SearchSummary {
+        ress_core::search::SearchSummary {
+            generation,
+            matches: 0,
+            buckets: std::sync::Arc::new(buckets),
+            scanned_up_to: 0,
+            done: false,
+            failed: false,
+        }
+    }
+    #[test]
+    fn gated_search_buckets_is_none_without_an_active_search() {
+        let summary = search_summary(1, [1u16; 1024]);
+        assert_eq!(gated_search_buckets(None, &summary), None);
+    }
+    #[test]
+    fn gated_search_buckets_returns_the_buckets_when_generations_match() {
+        let pattern = std::sync::Arc::new(SearchPattern::compile("needle", false).unwrap());
+        let search = ActiveSearch {
+            pattern,
+            generation: 3,
+            current: None,
+        };
+        let summary = search_summary(3, [7u16; 1024]);
+        assert_eq!(
+            gated_search_buckets(Some(&search), &summary),
+            Some(std::sync::Arc::new([7u16; 1024]))
+        );
+    }
+    #[test]
+    fn gated_search_buckets_is_none_on_generation_mismatch() {
+        // a snapshot left over from a SUPERSEDED sweep must never be mistaken for describing the
+        // current pattern -- mirrors search_status_suffix_is_none_on_generation_mismatch
+        // (render.rs), the status line's own identical guard.
+        let pattern = std::sync::Arc::new(SearchPattern::compile("needle", false).unwrap());
+        let search = ActiveSearch {
+            pattern,
+            generation: 2,
+            current: None,
+        };
+        let summary = search_summary(1, [9u16; 1024]);
+        assert_eq!(gated_search_buckets(Some(&search), &summary), None);
+    }
+    #[test]
     fn chrome_layout_overlay_needs_at_least_five_columns() {
         // rows=7 alone already satisfies the row half of the bound (an
         // interior height of at least one), so only the cols dimension is
         // under test here.
-        assert!(!ChromeLayout::of(Mode::Help, false, 7, 4, 0).overlay);
-        assert!(ChromeLayout::of(Mode::Help, false, 7, 5, 0).overlay);
+        assert!(!ChromeLayout::of(Mode::Help, false, false, 7, 4, 0).overlay);
+        assert!(ChromeLayout::of(Mode::Help, false, false, 7, 5, 0).overlay);
     }
     #[test]
     fn chrome_layout_can_enter_normal_at_any_size() {
@@ -1376,10 +1974,28 @@ mod tests {
     }
     #[test]
     fn chrome_layout_can_enter_command_needs_a_bottom_row_and_three_columns() {
-        assert!(!ChromeLayout::can_enter(Mode::Command, 1, u16::MAX));
-        assert!(!ChromeLayout::can_enter(Mode::Command, 2, 0));
-        assert!(!ChromeLayout::can_enter(Mode::Command, 2, 2));
-        assert!(ChromeLayout::can_enter(Mode::Command, 2, 3));
+        // one shared floor for every `CommandKind` — pinned with `Colon` here;
+        // `search_mode_respects_the_same_size_floor_as_colon` pins the `/`/`?` parity directly.
+        assert!(!ChromeLayout::can_enter(
+            Mode::Command(CommandKind::Colon),
+            1,
+            u16::MAX
+        ));
+        assert!(!ChromeLayout::can_enter(
+            Mode::Command(CommandKind::Colon),
+            2,
+            0
+        ));
+        assert!(!ChromeLayout::can_enter(
+            Mode::Command(CommandKind::Colon),
+            2,
+            2
+        ));
+        assert!(ChromeLayout::can_enter(
+            Mode::Command(CommandKind::Colon),
+            2,
+            3
+        ));
     }
     #[test]
     fn chrome_layout_can_enter_help_matches_the_overlay_bound_in_both_dimensions() {
@@ -1396,7 +2012,7 @@ mod tests {
         // routing into handle_key_command's dead key table.
         let mut app = App::new();
         assert_eq!(app.handle_key(key(':'), 2, AMPLE), Action::Redraw);
-        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.mode, Mode::Command(CommandKind::Colon));
         assert_eq!(
             app.handle_key(key('j'), 1, AMPLE),
             Action::Nav(Nav::Lines(1))
@@ -1409,7 +2025,7 @@ mod tests {
         // App::new() default throughout.
         let mut app = App::new();
         assert_eq!(app.handle_key(key(':'), AMPLE, 3), Action::Redraw);
-        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.mode, Mode::Command(CommandKind::Colon));
         assert_eq!(
             app.handle_key(key('j'), AMPLE, 2),
             Action::Nav(Nav::Lines(1))
@@ -1707,7 +2323,7 @@ mod tests {
     fn colon_enters_command_mode() {
         let mut app = App::new();
         assert_eq!(app.handle_key(key(':'), AMPLE, AMPLE), Action::Redraw);
-        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.mode, Mode::Command(CommandKind::Colon));
     }
     #[test]
     fn colon_is_a_no_op_without_a_bottom_chrome_row() {
@@ -1725,7 +2341,7 @@ mod tests {
         // chrome_rows(2) == 1: the smallest size with a bottom row at all.
         let mut app = App::new();
         assert_eq!(app.handle_key(key(':'), 2, AMPLE), Action::Redraw);
-        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.mode, Mode::Command(CommandKind::Colon));
     }
     #[test]
     fn colon_is_a_no_op_below_three_columns() {
@@ -1747,7 +2363,7 @@ mod tests {
             assert_eq!(app.mode, Mode::Normal, "cols={cols}");
         }
         assert_eq!(app.handle_key(key(':'), AMPLE, 3), Action::Redraw);
-        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.mode, Mode::Command(CommandKind::Colon));
     }
     #[test]
     fn colon_too_small_is_a_true_no_op_and_preserves_a_pending_count() {
@@ -2029,7 +2645,7 @@ mod tests {
             Action::None
         );
         assert_eq!(app.command_buffer(), "");
-        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.mode, Mode::Command(CommandKind::Colon));
     }
     #[test]
     fn command_ignores_ctrl_digit() {
@@ -2039,6 +2655,439 @@ mod tests {
         app.handle_key(key(':'), AMPLE, AMPLE);
         assert_eq!(app.handle_key(ctrl('5'), AMPLE, AMPLE), Action::None);
         assert_eq!(app.command_buffer(), "");
+    }
+    #[test]
+    fn command_kind_colon_still_parses_digits_only() {
+        // regression: introducing CommandKind must not change Colon's own grammar one bit.
+        let mut app = App::new();
+        app.handle_key(key(':'), AMPLE, AMPLE);
+        assert_eq!(app.mode, Mode::Command(CommandKind::Colon));
+        assert_eq!(app.handle_key(key('x'), AMPLE, AMPLE), Action::None);
+        assert_eq!(
+            app.command_buffer(),
+            "",
+            "non-digit chars are still rejected in Colon mode"
+        );
+        app.handle_key(key('4'), AMPLE, AMPLE);
+        app.handle_key(key('2'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                AMPLE,
+                AMPLE
+            ),
+            Action::Nav(Nav::Line(42))
+        );
+    }
+    // ---- search input mode: `/` `?` `n` `N` (search v1, task 6) ----
+    #[test]
+    fn slash_enters_search_mode_and_question_mark_enters_backward() {
+        let mut app = App::new();
+        assert_eq!(app.handle_key(key('/'), AMPLE, AMPLE), Action::Redraw);
+        assert_eq!(
+            app.mode,
+            Mode::Command(CommandKind::Search { backward: false })
+        );
+        let mut app2 = App::new();
+        assert_eq!(app2.handle_key(key('?'), AMPLE, AMPLE), Action::Redraw);
+        assert_eq!(
+            app2.mode,
+            Mode::Command(CommandKind::Search { backward: true })
+        );
+    }
+    #[test]
+    fn search_mode_accepts_arbitrary_printable_chars_and_backspace() {
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        assert_eq!(app.handle_key(key('a'), AMPLE, AMPLE), Action::Redraw);
+        assert_eq!(app.handle_key(key('.'), AMPLE, AMPLE), Action::Redraw);
+        assert_eq!(app.handle_key(key('*'), AMPLE, AMPLE), Action::Redraw);
+        assert_eq!(
+            app.command_buffer(),
+            "a.*",
+            "regex metacharacters and digits are ordinary buffer chars here, unlike Colon's grammar"
+        );
+        assert_eq!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                AMPLE,
+                AMPLE
+            ),
+            Action::Redraw
+        );
+        assert_eq!(app.command_buffer(), "a.");
+    }
+    #[test]
+    fn search_mode_q_is_an_ordinary_character_not_a_quit_key() {
+        // "q stays quit in Normal only": inside Search input, typing 'q' as part of a pattern
+        // must push it into the buffer, not quit the pager.
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        assert_eq!(app.handle_key(key('q'), AMPLE, AMPLE), Action::Redraw);
+        assert_eq!(app.command_buffer(), "q");
+        assert_eq!(
+            app.mode,
+            Mode::Command(CommandKind::Search { backward: false }),
+            "must still be composing the search, not quit"
+        );
+    }
+    #[test]
+    fn search_mode_backspace_on_an_empty_buffer_repaints_nothing() {
+        // the same None-family member Colon's own backspace-on-empty has.
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                AMPLE,
+                AMPLE
+            ),
+            Action::None
+        );
+        assert_eq!(app.command_buffer(), "");
+        assert_eq!(
+            app.mode,
+            Mode::Command(CommandKind::Search { backward: false })
+        );
+    }
+    #[test]
+    fn search_mode_rejects_control_chars() {
+        // defensive: a real terminal never delivers a control-char `c` through KeyCode::Char at
+        // all (raw-mode decoding maps those bytes to their own dedicated KeyCodes, or to
+        // Char(<letter>) + CONTROL) -- this pins the guard against synthetic/pasted input anyway.
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        let bel = KeyEvent::new(KeyCode::Char('\u{7}'), KeyModifiers::NONE);
+        assert_eq!(app.handle_key(bel, AMPLE, AMPLE), Action::None);
+        assert_eq!(app.command_buffer(), "");
+    }
+    #[test]
+    fn search_mode_ctrl_j_commits_like_enter_not_a_stray_j() {
+        // issue #30's ICRNL-then-raw-mode-misparse mechanism is mode-agnostic (see Colon's own
+        // alias arm's doc comment): a `/pattern<CR>` typed before first paint gets its Enter
+        // delivered as Ctrl+J exactly like a `:N<CR>` would. Worse than Colon's merely-stuck-
+        // buffer symptom, an unguarded push arm here would silently splice a stray 'j' into the
+        // pattern with no visible sign anything went wrong -- Ctrl+J must commit, like Enter.
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        app.handle_key(key('a'), AMPLE, AMPLE);
+        app.handle_key(key('b'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(ctrl('j'), AMPLE, AMPLE),
+            Action::CommitSearch {
+                raw: "ab".to_string(),
+                backward: false,
+            }
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.command_buffer(), "", "the buffer resets once committed");
+    }
+    #[test]
+    fn search_mode_other_ctrl_chords_do_not_touch_the_buffer() {
+        // a general guard, not a Ctrl+J special case: NO ctrl-modified char is ever pattern
+        // text, mirroring Colon's own digit arm's ctrl guard ("Ctrl+digit is not a digit").
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        app.handle_key(key('a'), AMPLE, AMPLE);
+        assert_eq!(app.handle_key(ctrl('a'), AMPLE, AMPLE), Action::None);
+        assert_eq!(
+            app.command_buffer(),
+            "a",
+            "unchanged -- Ctrl+a must not push 'a' into the pattern"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Command(CommandKind::Search { backward: false }),
+            "still composing, not committed or cancelled"
+        );
+    }
+    #[test]
+    fn search_mode_esc_cancels_clearing_the_buffer() {
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        app.handle_key(key('a'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                AMPLE,
+                AMPLE
+            ),
+            Action::Redraw
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.command_buffer(), "");
+    }
+    #[test]
+    fn search_enter_with_empty_buffer_just_closes() {
+        // mirrors Colon's own empty-Enter cancel: no Action::CommitSearch for a search nobody
+        // actually typed.
+        let mut app = App::new();
+        app.handle_key(key('/'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                AMPLE,
+                AMPLE
+            ),
+            Action::Redraw
+        );
+        assert_eq!(app.mode, Mode::Normal);
+    }
+    #[test]
+    fn search_enter_with_text_commits() {
+        let mut app = App::new();
+        app.handle_key(key('?'), AMPLE, AMPLE);
+        app.handle_key(key('a'), AMPLE, AMPLE);
+        app.handle_key(key('b'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                AMPLE,
+                AMPLE
+            ),
+            Action::CommitSearch {
+                raw: "ab".to_string(),
+                backward: true,
+            }
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.command_buffer(), "", "the buffer resets once committed");
+    }
+    #[test]
+    fn search_mode_respects_the_same_size_floor_as_colon() {
+        // chrome-gate parity: `/`/`?` share `:`'s exact cols >= 3 floor, refused identically
+        // below it and entering identically at it.
+        let mut app = App::new();
+        assert_eq!(app.handle_key(key('/'), AMPLE, 2), Action::None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.handle_key(key('?'), AMPLE, 2), Action::None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.handle_key(key('/'), AMPLE, 3), Action::Redraw);
+        assert_eq!(
+            app.mode,
+            Mode::Command(CommandKind::Search { backward: false })
+        );
+        // `?` gets the identical floor treatment -- pinned on its own fresh App (the shared
+        // `app` above already left Normal mode) so the "parity" this test's name promises
+        // covers the SUCCEEDS-at-3 half too, not just the refused-at-2 half already above.
+        let mut app2 = App::new();
+        assert_eq!(app2.handle_key(key('?'), AMPLE, 2), Action::None);
+        assert_eq!(app2.mode, Mode::Normal);
+        assert_eq!(app2.handle_key(key('?'), AMPLE, 3), Action::Redraw);
+        assert_eq!(
+            app2.mode,
+            Mode::Command(CommandKind::Search { backward: true })
+        );
+    }
+    #[test]
+    fn any_key_clears_the_notice_first() {
+        let mut app = App::new();
+        app.notice = Some("pattern not found".to_string());
+        assert_eq!(
+            app.handle_key(key('j'), AMPLE, AMPLE),
+            Action::Nav(Nav::Lines(1)),
+            "the key that clears the notice still acts normally"
+        );
+        assert_eq!(app.notice, None);
+    }
+    #[test]
+    fn n_maps_to_search_next_and_capital_n_maps_to_search_prev() {
+        // handle_key's own mapping is search-blind: it returns the Nav variant regardless of
+        // whether `app.search` is set at all -- that check, and the direction algebra, are both
+        // apply-time concerns (see `search_direction_algebra_repeats_for_n_and_flips_for_capital_n`
+        // and `n_and_n_without_a_search_are_notice_no_ops`, below).
+        assert_eq!(
+            App::new().handle_key(key('n'), AMPLE, AMPLE),
+            Action::Nav(Nav::SearchNext)
+        );
+        assert_eq!(
+            App::new().handle_key(key('N'), AMPLE, AMPLE),
+            Action::Nav(Nav::SearchPrev)
+        );
+    }
+    #[test]
+    fn n_consumes_a_pending_count_like_other_non_count_motions() {
+        let mut app = App::new();
+        app.handle_key(key('5'), AMPLE, AMPLE);
+        assert_eq!(
+            app.handle_key(key('n'), AMPLE, AMPLE),
+            Action::Nav(Nav::SearchNext)
+        );
+        assert_eq!(
+            app.handle_key(key('j'), AMPLE, AMPLE),
+            Action::Nav(Nav::Lines(1)),
+            "the count must not have survived onto the next motion"
+        );
+    }
+    #[test]
+    fn search_direction_algebra_repeats_for_n_and_flips_for_capital_n() {
+        // vim's algebra: `n` repeats the ORIGINAL search's own direction; `N` reverses it --
+        // pinned directly against the pure formula, both pattern directions, independent of
+        // Document/apply_nav.
+        // pattern from `/` (backward=false): n stays forward, N flips backward.
+        assert!(effective_search_forward(false, Nav::SearchNext));
+        assert!(!effective_search_forward(false, Nav::SearchPrev));
+        // pattern from `?` (backward=true): n stays backward, N flips forward.
+        assert!(!effective_search_forward(true, Nav::SearchNext));
+        assert!(effective_search_forward(true, Nav::SearchPrev));
+    }
+    #[test]
+    fn last_notice_line_extracts_the_reason_not_the_generic_header() {
+        // batch 3 (2026-07-23), finding #13b: regex's own pretty multi-line parse errors put
+        // the actual reason on their LAST line, not the first ("regex parse error:", useless on
+        // its own) -- pinned against three real error shapes, the third exercising #8's own
+        // unicode(false) ruling directly (a `\p{L}` class needs an explicit `(?u)` opt-in or
+        // fails to compile at all under it).
+        // `.err().unwrap()`, not `.unwrap_err()`: `SearchPattern` (the `Ok` type) has no `Debug`
+        // impl, which `Result::unwrap_err` needs (to print it if the result were actually
+        // `Ok`) but `Option::unwrap` (after `.err()` converts away the `Ok` side entirely) does
+        // not.
+        let unclosed_group = SearchPattern::compile("(", false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(last_notice_line(&unclosed_group), "error: unclosed group");
+        let unclosed_repetition = SearchPattern::compile("a{", false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            last_notice_line(&unclosed_repetition),
+            "error: unclosed counted repetition"
+        );
+        let unicode_class = SearchPattern::compile(r"\p{L}", false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            last_notice_line(&unicode_class),
+            "error: Unicode not allowed here"
+        );
+    }
+    #[tokio::test]
+    async fn n_and_n_without_a_search_are_notice_no_ops() {
+        let doc = nav_doc();
+        let mut app = App::new();
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::SearchNext, 10)
+            .await
+            .unwrap();
+        assert_eq!(app.notice.as_deref(), Some("no previous search"));
+        assert_eq!(
+            app.top,
+            Anchor::TOP,
+            "no search means no navigation happens"
+        );
+        app.notice = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::SearchPrev, 10)
+            .await
+            .unwrap();
+        assert_eq!(app.notice.as_deref(), Some("no previous search"));
+        assert_eq!(app.top, Anchor::TOP);
+    }
+    #[tokio::test]
+    async fn apply_nav_search_next_with_no_prior_match_starts_from_the_current_top() {
+        // no `current` yet -> forward origin is app.top.offset(), per apply_nav's own doc
+        // comment -- the common case, the very first jump after committing a search.
+        let data = b"xxx\nneedle\n".to_vec();
+        let src = std::sync::Arc::new(ress_core::source::MockSource::new(data));
+        let doc = Document::new(src, ress_core::Config::default());
+        let mut app = App::new();
+        let pattern = std::sync::Arc::new(SearchPattern::compile("needle", false).unwrap());
+        app.search = Some(ActiveSearch {
+            pattern,
+            generation: 1,
+            current: None,
+        });
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::SearchNext, 10)
+            .await
+            .unwrap();
+        assert_eq!(app.top.offset(), 4, "the line start of the only match");
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            Some(4),
+            "current updates to the byte offset of the match just found"
+        );
+    }
+    #[tokio::test]
+    async fn apply_nav_search_next_advances_past_the_current_match_without_a_self_hit() {
+        // forward origin = current + 1 (INCLUSIVE search_next origin): parked exactly on the
+        // first "needle" (byte 0), n must land on the SECOND one (byte 7), not re-find the first.
+        let data = b"needle\nneedle\n".to_vec();
+        let src = std::sync::Arc::new(ress_core::source::MockSource::new(data));
+        let doc = Document::new(src, ress_core::Config::default());
+        let mut app = App::new();
+        let pattern = std::sync::Arc::new(SearchPattern::compile("needle", false).unwrap());
+        app.search = Some(ActiveSearch {
+            pattern,
+            generation: 1,
+            current: Some(0),
+        });
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::SearchNext, 10)
+            .await
+            .unwrap();
+        assert_eq!(app.search.as_ref().unwrap().current, Some(7));
+        assert_eq!(app.top.offset(), 7);
+    }
+    #[tokio::test]
+    async fn apply_nav_search_prev_after_a_backward_pattern_finds_the_earlier_match_without_a_self_hit()
+     {
+        // mirrors document.rs's own search_next_backward_self_hit_finds_the_earlier_match_instead
+        // fixture and origin (11) exactly: backward origin = current UNADJUSTED (no `- 1`) --
+        // search_next's own EXCLUSIVE `hi` bound is what skips the self-hit, not arithmetic here.
+        // `?` (pattern.backward = true) + Nav::SearchNext ("n") = effective backward, per the
+        // algebra (n repeats the original search's own direction).
+        let data = b"needle\nxxx\nneedle\n".to_vec();
+        let src = std::sync::Arc::new(ress_core::source::MockSource::new(data));
+        let doc = Document::new(src, ress_core::Config::default());
+        let mut app = App::new();
+        let pattern = std::sync::Arc::new(SearchPattern::compile("needle", true).unwrap());
+        app.search = Some(ActiveSearch {
+            pattern,
+            generation: 1,
+            current: Some(11),
+        });
+        let mut pending = None;
+        apply_nav(&doc, &mut app, &mut pending, Nav::SearchNext, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            Some(0),
+            "must skip the match AT current (11), landing on the earlier one"
+        );
+        assert_eq!(app.top.offset(), 0);
+    }
+    #[tokio::test]
+    async fn apply_outcome_found_match_also_updates_the_active_search_current() {
+        // apply_outcome is the shared consumer both apply_nav and the run loop's pending-
+        // completion arm call -- this pins its OWN mutation of `search.current` directly,
+        // independent of either caller.
+        let doc = nav_doc();
+        let anchor = some_anchor(&doc).await;
+        let mut app = App::new();
+        let pattern = std::sync::Arc::new(SearchPattern::compile("x", false).unwrap());
+        app.search = Some(ActiveSearch {
+            pattern,
+            generation: 3,
+            current: Some(1),
+        });
+        apply_outcome(
+            &mut app,
+            NavOutcome::FoundMatch {
+                top: anchor,
+                match_at: 99,
+                wrapped: false,
+            },
+        );
+        assert_eq!(app.search.as_ref().unwrap().current, Some(99));
+        assert_eq!(
+            app.search.as_ref().unwrap().generation,
+            3,
+            "generation is untouched by an outcome"
+        );
     }
     #[test]
     fn f1_enters_help_and_any_key_leaves() {
@@ -2345,6 +3394,104 @@ mod tests {
             .unwrap();
         assert_eq!(app.hscroll.columns(), 0);
     }
+    /// A real, non-TOP anchor via actual navigation. `Anchor`'s constructor
+    /// is crate-private to ress-core by design (only `Document` navigation
+    /// or `Anchor::TOP` can produce one — see its own doc comment), so these
+    /// tests get a genuine anchor the same way production code does: nav_doc's
+    /// tiny fixture makes scroll_lines resolve synchronously, well within the
+    /// default 8 MiB nav budget, so the `else` branch below is unreachable in
+    /// practice and exists only as a diagnostic guard.
+    async fn some_anchor(doc: &Document) -> Anchor {
+        let Resolution::Ready(NavOutcome::At(a)) = doc.scroll_lines(Anchor::TOP, 1).await.unwrap()
+        else {
+            panic!("nav_doc's tiny fixture always resolves synchronously to At");
+        };
+        a
+    }
+    // `apply_outcome` is the shared consumer both `apply_nav` (interactive)
+    // and the run loop's pending-completion arm call — these pin its own
+    // mutation logic directly, independent of either caller, so a future
+    // divergence between the two call sites would show up here first.
+    /// A minimal `ActiveSearch` for seeding `app.search` in the `apply_outcome` tests below --
+    /// pattern content is irrelevant to `apply_outcome` itself (it never inspects it), only
+    /// `current`'s own before/after value matters.
+    fn some_search(current: Option<u64>) -> ActiveSearch {
+        ActiveSearch {
+            pattern: std::sync::Arc::new(SearchPattern::compile("x", false).unwrap()),
+            generation: 1,
+            current,
+        }
+    }
+    #[tokio::test]
+    async fn apply_outcome_at_sets_the_anchor_and_touches_nothing_else() {
+        let doc = nav_doc();
+        let anchor = some_anchor(&doc).await;
+        let mut app = App::new();
+        app.search = Some(some_search(Some(5)));
+        apply_outcome(&mut app, NavOutcome::At(anchor));
+        assert_eq!(app.top, anchor);
+        assert_eq!(app.notice, None);
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            Some(5),
+            "At does not touch an active search's own current match"
+        );
+    }
+    #[tokio::test]
+    async fn apply_outcome_found_match_sets_top_and_search_current_without_a_notice() {
+        let doc = nav_doc();
+        let anchor = some_anchor(&doc).await;
+        let mut app = App::new();
+        app.search = Some(some_search(None));
+        apply_outcome(
+            &mut app,
+            NavOutcome::FoundMatch {
+                top: anchor,
+                match_at: 7,
+                wrapped: false,
+            },
+        );
+        assert_eq!(app.top, anchor);
+        assert_eq!(app.search.as_ref().unwrap().current, Some(7));
+        assert_eq!(
+            app.notice, None,
+            "an unwrapped jump must not raise a notice"
+        );
+    }
+    #[tokio::test]
+    async fn apply_outcome_found_match_wrapped_also_sets_the_wrap_notice() {
+        let doc = nav_doc();
+        let anchor = some_anchor(&doc).await;
+        let mut app = App::new();
+        app.search = Some(some_search(None));
+        apply_outcome(
+            &mut app,
+            NavOutcome::FoundMatch {
+                top: anchor,
+                match_at: 9,
+                wrapped: true,
+            },
+        );
+        assert_eq!(app.top, anchor);
+        assert_eq!(app.search.as_ref().unwrap().current, Some(9));
+        assert_eq!(app.notice.as_deref(), Some("search wrapped"));
+    }
+    #[tokio::test]
+    async fn apply_outcome_exhausted_sets_the_notice_and_leaves_the_anchor() {
+        let doc = nav_doc();
+        let anchor = some_anchor(&doc).await;
+        let mut app = App::new();
+        app.top = anchor;
+        app.search = Some(some_search(Some(3)));
+        apply_outcome(&mut app, NavOutcome::Exhausted);
+        assert_eq!(app.top, anchor, "the anchor never moves on Exhausted");
+        assert_eq!(app.notice.as_deref(), Some("pattern not found"));
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            Some(3),
+            "Exhausted does not touch an active search's own current match"
+        );
+    }
     #[tokio::test]
     async fn new_motion_supersedes_a_pending_operation() {
         let mut data = Vec::new();
@@ -2430,7 +3577,9 @@ mod tests {
             .unwrap();
         let mut active = pending.take().expect("resize must re-pend the same intent");
         assert!(matches!(active.nav, Nav::Bottom));
-        let a = (&mut active.p.handle).await.unwrap().unwrap();
+        let NavOutcome::At(a) = (&mut active.p.handle).await.unwrap().unwrap() else {
+            panic!("plain navigation always resolves At");
+        };
         assert_eq!(a.offset(), 196);
     }
     #[tokio::test]
@@ -2461,7 +3610,9 @@ mod tests {
         let mut active = pending.take().expect("a jump past the frontier must pend");
         assert!(matches!(active.nav, Nav::Line(3500)));
         assert_eq!(active.p.label, "jumping to line");
-        let a = (&mut active.p.handle).await.unwrap().unwrap();
+        let NavOutcome::At(a) = (&mut active.p.handle).await.unwrap().unwrap() else {
+            panic!("plain navigation always resolves At");
+        };
         assert_eq!(a.offset(), 34990);
     }
     // `ress_core::source::wait_for_count` is `pub(crate)` to that crate, invisible from here --

@@ -2,7 +2,7 @@
 
 A pager for huge files must never let one keypress — or one repaint — read
 an unbounded amount of data. `ress` enforces this structurally: the engine
-has exactly four read loops, they live in one module
+has exactly six read loops, they live in one module
 (`ress-core/src/scan.rs`), and each takes a **mandatory byte budget**. A
 scan without a bound cannot be written, which is the point — early
 revisions had five hand-rolled read loops, and "each loop manages its own
@@ -29,24 +29,42 @@ bound" reliably decayed into "some loops forgot."
   `[from, to)`; the window is captured once, at construction, like
   `BackwardScan`'s. Each `step` returns `Done(n)` (the whole window
   examined; `n` newlines found) or `More` to continue, reading each block
-  through `warm()` rather than `block()`. Unlike the other three, it never
-  becomes a spawned pending completion; its production consumer is the
-  status line's background worker instead (see "The status line's count
-  runs in the background", below), stepping it directly inside its own
-  loop — a background task can await a block a synchronous, per-draw call
-  never could.
+  through `warm()` rather than `block()`. Unlike `ForwardScan`/
+  `BackwardScan`, it never becomes a spawned pending completion; its
+  production consumer is the status line's background worker instead (see
+  "The status line's count runs in the background", below), stepping it
+  directly inside its own loop — a background task can await a block a
+  synchronous, per-draw call never could.
+- `SearchForward::new(pattern, from, limit, chunk)` — a resumable search
+  for the compiled `pattern`'s next match at or after `from`, bounded
+  above by the exclusive `limit`. Each `step` reads at most `chunk` bytes
+  and returns `Found { match_at, line_start }`, `End` (this leg is
+  exhausted with no match), or `More` to continue — see
+  [search](search.md) for the two-leg wrap policy `n`/`N` build on top of
+  this and `SearchBackward`, and for why a step can legitimately defer
+  returning `Found` past where a match first completes.
+- `SearchBackward::new(pattern, hi, limit, chunk)` — the mirror image: a
+  resumable search for `pattern`'s nearest match before `hi`, bounded
+  below by the inclusive `limit` (the two search scans' `limit` bounds are
+  asymmetric — one exclusive, one inclusive — by construction; a caller
+  composing a wrap-around search across both must account for that one
+  byte). Same `step` outcomes as `SearchForward`.
 
-`ForwardScan` and `BackwardScan` are the engine's only navigation read
-loops, and the cursor lives inside the object rather than being handed back
-to the caller as a value — an interactive attempt and the pending
-continuation it falls back to are literally the same scan, stepped further,
-never a fresh scan re-derived from a resume cursor. All navigation
+`ForwardScan` and `BackwardScan` are the engine's line-position navigation
+read loops — search navigation (`n`/`N`) is built the same way but on its
+own pair, `SearchForward`/`SearchBackward` (see [search](search.md)),
+resuming toward a match rather than a line count. Either pair's cursor
+lives inside the object rather than being handed back to the caller as a
+value — an interactive attempt and the pending continuation it falls back
+to are literally the same scan, stepped further, never a fresh scan
+re-derived from a resume cursor. All line-position navigation
 (`scroll_lines`, `goto_end`, `goto_percent`, `goto_line`) and the viewport
-itself compose `fill_lines` and these two scans; `goto_line` additionally
-consults the background line index to pick its scan's starting checkpoint
-(see "Line index lookups reuse `ForwardScan`" below). Outcomes are explicit
-enums — a caller must decide what `More` means for its operation; there is
-no silent fallthrough.
+itself compose `fill_lines` and the `ForwardScan`/`BackwardScan` pair;
+`goto_line` additionally consults the background line index to pick its
+scan's starting checkpoint (see "Line index lookups reuse `ForwardScan`"
+below). Outcomes are explicit enums for every scan here — a caller must
+decide what `More` means for its operation; there is no silent
+fallthrough.
 
 ## The budget contract is block-granular
 
@@ -123,7 +141,7 @@ past EOF.
 
 The status line's current-line query used to run on `draw`'s own call
 stack every frame, which meant it could never await source I/O the way
-the other three scans do — a draw that stalled on a cold read would
+the other five scans do — a draw that stalled on a cold read would
 defeat the pager's whole first-paint guarantee. `StatusWorker` (see
 [architecture](architecture.md)) sidesteps the constraint instead of
 working around it on the same call stack: it is a separate background

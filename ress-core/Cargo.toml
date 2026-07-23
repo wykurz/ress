@@ -11,12 +11,13 @@ bytes.workspace = true
 async-trait.workspace = true
 lru.workspace = true
 memchr = "2.7"
+regex.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 tracing.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = "3.13"
 proptest.workspace = true
 criterion = { version = "0.5", features = ["async_tokio"] }
