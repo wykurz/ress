@@ -1,12 +1,14 @@
 # Concurrency
 
-`ress` runs three independent background computations alongside the
+`ress` runs four independent background computations alongside the
 interactive event loop: indexing a file's line structure, answering the
-status line's current-line query, and completing a navigation that outran
-its interactive budget. All three are built to one shape, described here
-once rather than separately for each: one task, owned outright by whoever
-needs its answer, consuming immutable inputs and publishing immutable
-snapshots — never shared mutable state that two sides reach into.
+status line's current-line query, completing a navigation that outran its
+interactive budget, and sweeping a committed search pattern over the whole
+file for a running match count and density map. All four are built to one
+shape, described here once rather than separately for each: one task, owned
+outright by whoever needs its answer, consuming immutable inputs and
+publishing immutable snapshots — never shared mutable state that two sides
+reach into.
 
 ## The shape
 
@@ -30,11 +32,20 @@ itself owns.
   care about through one `watch` channel and read the worker's answer — a
   small, `Copy` snapshot — from another, with no `Mutex` at all, since the
   whole answer fits in the channel's own value.
+- **The search sweep** (`SweepAnalysis`, driven by `crate::analyzer::spawn` —
+  a generic background-analysis loop generalized out of the status worker's
+  own shape, `ress-core/src/search.rs`) enumerates every match of a
+  committed search pattern over the whole file, publishing a bounded
+  `SearchSummary` — a running match count, a fixed-size density histogram,
+  how far it has gotten — after each bounded unit of work. Like the status
+  worker, it has both an inbound channel (a fresh committed search
+  supersedes whatever pattern it was counting) and an outbound one
+  publishing its answer; see [search](search.md) for the full model.
 - **Pending navigation** (`PendingNav`, `ress-core/src/resolve.rs`, owned by
   the run loop's own slot in `ress/src/app.rs`) is spawned fresh for one
   navigation that could not finish inside its interactive budget,
   publishing bytes-scanned progress and resolving to the final anchor.
-  Unlike the two document-lifetime workers above, it answers exactly one
+  Unlike the three document-lifetime workers above, it answers exactly one
   question and is then done: there is no inbound channel to re-target it,
   because a superseding motion drops it and spawns a new one instead.
 
@@ -47,8 +58,8 @@ live in one `TaskOwner` (a thin `JoinSet` wrapper kept only for
 `JoinSet`'s own cancel-on-drop `Drop`) the `Prefetcher` holds, so dropping
 the `Prefetcher` — which happens exactly when its `Document` does — drops
 that `TaskOwner`, aborting every handle its `JoinSet` holds, the same
-cancel-on-drop guarantee as the three background computations above — with
-the same one blocking-read exception those three tasks share too (see
+cancel-on-drop guarantee as the four background computations above — with
+the same one blocking-read exception those four tasks share too (see
 [prefetch](prefetch.md)'s own Cancellation section for the full
 three-layer account and its `FILL_CONCURRENCY` bound, not restated here).
 
@@ -108,8 +119,8 @@ task already published or will publish next.
 
 Every one of these background readers shares one more property with the
 block cache itself: it never distorts what the cache remembers about
-genuine interest. The index scan and the status worker's count both read
-through the cache's non-promoting path (`warm()`, see
+genuine interest. The index scan, the status worker's count, and the
+search sweep all read through the cache's non-promoting path (`warm()`, see
 [block cache](block_cache.md)) rather than the interactive one, so however
 large a background pass over the file gets, it cannot evict or reorder the
 working set a user has actually scrolled back to — promotion stays

@@ -23,6 +23,7 @@ unicode-width = "0.2"
 proptest = "1.6"
 lru = "0.12"
 vt100 = "0.16"
+regex = "1"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

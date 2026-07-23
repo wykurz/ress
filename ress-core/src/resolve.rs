@@ -3,10 +3,28 @@
 //! progress, instead of blocking the UI or silently degrading.
 use crate::document::Anchor;
 
+/// What a completed navigation produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavOutcome {
+    /// An ordinary navigation landed here.
+    At(Anchor),
+    /// A search jump landed: `top` is the line anchor, `match_at` the
+    /// match's own byte offset (the next search origin and the BOLD
+    /// highlight), `wrapped` whether the jump passed an end to get there.
+    FoundMatch {
+        top: Anchor,
+        match_at: u64,
+        wrapped: bool,
+    },
+    /// No answer exists anywhere -- search's "pattern not found"; the
+    /// anchor never moves. First consumer of the Exhausted terminal the
+    /// architecture doc reserved.
+    Exhausted,
+}
 /// The outcome of a navigation request.
 pub enum Resolution {
     /// Answered within the interactive budget.
-    Ready(Anchor),
+    Ready(NavOutcome),
     /// Scanning continues in the background; watch `progress`, await
     /// `handle`, or `cancel`.
     Pending(PendingNav),
@@ -33,8 +51,8 @@ pub struct PendingNav {
     pub label: &'static str,
     /// Progress updates, published once per scan chunk.
     pub progress: tokio::sync::watch::Receiver<Progress>,
-    /// Resolves to the final anchor; abort via `cancel`.
-    pub handle: tokio::task::JoinHandle<anyhow::Result<Anchor>>,
+    /// Resolves to the final outcome; abort via `cancel`.
+    pub handle: tokio::task::JoinHandle<anyhow::Result<NavOutcome>>,
 }
 impl PendingNav {
     /// Aborts the background scan; the anchor never moved.
@@ -45,21 +63,51 @@ impl PendingNav {
 #[cfg(test)]
 impl Resolution {
     /// Test helper: unwrap an in-budget result.
-    pub(crate) fn ready(self) -> Anchor {
+    pub(crate) fn ready(self) -> NavOutcome {
         match self {
-            Resolution::Ready(a) => a,
+            Resolution::Ready(o) => o,
             Resolution::Pending(_) => panic!("expected Ready, got Pending"),
         }
     }
-    /// Test helper: resolve fully, joining a pending scan.
+    /// Test helper: resolve fully, joining a pending scan. Callers here only
+    /// ever drive plain navigation (`At`), so this unwraps straight to
+    /// `Anchor` via `NavOutcome::at` rather than making every call site do
+    /// it -- a search test that needs `FoundMatch`/`Exhausted` directly
+    /// wants `join_outcome`, just below, instead.
     pub(crate) async fn join(self) -> Anchor {
         match self {
-            Resolution::Ready(a) => a,
+            Resolution::Ready(o) => o,
             Resolution::Pending(p) => p
                 .handle
                 .await
                 .expect("scan task panicked")
                 .expect("scan failed"),
+        }
+        .at()
+    }
+    /// Test helper: resolve fully, joining a pending scan, without
+    /// unwrapping to `Anchor` the way `join()` does -- search's own pending
+    /// tests need to inspect `FoundMatch`/`Exhausted` directly, which
+    /// `join()`'s `.at()` tail would panic on (by design: see `join()`'s own
+    /// doc comment). Identical to `join()` otherwise.
+    pub(crate) async fn join_outcome(self) -> NavOutcome {
+        match self {
+            Resolution::Ready(o) => o,
+            Resolution::Pending(p) => p
+                .handle
+                .await
+                .expect("scan task panicked")
+                .expect("scan failed"),
+        }
+    }
+}
+#[cfg(test)]
+impl NavOutcome {
+    /// Test helper: unwrap a plain navigation's anchor.
+    pub(crate) fn at(self) -> Anchor {
+        match self {
+            NavOutcome::At(a) => a,
+            other => panic!("expected NavOutcome::At, got {other:?}"),
         }
     }
 }

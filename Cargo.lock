@@ -1629,6 +1629,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-width",
  "vt100",
  "wait-timeout",
 ]
@@ -1644,6 +1645,7 @@ dependencies = [
  "lru 0.12.5",
  "memchr",
  "proptest",
+ "regex",
  "ress-filegen",
  "tempfile",
  "tokio",
