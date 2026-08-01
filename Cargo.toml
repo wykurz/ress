@@ -21,7 +21,7 @@ tokio = "1.41"
 tracing = "0.1"
 unicode-width = "0.2"
 proptest = "1.6"
-lru = "0.12"
+lru = "0.18"
 vt100 = "0.16"
 
 [workspace.lints.clippy]
