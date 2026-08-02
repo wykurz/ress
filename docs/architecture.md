@@ -47,44 +47,56 @@ background `StatusWorker` and covered in The status line, below.
 
 ## The event loop
 
-The binary runs a `tokio::select!` loop over five sources: crossterm's
+The binary runs a `tokio::select!` loop over six sources: crossterm's
 async event stream, the completion of a pending navigation scan, the
 background index's frontier advancing, the status worker's snapshots
-advancing (`ress_core::status`, see The status line, below), and a 100ms
-repaint tick that is always armed rather than only while something is
-pending. Key presses resolve through the pure `handle_key` state machine
-into `Nav` intents; an intent that resolves within its budget applies
-immediately, and one that cannot becomes the pending operation — the
-viewport stays put and a transient bottom-row indicator shows progress. A
-jump to the end that also has to walk up several rows runs that walk as a
-second stage with its own progress span, so the indicator is not one
-continuous climb across the whole operation.
+advancing (`ress_core::status`, see The status line, below), the search
+sweep's own `SearchSummary` snapshots advancing (see [search](search.md)),
+and a 100ms repaint tick that is always armed rather than only while
+something is pending. Key presses resolve through the pure `handle_key`
+state machine into an `Action`; a navigation key carries a `Nav` intent
+into `apply_nav` — one that resolves within its budget applies
+immediately, and one that cannot becomes the pending operation, the
+viewport staying put while a transient bottom-row indicator shows
+progress. Committing a search (Enter on a non-empty `/`/`?` buffer)
+resolves to `Action::CommitSearch` instead: the run loop, not
+`handle_key`, compiles the typed pattern where `Document` lives
+(`handle_key` itself stays IO- and regex-free) — a bad pattern surfaces as
+a one-line notice and nothing else happens; a good one starts the
+background sweep (`Document::start_search_sweep`) and feeds a
+`Nav::SearchNext` through that same `apply_nav` path to land the first
+match. A jump to the end that also has to walk up several rows runs that
+walk as a second stage with its own progress span, so the indicator is not
+one continuous climb across the whole operation.
 
-The frontier arm and the status arm keep the tick informed rather than
-drawing themselves: each raises a `dirty` flag when its background task
-has published something new, gated on the status line specifically being
-this frame's bottom-row occupant (`ChromeLayout::status_visible`) — not
-just a chrome row existing at all, since a row that exists but is
-currently showing the `:` command line instead has just as little to
-repaint for as a hidden one does. The tick — firing every 100ms
-unconditionally, dirty or not, pending or not — is the loop's sole point
-that turns a raised flag into a repaint, also redrawing while a
-navigation is pending, gated the same specific way
-(`ChromeLayout::progress_visible`): a pending nav's progress row is
-exactly as invisible when Command's line covers it as it is on a
-chromeless terminal. Every draw call site clears `dirty` itself
-immediately afterward; the two `watch` subscriptions are what re-arm it,
-not a signal threaded back
-through `draw`'s own return value — see [concurrency](concurrency.md) for
-why that coalescing stays correct with nothing more than a bool and a
-timer. A burst of index or status progress between two ticks still costs
-at most one extra repaint, and a document that is both idle (no pending
-navigation, no frontier or status movement) and fully resolved leaves the
-tick firing every 100ms but painting nothing.
+The frontier arm, the status arm, and the search-summary arm keep the tick
+informed rather than drawing themselves: each raises a `dirty` flag when
+its background task has published something new. The frontier and status
+arms gate on the status line specifically being this frame's bottom-row
+occupant (`ChromeLayout::status_visible`) — not just a chrome row existing
+at all, since a row that exists but is currently showing the `:` command
+line instead has just as little to repaint for as a hidden one does; the
+search-summary arm gates on the wider `ChromeLayout::search_summary_visible`
+instead, since a sweep tick can also move the scrollbar gutter's
+match-density ticks while the status segment itself stays covered by a
+notice or the command line. The tick — firing every 100ms unconditionally,
+dirty or not, pending or not — is the loop's sole point that turns a
+raised flag into a repaint, also redrawing while a navigation is pending,
+gated the same specific way (`ChromeLayout::progress_visible`): a pending
+nav's progress row is exactly as invisible when Command's line covers it
+as it is on a chromeless terminal. Every draw call site clears `dirty`
+itself immediately afterward; the three `watch` subscriptions are what
+re-arm it, not a signal threaded back through `draw`'s own return value —
+see [concurrency](concurrency.md) for why that coalescing stays correct
+with nothing more than a bool and a timer. A burst of index, status, or
+search-summary progress between two ticks still costs at most one extra
+repaint, and a document that is both idle (no pending navigation, no
+frontier, status, or search-summary movement) and fully resolved leaves
+the tick firing every 100ms but painting nothing.
 
 The pending slot holds its scan behind a cancel-on-drop guard (see
 [concurrency](concurrency.md) for the shape this and the other background
-tasks share, including the one blocking-read exception all four carry):
+tasks share, including the detached-fetch exception all four carry):
 `Esc`, a new motion superseding it, quitting, the event stream ending, and
 any error unwinding through the loop's `?` all drop the slot rather than
 detach the task, so every exit path aborts the scan at whichever ordinary
@@ -134,16 +146,26 @@ reads cancellable too is the planned Resolution-for-reads work.
 table, so a binding in one mode has no effect in another. `Help` is the
 simplest: any key at all closes it back to `Normal` without ever reaching
 `Normal`'s own table, which is why `q` pressed inside help cannot quit the
-pager — it just closes help, like any other key would. `Command` owns the
-`:N` line-jump prompt: digits accumulate into a buffer capped at 20
-characters (more than a `u64` line number can ever need), Backspace edits
-it, and Enter commits it as a `Nav::Line` — an all-digit buffer's only
-parse failure is overflow, and `goto_line`'s vim-style clamp already
-treats an overflowed value the same as a past-the-end line number, so
-there is no separate error path to render. Esc, or Enter on an empty
-buffer, cancels back to `Normal` instead. Every buffer edit repaints
-immediately, unlike `Normal`'s count prefix below: the buffer is on
-screen, so leaving an edit unpainted would freeze the row while
+pager — it just closes help, like any other key would. `Command` carries a
+payload, `CommandKind` (`Colon` or `Search { backward }`), that selects
+which of two grammars its one shared `command` buffer is read through —
+`:` enters `Colon`, `/` and `?` enter `Search` with `backward` set to
+which of the two was typed. `Colon` owns the `:N` line-jump prompt: digits
+accumulate into a buffer capped at 20 characters (more than a `u64` line
+number can ever need), Backspace edits it, and Enter commits it directly
+as a `Nav::Line` — an all-digit buffer's only parse failure is overflow,
+and `goto_line`'s vim-style clamp already treats an overflowed value the
+same as a past-the-end line number, so there is no separate error path to
+render. `Search` owns the `/`/`?` pattern prompt instead: the buffer holds
+arbitrary text rather than digits only, with no length cap of its own (a
+regex pattern isn't bounded the way a line number is), and Enter on a
+non-empty buffer commits it as `Action::CommitSearch` rather than a `Nav`
+directly, since compiling the typed text into a pattern needs `Document`
+— that step happens in the run loop, not here (see The event loop, above,
+and [search](search.md)). Esc, or Enter on an empty buffer, cancels back
+to `Normal` for either grammar, clearing the buffer. Every buffer edit
+repaints immediately, unlike `Normal`'s count prefix below: the buffer is
+on screen, so leaving an edit unpainted would freeze the row while
 keystrokes kept registering underneath it.
 
 The mouse wheel never reaches this router — `run`'s own event loop
@@ -189,10 +211,16 @@ when shown, is a persistent DIM row one above the bottom row, naming the
 current mode's own keys — a condensed cheat-sheet in `Normal`, the edit
 keys in `Command`, "any key closes" in `Help` — DIM rather than reversed
 so it reads as distinct chrome, not a second status line. The bottom row
-itself shows exactly one of three things, in precedence order: the `:`
-command line while `Command` is composing one, else the transient
-progress row while a navigation scan is pending (see
+itself shows exactly one of four things, in precedence order: the command
+line (`:`, `/`, or `?`, depending on `CommandKind`) while `Command` is
+composing one, else a one-line transient notice ("search wrapped",
+"pattern not found", a bad-pattern error) while `App.notice` holds one,
+else the transient progress row while a navigation scan is pending (see
 [budgeted scanning](budgeted_scanning.md)), else the status line (below).
+A notice outranks the progress row rather than the reverse specifically so
+a fresh search-error notice can never sit invisible behind an unrelated,
+already-running navigation's progress row — but still yields to
+`Command`, since composing a command stays uninterrupted either way.
 The help overlay paints last, over the content area only: `Clear` first,
 so no content already painted there bleeds through, then a bordered
 `Block` holding the keymap reference — both chrome rows stay visible
@@ -204,14 +232,17 @@ cols)` cedes a column only when there is a file to mark a position in
 (`size > 0`), a content row to draw it on (`rows > 0`), and a second
 column left over for text once the gutter's own is spoken for (`cols >=
 2`) — an empty file or a one-column terminal keeps the full width
-instead. The gutter itself is a DIM `│` track cell per row, plus one
-plain `█` cell marking where the viewport's top anchor falls,
-proportional to its byte offset through the file — a position marker, not
-a proportional-height thumb: the viewport's own byte span isn't cheaply
-known at render time, so sizing a thumb to it would need a second scan or
-a rough estimate presented as exact. Match-position ticks from a future
-search analyzer (see Seams for what comes next, below) are a more likely
-next addition to this gutter than a proportional-height thumb.
+instead. The gutter itself draws exactly one of three cells per row, the thumb
+checked first: a plain `█` cell marking where the viewport's top anchor
+falls, proportional to its byte offset through the file — a position
+marker, not a proportional-height thumb: the viewport's own byte span
+isn't cheaply known at render time, so sizing a thumb to it would need a
+second scan or a rough estimate presented as exact — else a DIM `·` on any
+row a live search's match density marks (`tick_rows`, mapping
+`SweepAnalysis`'s 1024-bucket histogram onto screen rows — see
+[search](search.md)), else a plain DIM `│` track cell. Search is no
+longer a future addition to this gutter (see Seams for what comes next,
+below): its background sweep is the ticks' own source today.
 
 ## The status line
 
@@ -320,12 +351,76 @@ arithmetic and implicit invariants kept producing edge-case bugs:
   navigation (or the `TOP` constant). Every anchor is a line start — offset
   0 or the byte after a newline, never at or past EOF — so the renderer
   never has to consider a mid-line viewport top.
+
+  **That is a property earned WHEN THE ANCHOR IS MINTED, against the size
+  snapshot taken at open, and a source that shrinks under the pager can
+  invalidate it afterwards** (batch 23 (2026-08-01) states what the flat
+  wording above left implicit). `PreadSource::size` is captured once and
+  never re-`stat`ed, so nothing in the type or in navigation re-validates a
+  live anchor: a file truncated below an anchor already on screen leaves
+  that anchor pointing past the real end. The renderer's answer is to render
+  nothing there — `fill_lines` reports `Budget` (it cannot prove where the
+  data stops, see [budgeted scanning](budgeted_scanning.md)) and the
+  viewport comes back with no rows rather than with fabricated ones.
+  Refusing to invent content is the correct half; **re-anchoring to the
+  discovered real end is a capability this crate does not yet have**, and
+  it belongs to navigation rather than to the renderer, which has no budget
+  to run the backward scan that finding the last real line start requires.
+  Until it exists, mid-session truncation blanks the viewport.
 - **`HScroll`** (horizontal scroll offset) clamps itself to `MAX_HSCROLL` at
   construction. No downstream arithmetic can see an unbounded column offset,
   which keeps the viewport's scan budget finite for any input.
-- **Scan budgets are mandatory parameters** of the scanner primitives — a
-  read loop without a bound cannot be written. See
+- **Scan budgets are mandatory parameters** of the scanner primitives — an
+  unbudgeted primitive scan cannot be written; the background passes are
+  bounded per step by structure instead. See
   [budgeted scanning](budgeted_scanning.md).
+- **`search::hay::Abs`/`Local`** (restructure R4, 2026-07-27) separate absolute file offsets from
+  indices into one windowed search buffer at the type level — an `Abs` and a `Local` cannot be
+  added or compared *directly* (there is no `impl` that accepts the other type), closing the class
+  of bug where a bare mixed-unit `u64`/`usize` expression silently compiles regardless of which
+  space each operand is actually in. **Restructure R5 (2026-07-28):** the three `match_at`
+  computations across `scan.rs`'s `SearchForward`/`SearchBackward` — the exact
+  `self.pos - carry_len as u64 + s.0 as u64` shape this paragraph used to cite as the still-open
+  half of the doctrine — plus one `SearchBackward` `line_start` derivation, are now routed through
+  `Hay::to_abs`, since a live `hay` is already in scope at each of those sites; a mis-derived shift
+  there is now a type mismatch, not a silent wrong number. **What this still does not enforce,
+  disclosed under this project's own "docs claim
+  only enforced invariants" policy:** the newtypes still expose `pub(crate)` fields (privatizing
+  them would mean routing dozens of ordinary `Local(n)`/`Abs(n)` *constructions* — not the
+  Abs↔Local *conversions* this doctrine is actually about — through named constructors for no
+  compile-time gain, since a bare tuple constructor is exactly as auditable as a same-named
+  method), so a handful of narrower local-index bookkeeping sites (`last_nl`/line-start tracking)
+  still read `.0` directly rather than calling `to_abs`; `to_local` still has zero production
+  callers (every consumer mints its own `Local`s directly from values it already has, rather than
+  converting an incoming `Abs`). **Restructure R7 (batch 8, 2026-07-29)** closes the remaining
+  half, which was never a conversion at all but the hay's own *base*: `Hay::new(bytes, base)` took
+  that absolute position as a parameter, so all nine production call sites derived it — every one
+  of them by subtracting a LENGTH from a POSITION (`Abs(pos - buf.len())`). That arithmetic is
+  type-correct and silently asserts something nothing checked: *every byte I hold arrived
+  contiguously, ending at `pos`*. A conforming short read (`BlockSource`'s "up to `len`" contract)
+  breaks the premise and produces not a missing byte but a **wrong position**, which propagates
+  into reported anchors and into the look-behind `^`/`\b` are decided against. It shipped twice
+  from one function before the type existed: a `carry` spliced onto a short `slice` (batch 7
+  finding #2) and an incomplete look-behind gather rebased as adjacent (batch 8 P1). `hay::Assembly`
+  now owns it — a run is offered together with the position it was READ FROM, adjacency is
+  arithmetic the type performs, a run that does not touch what is already held is *refused* rather
+  than spliced, and the finished hay's base is read from the anchor run instead of recomputed.
+  Accept ranges are named in file coordinates via `Assembly::local_of`, so a refused run shifts
+  every downstream index automatically rather than depending on a `lb` recomputed by hand in the
+  right order. `tests/no_raw_hay_primitives.rs` guards it: `Hay::new` outside `search::hay` is a CI
+  failure. Two consumers whose window is maintained state rather than per-call runs
+  (`SearchForward`'s `ctx`+`carry`, `SweepAnalysis`'s `carry`) additionally track that window's
+  base as a field, maintained at each mutation, instead of re-deriving it at each use.
+  `Hay` itself (`search::hay`, [search](search.md)) is the single
+  place a windowed byte slice is handed to the regex engine. Its high edge (`Edge::True`/`Cut`) is
+  an audited fact, not a witness-checked one (no constructor requires proof — `structural-accept.md`
+  §4's own conclusion: a real witness would mean requiring `meter::CertifiedEnd` at every site,
+  which the ordinary, healthy-source case has none to offer, trusting `BlockCache::size()` directly
+  instead); its low edge, by contrast, is *derived*, not declared — `Hay::low_is_true` computes
+  `base == Abs(0)` from data the hay already holds, so there is no `with_low` at all and no way to
+  set it wrong. `Edge::Unreadable` (R4's third variant) is retired: proven, not merely argued
+  (`restr-R4-review.md`'s own mutation battery, M1-M4), to have carried zero information any accept
+  predicate reads, before or after this restructure.
 
 The engine's property tests pin the behavioral versions of these invariants
 (layout never panics on arbitrary bytes and never exceeds the window;
@@ -335,8 +430,8 @@ so structural rewrites keep the same observable contract.
 ## Concurrency rules
 
 See [concurrency](concurrency.md) for how the engine's background tasks —
-the index scan, the status worker, pending navigation — are shaped around
-these rules.
+the index scan, the status worker, pending navigation, the search sweep —
+are shaped around these rules.
 
 - The engine uses `std::sync::Mutex` for shared state with one hard rule:
   **a guard is never held across an `.await`.** Lock, decide, unlock, then
@@ -377,19 +472,47 @@ seam already filled below; the rest are still ahead:
   file cannot evict the interactive working set. `Document` owns the
   scheduler, so dropping a document aborts its scan — the same
   cancel-on-drop discipline as pending navigation (see The event loop,
-  above), with the same one blocking-read exception (see
-  [concurrency](concurrency.md)) — and no closed document leaves a
-  background reader running as a tracked task, though real files can leave
-  at most one already-in-flight positioned read finishing on its own. The
-  scan feeds `LineIndex`: a sparse table of the byte offset of every
-  1024th line start (~8 MB of checkpoints indexes a billion lines),
+  above), with the same detached-fetch exception (see
+  [concurrency](concurrency.md)) — and no closed document leaves the scan
+  itself running as a tracked task, though a block it had already started
+  fetching CAN outlive it, conditionally (restructure R2, 2026-07-27
+  narrowed this from unconditional; see [concurrency](concurrency.md)'s own
+  account of the same narrowing): if the fetch has already SPENT its read
+  ticket — admission is one step short of that, since a final waiter check
+  follows it — the cache's own detached fetch task survives, for any
+  source, not only real files, finishing and landing the block in the
+  cache for whoever asks next; if it has not, the scan's own abort can
+  leave it as the fetch's last interested party, and a fetch whose own
+  abandon check OBSERVES that dies unstarted instead (each check is a
+  linearization point, not a promise about the window around it — a
+  departure landing while the ticket is being spent is not seen; [block
+  cache](block_cache.md)'s waiterless-abandon bullet is the authority),
+  costing nothing rather than
+  surviving pointlessly. The scan feeds
+  `LineIndex`: a sparse table of the byte offset of every 1024th line
+  start (~8 MB of checkpoints indexes a billion lines),
   publishing progress after every ingested block through a watch channel
   (the "frontier"). One subtlety worth stating precisely: a line "start"
   that lands exactly at EOF is a trailing newline's phantom, not a real
   line; `goto_line` guards against ever resolving there, redirecting to
-  the line before it. Search and syntax highlighting remain future
-  analyzers meant to share this same single-shared-scan design, so the
-  file is read once no matter how many analyzers eventually run.
+  the line before it. Search is no longer a future analyzer: its
+  background match-summary sweep (`SweepAnalysis`, in `search.rs`) is the
+  first consumer of a second, generic analysis driver
+  (`crate::analyzer::spawn`, generalized out of `StatusWorker`'s own loop
+  shape — see The status line, below) that owns reset-on-a-fresh-request
+  supersession, bounded steps, retry-with-backoff, and
+  give-up-and-degrade-to-a-floor as one reusable shape, so an analyzer
+  supplies only the work, never the loop. `Document::start_search_sweep`
+  spawns it — eagerly for `Document::new`, lazily on its own first call
+  otherwise. The two scans share this cache — a byte range one of them
+  has already read is a cache hit for the other, not a second disk read,
+  for as long as that range is still resident (eviction can still send
+  either scan back to disk for it — how soon depends on the cache's
+  segmented capacity; see [block cache](block_cache.md)) — but not one
+  single pass: the sweep walks the file again, on its own schedule,
+  rather than riding this one. Syntax highlighting remains the one
+  analyzer still ahead. See [search](search.md) for the sweep's own
+  bounds.
 - **`goto_line`** is bound to `<count>G`, `<count>gg`, and the `:N`
   command line, and resolves through the index three ways.
   If the index already covers the target line, it walks
@@ -401,12 +524,19 @@ seam already filled below; the rest are still ahead:
   has covered so far, and the scan is still running — it pends on the
   frontier, reporting the scan's own progress as the bar until coverage
   catches up, then walks as above.
-- **Pending navigation** exists: `Resolution { Ready, Pending }` is how
-  every navigation result is expressed today, and budget-exhausted jumps
-  continue as cancellable background scans with live progress (see
-  [budgeted scanning](budgeted_scanning.md)). A planned `Exhausted` variant
-  — for "no such answer" — has no consumer yet: `goto_line` clamps rather
-  than failing, so search's "pattern not found" is expected to be the
-  variant's first real use once search lands. Making *reads themselves*
-  pending (a cold viewport block on a wedged mount still holds the loop) is
-  the remaining step.
+- **Pending navigation** exists: `Resolution { Ready(NavOutcome),
+  Pending(PendingNav) }` is how every navigation result is expressed
+  today, and budget-exhausted jumps continue as cancellable background
+  scans with live progress (see [budgeted scanning](budgeted_scanning.md)).
+  `NavOutcome` is `At(Anchor)` for an ordinary jump — the only variant
+  `goto_line` and its siblings ever resolve, since `goto_line` clamps a
+  past-the-end target rather than failing — `FoundMatch { top, match_at,
+  wrapped }` for a search jump (`top` the matched line's own anchor,
+  `match_at` its byte offset — the next search's own origin and the
+  highlight target — `wrapped` whether the jump crossed an end to get
+  there), or `Exhausted` when no answer exists anywhere: search's own
+  "pattern not found," reached once neither leg of its two-leg wrap
+  policy finds a match (see [search](search.md)) — the variant's real,
+  not merely reserved, first use. Making *reads themselves* pending (a
+  cold viewport block on a wedged mount still holds the loop) is the
+  remaining step.

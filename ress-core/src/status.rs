@@ -61,16 +61,21 @@ const STATUS_RETRIES: u8 = 3;
 /// (what `TaskOwner` wraps) replaces the hand-written `self.task.abort()`
 /// this struct used to need. The one exception (same finding as
 /// `ScanScheduler`'s own doc comment — this worker's count walk reads
-/// through the identical `cache.warm` → `PreadSource::read_block` path via
-/// `CountScan::step`): a step already inside `read_block`'s
-/// `spawn_blocking` closure keeps running regardless, tokio's own
-/// `spawn_blocking` tasks being uncancellable once started. EACH
-/// supersession (a new anchor dropping `scan.step()` mid-read) can detach
-/// one such syscall, so repeated re-anchoring accumulates them (post-merge
-/// batch 2 (2026-07-22), finding #6); the bound is per-source, not
-/// per-worker — `PreadSource`'s in-flight read cap (`--read-concurrency`,
-/// see docs/concurrency.md), which detached reads keep holding permits of
-/// until the OS answers.
+/// through the identical `cache.warm` path via `CountScan::step`): the abort
+/// never reaches the block cache's own fetch, which is detached from every
+/// requester by design and for every source, not only real files (batch 4
+/// (2026-07-24), finding #11 — batch 22 (2026-08-01) corrects this comment,
+/// which still described the older, `spawn_blocking`-only boundary). Dropping
+/// the step drops its `WaiterTicket`; a fetch whose own abandon check
+/// OBSERVES the last waiter leaving dies unstarted (each check is a
+/// linearization point, not a promise about the window around it), and
+/// otherwise it runs to completion and publishes, so the work becomes a
+/// cache fill rather than a stranded syscall. EACH supersession (a new anchor
+/// dropping `scan.step()` mid-read) can leave one such fetch behind, so
+/// repeated re-anchoring accumulates them (post-merge batch 2 (2026-07-22),
+/// finding #6); the bound is per-source, not per-worker — `PreadSource`'s
+/// in-flight read cap (`--read-concurrency`, see docs/concurrency.md), whose
+/// permits a committed read holds until the OS answers.
 pub struct StatusWorker {
     anchor_tx: watch::Sender<u64>,
     snapshot_rx: watch::Receiver<StatusSnapshot>,
@@ -366,7 +371,7 @@ async fn run(
             // one; the cursor advancing proves the earlier blocks healed, so
             // a failure after progress is the first strike at the new
             // position, not another against the old one.
-            let before = scan.scanned();
+            let before = scan.progressed();
             tokio::select! {
                 changed = anchor_rx.changed() => {
                     if changed.is_err() {
@@ -386,7 +391,7 @@ async fn run(
                             }
                             continue 'outer;
                         }
-                        Ok(CountStep::More) => {
+                        Ok(CountStep::More(..)) => {
                             consecutive_failures = 0;
                             // a fully-cached walk never actually suspends on
                             // its own; without this, it would monopolize the
@@ -396,7 +401,7 @@ async fn run(
                             tokio::task::yield_now().await;
                         }
                         Err(e) => {
-                            consecutive_failures = if scan.scanned() > before {
+                            consecutive_failures = if scan.progressed() > before {
                                 1
                             } else {
                                 consecutive_failures + 1
@@ -581,12 +586,16 @@ mod tests {
             fn size(&self) -> u64 {
                 8
             }
-            async fn read_block(&self, offset: u64, _len: usize) -> anyhow::Result<bytes::Bytes> {
-                if offset == 0 {
-                    Ok(bytes::Bytes::from_static(b"a\nb\n"))
-                } else {
-                    Err(anyhow::anyhow!("boom"))
-                }
+            async fn admit(&self) -> crate::source::ReadTicket {
+                crate::source::ReadTicket::from_fn(|offset, _len| {
+                    Box::pin(async move {
+                        if offset == 0 {
+                            Ok(bytes::Bytes::from_static(b"a\nb\n"))
+                        } else {
+                            Err(anyhow::anyhow!("boom"))
+                        }
+                    })
+                })
             }
         }
         let c = Arc::new(BlockCache::new(Arc::new(FailsAfterFirstBlock), 4, 1 << 20));
@@ -605,7 +614,7 @@ mod tests {
     // delta-review rewrite, "go through real StatusWorker::drop"): proves `StatusWorker`'s own
     // `Drop` genuinely aborts its task -- through the REAL `StatusWorker::spawn`/`Drop`, not by
     // calling `run` directly and aborting a raw `JoinHandle` by hand the way this test used to.
-    // That older shape (`abort_ends_an_in_flight_step_with_anchor_tx_still_alive`, deleted here,
+    // That older shape (the deleted `abort_ends_an_in_flight_step_with_anchor_tx_still_alive`,
     // itself the pass-6-S4 fix for an EARLIER test that only proved "drop stops reading, however
     // that happens" without isolating `.abort()`'s own contribution) isolated `.abort()` cleanly
     // but never touched `StatusWorker` at all -- it proved `abort()` works in isolation, not that
@@ -637,26 +646,31 @@ mod tests {
     // exception `StatusWorker`'s own doc comment already names -- not what this test is about,
     // and not reachable with a `MockSource` regardless).
     //
-    // Cancelled is now a POSITIVE event (pass 7, P7-C: `MockSource`'s own `cancelled_events`, a
-    // scopeguard on `read_block`'s own future -- see `source.rs`'s own doc comment), not inferred
-    // from a bounded silence. The deleted test also checked `JoinError::is_cancelled` directly;
-    // this one can't -- `StatusWorker` does not expose a raw handle to check, an encapsulation
-    // improvement, not a loss -- `task_owner.rs`'s own dedicated probe test pins that tokio-level
-    // fact once, generically, so it does not need re-deriving here.
+    // The task's own death is a POSITIVE event, not inferred from a bounded silence -- see the
+    // REVISED note inside the test body, below, for what proves it now (batch 4 (2026-07-24),
+    // finding #11 replaced the `MockSource`-level `cancelled_events` proof this paragraph
+    // originally described with a task-scoped one, once the cache's own fetch stopped dying with
+    // its requester). The deleted test also checked `JoinError::is_cancelled` directly; this one
+    // can't -- `StatusWorker` does not expose a raw handle to check, an encapsulation improvement,
+    // not a loss -- `task_owner.rs`'s own dedicated probe test pins that tokio-level fact once,
+    // generically, so it does not need re-deriving here.
     //
     // Finally, confirms `BlockCache` itself survives an abort mid-fetch cleanly: a REAL, separate
     // `.block(0)` call against the SAME cache, after the abort, must still succeed normally --
-    // proving the cache's `Mutex` isn't wedged by a fetch that will never finish, not that
-    // `InFlightGuard` specifically cleaned up its own registration (block 0 is never the block the
-    // aborted anchor-4000 walk registered, ~62). That guard-specific property is `cache.rs`'s
-    // `aborted_fetcher_does_not_leak_its_registration` to prove, via a direct `in_flight_len`
-    // assertion on the interrupted block itself.
+    // proving the cache's `Mutex` isn't wedged by anything the aborted walk touched (block 0 is
+    // never the block the aborted anchor-4000 walk registered, ~62). Black-box on purpose, same as
+    // `cache.rs`'s own `aborting_the_first_requester_does_not_wedge_the_block`: it does not pin
+    // which mechanism keeps the cache usable, only that dropping a worker mid-fetch never wedges it
+    // for an unrelated later caller.
     //
-    // RED-verified: temporarily deleted `TaskOwner`'s field-drop-abort by swapping `StatusWorker`'s
-    // `spawn` to leak the task via `std::mem::forget` on a throwaway `TaskOwner` instead of storing
-    // the real one (simulating "the field never gets dropped, so nothing aborts") -- this test
-    // failed at its 5s timeout waiting for a `Cancelled` event that never arrived. Reverted
-    // immediately after confirming.
+    // RED-verified against the CURRENT mechanism (fix round 1, re-verified -- the paragraph this
+    // replaces described an earlier RED-verification against the pre-unit-D `cancelled_events`
+    // proof, now stale): temporarily changed `TaskOwner::spawn` to bypass its own `JoinSet`
+    // entirely (a raw `tokio::spawn(fut)`, returning that independent task's own `abort_handle()`
+    // just to satisfy the return type -- the same "detach, don't own" mutation
+    // `task_owner.rs`'s own generic probe and `schedule.rs`'s sibling test both use) -- this test
+    // failed at its 5s bound: "the worker's own snapshot sender never closed -- was it genuinely
+    // aborted?: Elapsed(())". Reverted immediately after confirming.
     //
     // The gate below (pass 7's structural pass, codex P2, a 3rd re-review) is NOT a RED-verified
     // fix in that same sense, stated honestly rather than overclaimed: reverting just this test's
@@ -702,14 +716,47 @@ mod tests {
         // the task is now genuinely, and PERMANENTLY (until released, which never happens in this
         // test), suspended mid-walk, parked on the gate armed above -- unlike a fixed-latency
         // read, there is no window in which it could complete on its own before the drop below.
-        let mut cancelled = src.cancelled_events();
-        let cancelled_baseline = *cancelled.borrow();
+        //
+        // REVISED, batch 4 (2026-07-24), finding #11: `cache.rs`'s own fetch path became a
+        // detached publisher (`BlockCache::get`'s own doc comment), so the gated read no longer
+        // dies with the worker that triggered it -- `drop(w)` below no longer fires a
+        // `cancelled_events` on `src` at all (the detached fetch survives, and will complete once
+        // opened at the very end of this test). What still, correctly, dies is the WORKER TASK
+        // itself: `run`'s own `snapshot_tx` (this file's own `spawn`) lives inside that task's
+        // `async move` body, moved there, never cloned elsewhere -- so it closes if and only if
+        // the worker's own future is torn down or returns, entirely independent of the cache's
+        // own detached fetch. Subscribed fresh here, AFTER the walk's own "Converging" snapshot
+        // for anchor 4000 already went out (`run`'s own send right before entering the count
+        // walk) and before anything else could ever send again (the walk is genuinely, provably
+        // stuck on the gate) -- so this receiver's `changed()` can only ever resolve via the
+        // sender closing, i.e. the worker task itself ending. `anchor_keepalive` is STILL alive
+        // here, proven by construction (never dropped, moved out of, or closed anywhere above) --
+        // isolating this from the OTHER way `run`'s own `select!` could return (the anchor
+        // channel closing), exactly as this test always isolated the equivalent `cancelled_events`
+        // wait it replaces.
+        //
+        // `borrow_and_update` immediately after subscribing, deliberately: `StatusWorker`'s own
+        // `snapshot_rx` field is a stale template `status_snapshots` only ever `.clone()`s, never
+        // itself advanced, so a fresh clone inherits whatever backlog has accumulated since
+        // construction (anchor 0's own initial resolution, then this walk's own "Converging" for
+        // anchor 4000) -- its very first `changed()` would otherwise resolve immediately against
+        // that backlog, not against a genuinely NEW event. RED-verified directly: without this
+        // line, this test fails immediately (not at the 5s bound) with `closed.is_err()` false --
+        // the backlog, not a timeout.
+        let mut snapshots = w.status_snapshots();
+        snapshots.borrow_and_update();
         drop(w);
-        // POSITIVE proof: the in-flight read's own future was torn down, not left running or let
-        // finish on its own. `anchor_keepalive` is STILL alive here, proven by construction (it
-        // was never dropped, moved out of, or closed anywhere above) -- this cannot have been
-        // produced by channel closure.
-        wait_for_count(&mut cancelled, |n| n > cancelled_baseline).await;
+        // POSITIVE proof: the worker task's own future was torn down, not left running or let
+        // finish on its own. Bounded by the same diagnostic ceiling `wait_for_count` itself uses
+        // (source.rs): a leaked, never-aborted worker would leave this parked forever rather than
+        // pass silently.
+        let closed = tokio::time::timeout(crate::source::DIAGNOSTIC_CEILING, snapshots.changed())
+            .await
+            .expect("the worker's own snapshot sender never closed -- was it genuinely aborted?");
+        assert!(
+            closed.is_err(),
+            "the worker task itself must have been torn down for its own snapshot sender to close"
+        );
         drop(anchor_keepalive);
         // the gate stays armed for every future read on this source, not just the one this test
         // meant to gate -- opened here, now that the abort is already positively proven above, so
@@ -804,29 +851,35 @@ mod tests {
         // the eighth.
         struct FailsFirstRereadOfEachBlock {
             data: bytes::Bytes,
-            attempts: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+            attempts: Arc<std::sync::Mutex<std::collections::HashMap<u64, u32>>>,
         }
         #[async_trait::async_trait]
         impl crate::source::BlockSource for FailsFirstRereadOfEachBlock {
             fn size(&self) -> u64 {
                 self.data.len() as u64
             }
-            async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<bytes::Bytes> {
-                let attempt = {
-                    let mut a = self.attempts.lock().unwrap();
-                    let n = a.entry(offset).or_insert(0);
-                    *n += 1;
-                    *n
-                };
-                if attempt == 2 {
-                    return Err(anyhow::anyhow!(
-                        "transient failure at offset {offset}, attempt {attempt}"
-                    ));
-                }
-                let size = self.data.len() as u64;
-                let start = offset.min(size) as usize;
-                let end = offset.saturating_add(len as u64).min(size) as usize;
-                Ok(self.data.slice(start..end))
+            async fn admit(&self) -> crate::source::ReadTicket {
+                let data = self.data.clone();
+                let attempts = self.attempts.clone();
+                crate::source::ReadTicket::from_fn(move |offset, len| {
+                    Box::pin(async move {
+                        let attempt = {
+                            let mut a = attempts.lock().unwrap();
+                            let n = a.entry(offset).or_insert(0);
+                            *n += 1;
+                            *n
+                        };
+                        if attempt == 2 {
+                            return Err(anyhow::anyhow!(
+                                "transient failure at offset {offset}, attempt {attempt}"
+                            ));
+                        }
+                        let size = data.len() as u64;
+                        let start = offset.min(size) as usize;
+                        let end = offset.saturating_add(len as u64).min(size) as usize;
+                        Ok(data.slice(start..end))
+                    })
+                })
             }
         }
         let mut data = Vec::new();
@@ -835,7 +888,7 @@ mod tests {
         }
         let src = Arc::new(FailsFirstRereadOfEachBlock {
             data: bytes::Bytes::from(data),
-            attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            attempts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         });
         // small cache: the scan's own linear pass evicts each block behind
         // itself, so the walk's fetches are genuine re-reads (attempt 2)
@@ -866,34 +919,40 @@ mod tests {
         // too small to retain the scan's pass makes the walk's fetches
         // genuine rereads that never heal.
         struct FailsEveryReread {
-            reads: std::sync::atomic::AtomicU64,
-            attempts: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+            reads: Arc<std::sync::atomic::AtomicU64>,
+            attempts: Arc<std::sync::Mutex<std::collections::HashMap<u64, u32>>>,
         }
         #[async_trait::async_trait]
         impl crate::source::BlockSource for FailsEveryReread {
             fn size(&self) -> u64 {
                 64
             }
-            async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<bytes::Bytes> {
-                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let attempt = {
-                    let mut a = self.attempts.lock().unwrap();
-                    let n = a.entry(offset).or_insert(0);
-                    *n += 1;
-                    *n
-                };
-                if attempt > 1 {
-                    return Err(anyhow::anyhow!("reread of offset {offset} refused"));
-                }
-                let data = bytes::Bytes::from(b"aaaaaaa\n".repeat(8));
-                let start = offset.min(64) as usize;
-                let end = offset.saturating_add(len as u64).min(64) as usize;
-                Ok(data.slice(start..end))
+            async fn admit(&self) -> crate::source::ReadTicket {
+                let reads = self.reads.clone();
+                let attempts = self.attempts.clone();
+                crate::source::ReadTicket::from_fn(move |offset, len| {
+                    Box::pin(async move {
+                        reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let attempt = {
+                            let mut a = attempts.lock().unwrap();
+                            let n = a.entry(offset).or_insert(0);
+                            *n += 1;
+                            *n
+                        };
+                        if attempt > 1 {
+                            return Err(anyhow::anyhow!("reread of offset {offset} refused"));
+                        }
+                        let data = bytes::Bytes::from(b"aaaaaaa\n".repeat(8));
+                        let start = offset.min(64) as usize;
+                        let end = offset.saturating_add(len as u64).min(64) as usize;
+                        Ok(data.slice(start..end))
+                    })
+                })
             }
         }
         let src = Arc::new(FailsEveryReread {
-            reads: std::sync::atomic::AtomicU64::new(0),
-            attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            attempts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         });
         let c = Arc::new(BlockCache::new(src.clone(), 8, 4 * 8));
         let s = crate::schedule::ScanScheduler::spawn(c.clone());

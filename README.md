@@ -78,16 +78,33 @@ the philosophy). Counts prefix motions: `12j` moves twelve lines.
 | `Esc` | cancel a pending operation, count, or chord |
 | `F1` | toggle the help overlay (needs 7+ rows, 5+ columns) |
 | `q` / `Ctrl-c` | quit |
+| `/pattern` / `?pattern` | search forward / backward for a regex pattern (Enter to go — Ctrl+J works too, so a pattern typed before the first paint still commits; Esc to cancel, Backspace to edit; needs 2+ rows, 3+ columns) |
+| `n` / `N` | repeat the last search / reverse its direction |
 
 Jumps that need more scanning than the interactive budget (for example `G`
-into a file whose tail is one giant line, a very large count, or a
+into a file whose tail is one giant line, a very large count, a
 `<count>G`, `<count>gg`, or `:N` jump beyond what the background line index
-has scanned) continue in the background: the viewport stays put, a
-transient bottom-row indicator shows progress, `Esc` cancels, and any new
-motion supersedes the scan.
+has scanned, or a `/`/`?` search — including its `n`/`N` continuations —
+that has to scan further than the budget reaches) continue in the
+background: the viewport stays put, a transient bottom-row indicator shows
+progress, `Esc` cancels, and any new motion supersedes the scan.
 
-Reserved for upcoming features: `/` `?` `n` `N` (search), `w` (wrap
-toggle), `0` (reset horizontal scroll).
+Search (`/` `?` `n` `N`) matches a `regex::bytes` pattern against raw
+file bytes — smartcase like vim: case-insensitive unless the pattern
+itself contains an uppercase character; `^`/`$` are line anchors, matching
+a real line's start/end, not just the file's own. A search that reaches
+its own end of the file without a match wraps around and keeps looking
+from the far end, noting `search wrapped` in the status line when that's
+what found it; one that finds nothing anywhere shows `pattern not found`
+and leaves the viewport untouched. Matches longer than 4 KiB are not
+guaranteed to be found — an honest limit of the windowed matching
+underneath, not a truncation of what's shown. See
+[docs/search.md](docs/search.md) for the full model, including the
+background sweep behind the status line's running match count and the
+scrollbar's match ticks.
+
+Reserved for upcoming features: `w` (wrap toggle), `0` (reset horizontal
+scroll).
 
 Building
 ========
@@ -132,6 +149,8 @@ Design documents describing the internals live in the `docs/` directory:
   polluting the cache
 - [Concurrency](docs/concurrency.md) — the one-owned-task, watch-channel
   shape every background computation shares
+- [Search](docs/search.md) — the windowed matching model, smartcase, wrap
+  semantics, and the bounded background sweep
 - [Measuring performance](docs/perf.md) — the criterion and end-to-end
   harnesses, what each isolates, and how to run them
 

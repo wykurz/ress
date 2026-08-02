@@ -12,20 +12,31 @@
 //! its `Document` does, since it is a plain field, never shared — drops
 //! that owner, which aborts every handle it holds. What that abort actually
 //! reaches (found in PR #44 round 10, verified against tokio's own source,
-//! not assumed): a queued fill still waiting on the semaphore dies outright,
-//! never having started a read at all; a fill suspended at any ordinary
-//! `.await` (the semaphore acquire, or between yields) dies there, same as
-//! the queued case. A fill that has already reached `cache.warm` →
-//! `PreadSource::read_block`'s `spawn_blocking` closure is a THIRD case,
-//! not a variant of the first two: `spawn_blocking` tasks are documented by
-//! tokio itself as uncancellable once running, so the blocking `pread`
-//! completes on its own (or, on a wedged mount, hangs on its own) regardless
-//! of the outer task's abort — only that outer wrapper, and any value it
-//! would have produced, is gone. At most `FILL_CONCURRENCY` fills can be in
-//! that third state at once (the semaphore's own permit count), so a drop
-//! leaves at most that many single-block reads outstanding, real-file
-//! sources only (`docs/prefetch.md`'s own Cancellation section states this
-//! same bound). The idiom's other half does not apply here in production: a
+//! not assumed; **the boundary moved in batch 4 (2026-07-24), finding #11,
+//! and this comment lagged it until batch 22 (2026-08-01)**): a queued fill
+//! still waiting on the semaphore dies outright, never having started a read
+//! at all; a fill suspended at any ordinary `.await` (the semaphore acquire,
+//! or between yields) dies there, same as the queued case. A fill that has
+//! already reached `cache.warm` is the THIRD case, not a variant of the first
+//! two — and the boundary is that call's own REGISTRATION in the block
+//! cache's `in_flight`, not entry into a `spawn_blocking` closure the way
+//! this comment used to say. The cache detaches every source's fetch
+//! (`docs/block_cache.md`), so aborting the fill reaches only its own
+//! `WaiterTicket`: one fewer party interested in the block, never a signal
+//! reaching the read. The fetch then dies unstarted if one of its own
+//! abandon checks OBSERVES that departure — each check is a linearization
+//! point, not a promise covering the window around it, so a drop landing
+//! while the ticket is being spent is not seen — and otherwise completes and
+//! publishes into the cache for whoever asks next. Both endings
+//! are correct rather than tolerated, and neither is real-file-specific: what
+//! a drop leaves outstanding is at most the fetches this `Prefetcher`'s own
+//! in-flight fills had joined (so at most `FILL_CONCURRENCY` of them), each
+//! finishing as an ordinary cache fill. `PreadSource`'s uncancellable
+//! `spawn_blocking` read still exists, one layer further down, but it is no
+//! longer what decides this: it is why a COMMITTED fetch cannot be stopped,
+//! not why the fill's abort fails to reach it. `docs/prefetch.md`'s own
+//! Cancellation section has the same three layers at length.
+//! The idiom's other half does not apply here in production: a
 //! fill's only observable effect is warming the shared cache, not an answer
 //! a consumer reads back, so there is nothing to publish there. In TESTS
 //! specifically (pass 7, P7-C, a p6-review2 finding, "replace latency-and-
@@ -37,7 +48,7 @@
 //! `MockSource`'s own events already document, source.rs), so production
 //! code path and behavior are unchanged; only a test that actually
 //! subscribes ever sees them. This is what lets a cancellation test prove
-//! even a QUEUED fill (one that never reached `read_block`, so
+//! even a QUEUED fill (one that never reached a spent ticket's own read, so
 //! `MockSource`'s own events say nothing about it) was genuinely torn down,
 //! not merely inferred absent from a bounded silence.
 use crate::cache::BlockCache;
@@ -53,10 +64,11 @@ const FILL_CONCURRENCY: usize = 4;
 /// Every fill spawned by `note_viewport` is tracked in `state`'s
 /// `TaskOwner`, never detached: dropping a `Prefetcher` drops that owner,
 /// which aborts every handle it holds — a queued or cooperatively-awaiting
-/// fill dies outright, but a fill already inside its own blocking read does
-/// not (see this module's own doc comment for the full, three-layer
-/// account and why that residual is bounded by `FILL_CONCURRENCY`,
-/// real-file sources only). The task-abort guarantee itself is still
+/// fill dies outright, but a fill that has already registered with the block
+/// cache leaves a detached fetch behind, which finishes as an ordinary cache
+/// fill or dies unstarted (see this module's own doc comment for the full,
+/// three-layer account and why that residual is bounded by
+/// `FILL_CONCURRENCY`). The task-abort guarantee itself is still
 /// reached through `state`'s own field-drop, not a hand-written one FOR
 /// THAT PURPOSE — see `task_owner.rs`'s own doc comment for why that is
 /// structural (`TaskOwner` wraps a `JoinSet`, which already aborts
@@ -72,8 +84,8 @@ pub struct Prefetcher {
     // found in PR #44 pass 7 (P7-C): fill-level Cancelled/Released events, ALWAYS present (not
     // `#[cfg(test)]`-gated -- production runs the identical code path a test does, just with
     // nobody ever subscribing), so a cancellation test can prove even a QUEUED fill (one that
-    // never reached `read_block`, so `MockSource`'s own events say nothing about it) was
-    // genuinely torn down -- see this module's own doc comment and `FillEventGuard`, below.
+    // never reached a spent ticket's own read, so `MockSource`'s own events say nothing about it)
+    // was genuinely torn down -- see this module's own doc comment and `FillEventGuard`, below.
     // `Arc`-wrapped (unlike `MockSource`'s own equivalent fields, which are plain): a fill's own
     // spawned task is `'static` and cannot borrow `&Prefetcher`, so `note_viewport` clones this
     // ONE `Arc` into each fill instead, the same way it already clones `cache`/`sem`.
@@ -426,7 +438,8 @@ mod tests {
     // that runs to its own natural end -- never touched by a drop mid-flight -- must signal
     // Released, not Cancelled, proving the guard genuinely discriminates the two outcomes rather
     // than firing Cancelled unconditionally on every Drop (which would make
-    // `dropping_the_prefetcher_cancels_in_flight_and_queued_fills`'s own Cancelled-count assertion
+    // `dropping_the_prefetcher_signals_cancelled_for_every_in_flight_and_queued_fill`'s own
+    // Cancelled-count assertion
     // meaningless -- it would pass even if abort were never reached at all).
     #[tokio::test]
     async fn completed_fills_signal_released_not_cancelled() {
@@ -463,13 +476,13 @@ mod tests {
     // bounded wait for "no further read starts," unavoidably an inference from absence rather
     // than a positive observation, and the last "latency-and-silence" proof this module's own
     // cancellation coverage still had (the in-flight four's own cancellation was already provable
-    // via `MockSource`, but the queued four never reach `read_block` at all, so `MockSource`'s
-    // own events say nothing about them). Closed via `FillEventGuard` (this module's own, wraps
-    // the WHOLE fill including its semaphore wait): all 8 fills -- 4 in-flight, 4 still queued on
-    // the semaphore -- have equally already entered their own async block and constructed a
-    // guard, so `TaskOwner`'s abort-on-drop reaches every one of them identically, and every one
-    // fires a positive `Cancelled` event from its own guard's `Drop`. Zero silence anywhere in
-    // this test now.
+    // via `MockSource`, but the queued four never reach a spent ticket's own read at all, so
+    // `MockSource`'s own events say nothing about them). Closed via `FillEventGuard` (this
+    // module's own, wraps the WHOLE fill including its semaphore wait): all 8 fills -- 4
+    // in-flight, 4 still queued on the semaphore -- have equally already entered their own
+    // async block and constructed a guard, so `TaskOwner`'s abort-on-drop reaches every one of
+    // them identically, and every one fires a positive `Cancelled` event from its own guard's
+    // `Drop`. Zero silence anywhere in this test now.
     //
     // RED-verified: temporarily moved `FillEventGuard::new` to AFTER the semaphore acquire
     // (simulating "a queued fill never constructs a guard, so a queued cancellation goes

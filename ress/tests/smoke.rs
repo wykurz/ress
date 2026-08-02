@@ -520,3 +520,224 @@ fn colon_command_typed_before_first_paint_still_jumps() {
          still be stuck composing the command line. final screen:\n{screen_text}"
     );
 }
+/// Regression pin for the SEARCH feature (v1, tasks 1-8): `/pattern<Enter>` compiles the
+/// pattern, jumps to the first match, and the status line publishes the background sweep's own
+/// running match count. Same pty idiom as `colon_command_typed_before_first_paint_still_jumps`
+/// above (spawn on a numbered fixture, wait for first paint via the log, write the key burst to
+/// the pty master, replay the drained bytes through a vt100 parser until the target text
+/// appears) -- but the write lands well AFTER first paint, not before: raw mode is already
+/// active by construction at that point (`Term::new`'s `enable_raw_mode` is the first thing
+/// `run` does, and first paint cannot happen before it), so there is no ICRNL/cooked-mode race
+/// to court here the way that test's own pre-paint burst has to -- this test's whole point is
+/// the search feature end-to-end, not that mechanism, so the trailing CR needs no special
+/// handling to land as Enter.
+///
+/// Teardown mirrors `first_paint_event_reaches_the_log_file`'s own graceful `q` instead of
+/// `colon_command_typed_before_first_paint_still_jumps`'s SIGKILL -- deliberately:
+/// `Term`'s own `Drop` (`ress/src/terminal.rs`) leaves the alternate screen on a graceful exit,
+/// so a vt100 replay taken AFTER that would show the restored primary screen, not the search
+/// result. Every assertion below runs, and completes, strictly BEFORE the quit key is ever
+/// written, so a graceful quit is safe here -- the teardown block at the end is pure cleanup,
+/// asserting nothing new (nothing further needs reading once it's done: unlike
+/// `first_paint_event_reaches_the_log_file`'s own flush-dependent recount, this test has no
+/// claim left that a post-quit read could still support). Still wrapped in `KillGuard`, not a
+/// plain `Child`: the screen assertions below -- like
+/// `colon_command_typed_before_first_paint_still_jumps`'s own -- can panic before that teardown
+/// ever runs.
+#[test]
+fn slash_search_jumps_and_reports() {
+    let fixture =
+        std::env::temp_dir().join(format!("ress-smoke-search-{}.txt", std::process::id()));
+    let mut contents = String::new();
+    for n in 1..=3500u32 {
+        // "line 2500" is a byte-for-byte-unique substring of this whole file: no other n in
+        // 1..=3500 ever prints those four digits right after "line ", so the pattern below can
+        // only ever match this one line -- and that line's own start is exactly where the
+        // search jump must land.
+        contents.push_str(&format!(
+            "line {n} the quick brown fox jumps over the lazy dog\n"
+        ));
+    }
+    std::fs::write(&fixture, &contents).unwrap();
+    let _fixture_guard = TempFile(fixture.clone());
+    let log = std::env::temp_dir().join(format!("ress-smoke-search-{}.log", std::process::id()));
+    let _log_guard = TempFile(log.clone());
+
+    // wider than the other tests in this file: the status row's `{name} · L{n}/{total} · {pct}%
+    // · /{pattern} · {n} matches` text includes the fixture's own full path (`ress/src/main.rs`'s
+    // `name = cli.file.display().to_string()`), and `std::env::temp_dir()` can resolve to a long,
+    // sandbox-specific prefix (observed: a nix-shell TMPDIR well past 50 bytes on its own) --
+    // 80 columns is not reliably enough room left for the search segment this test asserts on to
+    // survive `render_status_line`'s own real, already-tested truncation at `area.width`. This
+    // is generous headroom for that, not a magic number tuned to one host.
+    const COLS: u16 = 200;
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let ws = libc::winsize {
+        ws_row: 24,
+        ws_col: COLS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "openpty failed: {:?}",
+        std::io::Error::last_os_error()
+    );
+    let _master_guard = FdGuard(master);
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ress"));
+    command.arg(&fixture).arg("--log-file").arg(&log).arg("-v");
+    // see colon_command_typed_before_first_paint_still_jumps's identical comment: RESS_LOG, if
+    // inherited from the calling shell, can filter "first paint" out and hang this test for a
+    // reason that has nothing to do with the binary.
+    command.env_remove("RESS_LOG");
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(slave, 0) == -1
+                || libc::dup2(slave, 1) == -1
+                || libc::dup2(slave, 2) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if slave > 2 {
+                libc::close(slave);
+            }
+            libc::close(master);
+            Ok(())
+        });
+    }
+    // see colon_command_typed_before_first_paint_still_jumps's identical comment: the screen
+    // assertions below can panic before any explicit cleanup has run, so the child is wrapped at
+    // the point of spawn -- every path out of this function, panics included, runs through the
+    // same kill+wait.
+    let mut child = KillGuard(Some(command.spawn().unwrap()));
+    unsafe { libc::close(slave) };
+
+    let pty_output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drain_output = pty_output.clone();
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            drain_output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..n as usize]);
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut first_seen = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(&log)
+            && contents.contains("perf")
+            && contents.contains("first paint")
+        {
+            first_seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(first_seen, "ress never reached first paint");
+
+    // written well after first paint -- see this test's own doc comment for why that makes the
+    // pre-paint ICRNL/Ctrl+J handshake moot here: a plain, single write suffices.
+    let keys = b"/line 2500\r";
+    let written = unsafe { libc::write(master, keys.as_ptr() as *const libc::c_void, keys.len()) };
+    assert_eq!(written as usize, keys.len(), "short write injecting keys");
+
+    // handshake, not a guessed sleep -- same reasoning as colon_command_typed_before_first_paint_
+    // still_jumps's own paint_deadline loop: poll the drained bytes, replayed through a vt100
+    // parser, until the match has actually landed at the top of the viewport AND the status row
+    // has actually published a search segment reporting it -- an observed fact, checked fresh on
+    // every iteration, never a duration merely guessed to be long enough (AGENTS.md's own
+    // testing rule). Both conditions are polled together, not the top row alone followed by a
+    // single unpolled assert: the background sweep (`Document::start_search_sweep`) is a
+    // separate task from the jump itself, so nothing guarantees its first generation-stamped
+    // snapshot has already landed the instant the top row first settles.
+    let match_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut vt = vt100::Parser::new(24, COLS, 0);
+        vt.process(&pty_output.lock().unwrap());
+        let top_row = vt.screen().rows(0, COLS).next().unwrap_or_default();
+        let status_row = vt.screen().rows(0, COLS).nth(23).unwrap_or_default();
+        if top_row.starts_with("line 2500 ") && status_row.contains("matches") {
+            break;
+        }
+        if std::time::Instant::now() >= match_deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // one more, final parse for the actual assertions -- same split as
+    // colon_command_typed_before_first_paint_still_jumps's own paint_deadline loop, whose
+    // identical final re-parse comment (just below the loop there) explains why a raw substring
+    // search on the captured bytes isn't used instead: ratatui only writes the cells that
+    // actually changed between two similar-looking frames, so replaying the whole byte stream
+    // through a fresh vt100 emulator is what reconstructs the real final screen.
+    let mut vt = vt100::Parser::new(24, COLS, 0);
+    vt.process(&pty_output.lock().unwrap());
+    let top_row = vt.screen().rows(0, COLS).next().unwrap_or_default();
+    let status_row = vt.screen().rows(0, COLS).nth(23).unwrap_or_default();
+    let screen_text = vt.screen().contents();
+    assert!(
+        top_row.starts_with("line 2500 "),
+        "expected the search jump to land the match line at the top of the viewport; top row: \
+         {top_row:?}. full screen:\n{screen_text}"
+    );
+    assert!(
+        status_row.contains("matches"),
+        "expected the status row to report the search sweep's own match count (\"N matches\"); \
+         status row: {status_row:?}. full screen:\n{screen_text}"
+    );
+
+    // graceful-quit teardown, mirroring first_paint_event_reaches_the_log_file's own idiom: `q`
+    // from Normal mode -- Search's own Enter already returned there (handle_key_command_search)
+    // -- a bounded reap loop (deadline-assert with a kill fallback, never a bare wait), then the
+    // drain thread's join; no further reads follow, per this test's own doc comment.
+    let quit_key = b"q";
+    let written = unsafe {
+        libc::write(
+            master,
+            quit_key.as_ptr() as *const libc::c_void,
+            quit_key.len(),
+        )
+    };
+    assert_eq!(
+        written as usize,
+        quit_key.len(),
+        "short write injecting quit key"
+    );
+    let quit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(Some(_)) = child.0.as_mut().unwrap().try_wait() {
+            break;
+        }
+        if std::time::Instant::now() >= quit_deadline {
+            child.kill_and_wait();
+            panic!("subject did not exit within 10s of 'q' -- killed as cleanup");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    drain.join().ok();
+}
