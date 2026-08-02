@@ -1,14 +1,83 @@
 //! The byte-reading seam: `BlockSource` abstracts the file behind the cache,
 //! so a future io_uring backend is a drop-in replacement for `PreadSource`.
 use bytes::Bytes;
+use std::future::Future;
+use std::pin::Pin;
+
+/// A boxed, owned, `'static` future -- the shape a `ReadTicket` needs to carry a read that
+/// outlives any borrow of the source that minted it (restructure R1, 2026-07-27).
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// The right to perform exactly one physical read on the source that issued it.
+///
+/// Three lifecycle points, stated once, here, rather than paraphrased at each caller (fix round
+/// 1, F2, restructure R1 review: an earlier draft of this comment and of
+/// `MockSource::with_admission_cap`'s own put the middle one backwards):
+///
+/// - A dropped `BlockSource::admit` FUTURE, before it resolves, consumes nothing: no ticket was
+///   ever minted, so there is nothing to release and nothing was ever started. Free and
+///   cancel-safe.
+/// - A dropped, UNSPENT ticket -- minted by `admit`, never spent via `read` -- releases whatever
+///   it holds (a permit, for a permit-bounded source) PROMPTLY, not merely eventually: the permit
+///   lives inside this type's own captured closure, and dropping the ticket drops that closure
+///   and everything it captured, on the spot. Nothing was ever read, so nothing is lost either.
+///   This is deliberate, not an accident of the implementation: R2's phase-1 waiterless-abort
+///   depends on abandoning an admitted-but-unread ticket costing nothing.
+/// - Once SPENT (`read` called), the caller must treat the read as committed: it may happen, and
+///   the block cache's whole fetch lifecycle is built on not assuming otherwise. **That is a rule
+///   for the CALLER, not a guarantee this trait can extract from an implementation** (batch 21
+///   (2026-07-31), narrowing a claim this comment overreached on). `read` returns a future, and
+///   whether dropping that future cancels the work or releases the permit is decided entirely by
+///   the source that built it: `PreadSource` hands the permit into `spawn_blocking`, so the read
+///   really does run to completion and the permit really is held until it does -- but
+///   `MockSource` keeps its permit inside the returned future, so dropping it releases the permit
+///   promptly, which is legitimate and which this comment used to deny outright.
+///
+///   The distinction matters in exactly one direction. A caller that assumes the read might still
+///   happen is correct against every source; a caller that assumes cancellation reliably PREVENTS
+///   it is not, and would be wrong against a real file. So the pessimistic reading is the contract
+///   -- "past this point, do not count on cancellation" -- and the stronger property (an
+///   uncancellable, permit-holding read) is `PreadSource`'s own, documented on `run_with`, not the
+///   trait's. Post-merge fix #1's invariant is unchanged in what it demands of callers; what
+///   changed is this comment no longer claims the trait enforces it.
+///
+/// The ticket IS the read: `admit` builds one with the source's own handle -- and, for a
+/// permit-bounded source, the permit itself -- already captured, so reading without a ticket, or
+/// spending one source's ticket on another source, is not expressible; there is no `read_block`
+/// on the trait to call instead.
+#[must_use = "a ReadTicket is the read -- spend it with `read`, or the admitted work never happens"]
+pub struct ReadTicket {
+    read: Box<dyn FnOnce(u64, usize) -> BoxFuture<anyhow::Result<Bytes>> + Send>,
+}
+impl ReadTicket {
+    /// Mints a ticket around the closure that performs the actual read -- every
+    /// `BlockSource::admit` impl builds one of these with whatever it needs (a permit, a file
+    /// handle, another source's own ticket, ...) already captured.
+    pub fn from_fn(
+        read: impl FnOnce(u64, usize) -> BoxFuture<anyhow::Result<Bytes>> + Send + 'static,
+    ) -> Self {
+        Self {
+            read: Box::new(read),
+        }
+    }
+    /// Spends the ticket: reads up to `len` bytes starting at `offset` -- fewer bytes near EOF,
+    /// an empty buffer when `offset >= size` -- exactly `BlockSource::read_block`'s old contract,
+    /// now living here since the read only ever happens through a ticket. Consumes `self`, so a
+    /// ticket can be spent exactly once.
+    pub async fn read(self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
+        (self.read)(offset, len).await
+    }
+}
+
 /// Reads raw bytes from a fixed, seekable source.
 #[async_trait::async_trait]
 pub trait BlockSource: Send + Sync {
     /// Total size of the source in bytes.
     fn size(&self) -> u64;
-    /// Reads up to `len` bytes starting at `offset`; returns fewer bytes near
-    /// EOF and an empty buffer when `offset >= size`.
-    async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<Bytes>;
+    /// Waits until this source will admit another physical read, then mints a `ReadTicket` for
+    /// it. Cancel-safe and free: a dropped `admit` future has started nothing (see `ReadTicket`'s
+    /// own doc comment).
+    async fn admit(&self) -> ReadTicket;
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,49 +106,73 @@ pub(crate) const DIAGNOSTIC_CEILING: std::time::Duration = std::time::Duration::
 /// bench-local latency wrapper -- see `ress-core/benches/engine.rs`'s own `LatencySource`.
 ///
 /// found in PR #44 pass 7 (P7-C, a p6-review2 finding, "replace latency-and-silence
-/// cancellation tests"): publishes three positive, `watch`-based events per `read_block` call --
-/// `started_events` (this call has entered `read_block`, before the gate's own park check, if
-/// armed -- the original, round-16 mechanism), and now `cancelled_events`/`released_events`
-/// (this call's own future has since been dropped -- `Cancelled` if that happened before it
-/// ever reached its own return, `Released` if it ran to completion, Ok or Err either way). A
-/// future torn down by an abort mid-gate-park signals `Cancelled` the moment its own `Drop`
-/// runs; a future left to finish signals `Released` instead -- exactly one of the two, always,
-/// for every read that ever started, via the scopeguard `BlockEventGuard` below. This is what
-/// lets a cancellation test assert a POSITIVE "this specific in-flight read's own future was
-/// torn down," rather than inferring it from a bounded wait for silence (nothing further
-/// happening within some window).
-pub struct MockSource {
-    data: Bytes,
+/// cancellation tests"): publishes three positive, `watch`-based events per read (restructure R1,
+/// 2026-07-27: since `read_block` left the trait, "per read" now means per spent `ReadTicket` --
+/// `admit`'s own return is instant and free, never itself an event) -- `started_events` (a ticket
+/// has been spent and its own read entered, before the gate's own park check, if armed -- the
+/// original, round-16 mechanism), and now `cancelled_events`/`released_events` (that read's own
+/// future has since been dropped -- `Cancelled` if that happened before it ever reached its own
+/// return, `Released` if it ran to completion, Ok or Err either way). A future torn down by an
+/// abort mid-gate-park signals `Cancelled` the moment its own `Drop` runs; a future left to
+/// finish signals `Released` instead -- exactly one of the two, always, for every read that ever
+/// started, via the scopeguard `BlockEventGuard` below. This lets a test that spends a ticket
+/// directly (several in this file do) assert a POSITIVE "this specific in-flight read's own
+/// future was torn down," rather than inferring it from a bounded wait for silence.
+///
+/// `cancelled_events`'s role narrowed (fix round 1, F4, batch 4 (2026-07-24), finding #11): no
+/// longer reachable through `BlockCache` at all. Its own fetch (`cache.rs`) is now a detached
+/// task nothing but an abnormal teardown -- a panic, a runtime shutdown -- reaches, so a cache
+/// CONSUMER's own cancellation stops at the cache's own waiter loop and never propagates this
+/// far; every cache-level cancellation test in the crate had to move off this signal onto a
+/// task-scoped one instead (`schedule.rs`, `status.rs`, `document.rs`, `app.rs`). Kept rather
+/// than retired, because it is not actually dead: still the genuine signal for a test spending a
+/// ticket directly, unaffected by the cache; still what proves the gate-timeout backstop
+/// never counterfeits a cancellation
+/// (`forgetting_to_release_the_gate_fails_loud_within_the_bound`'s own `cancelled_events == 0`
+/// assertion); and reused one layer up, deliberately, as a ready-made abnormal-teardown simulator
+/// by `cache.rs`'s own `a_panicking_detached_fetch_does_not_leak_its_registration`
+/// (`with_gate_safety_bound`'s own doc comment has the second-caller account).
+/// The read-outcome bookkeeping `MockSource::admit`'s own ticket closure and `BlockEventGuard`
+/// both need to reach after the read has moved off `&self` and into a `'static` closure
+/// (restructure R1, 2026-07-27, structural-cache.md §3.1 -- `read_block` left the trait, so what
+/// used to be direct field access from inside `MockSource`'s own method body had to become an
+/// owned handle a boxed closure can carry instead). Bundled as one `Arc` so admitting a read
+/// clones once, not once per counter and once per sender.
+///
+/// found in PR #44 round 16 (a codex P2): a `watch` of how many reads have STARTED (before the
+/// gate's own park check, if armed) -- lets a test AWAIT "N reads have entered" as an explicit
+/// event via `started_events()`'s own receiver, rather than sleeping a guessed duration and
+/// hoping enough real time passed for N reads to have started (a correct implementation can
+/// fail that race under a loaded/parallel executor -- exactly this crate's own "tests prove
+/// events, not scheduler timing" rule, AGENTS.md). `watch`, not `Notify`: the existing count
+/// needs to be OBSERVABLE by a receiver that subscribes AFTER some reads have already started (a
+/// `Notify` only wakes tasks already waiting at the moment of the call, missing anything that
+/// happened earlier) -- the same "publish state, let observers await or poll it" idiom this
+/// workspace's own concurrency model already uses elsewhere (docs/concurrency.md).
+/// `cancelled`/`released` (pass 7, P7-C) share the identical shape, one channel per event kind,
+/// for the same reason. `gate_timeouts` (post-merge batch (2026-07-22), fix #6): the gate's own
+/// safety-bound panic used to unwind through `BlockEventGuard::drop`'s two-way
+/// completed/cancelled split and emit `Cancelled` -- the exact positive event ownership tests
+/// accept as proof of a torn-down future. Both that bound and `wait_for_count`'s ceiling default
+/// to the same `DIAGNOSTIC_CEILING`, and the gate's timer starts first (at read entry), so a
+/// LEAKED task panicking at the bound could satisfy a cancellation wait that should have failed.
+/// A third, distinct event keeps the diagnostic backstop from counterfeiting the proof.
+struct MockEvents {
     reads: AtomicU64,
     cancelled: AtomicU64,
     released: AtomicU64,
-    // found in PR #44 round 16 (a codex P2): a `watch` of how many `read_block` calls have
-    // STARTED (before the gate's own park check, if armed) -- lets a test AWAIT "N reads have entered
-    // read_block" as an explicit event via `started_events()`'s own receiver, rather than
-    // sleeping a guessed duration and hoping enough real time passed for N reads to have
-    // started (a correct implementation can fail that race under a loaded/parallel executor --
-    // exactly this crate's own "tests prove events, not scheduler timing" rule, AGENTS.md).
-    // `watch`, not `Notify`: the existing count needs to be OBSERVABLE by a receiver that
-    // subscribes AFTER some reads have already started (a `Notify` only wakes tasks already
-    // waiting at the moment of the call, missing anything that happened earlier) -- the same
-    // "publish state, let observers await or poll it" idiom this workspace's own concurrency
-    // model already uses elsewhere (docs/concurrency.md). `cancelled`/`released` (pass 7, P7-C)
-    // share the identical shape, one channel per event kind, for the same reason.
+    gate_timeouts: AtomicU64,
     started_tx: tokio::sync::watch::Sender<u64>,
     cancelled_tx: tokio::sync::watch::Sender<u64>,
     released_tx: tokio::sync::watch::Sender<u64>,
-    // post-merge batch (2026-07-22), fix #6: the gate's own safety-bound panic used to unwind
-    // through `BlockEventGuard::drop`'s two-way completed/cancelled split and emit `Cancelled`
-    // -- the exact positive event ownership tests accept as proof of a torn-down future. Both
-    // that bound and `wait_for_count`'s ceiling default to the same `DIAGNOSTIC_CEILING`, and
-    // the gate's timer starts first (at read entry), so a LEAKED task panicking at the bound
-    // could satisfy a cancellation wait that should have failed. A third, distinct event keeps
-    // the diagnostic backstop from counterfeiting the proof.
-    gate_timeouts: AtomicU64,
     gate_timeout_tx: tokio::sync::watch::Sender<u64>,
+}
+pub struct MockSource {
+    data: Bytes,
+    events: Arc<MockEvents>,
     // found in PR #44 pass 7 re-review (codex P2, "dropping_the_prefetcher_cancels_in_flight_
     // and_queued_fills" flake), extended in pass 7's structural pass (a 3rd re-review, the same
-    // class recurring): `None` (the default) means `read_block` never parks -- every other
+    // class recurring): `None` (the default) means a read never parks -- every other
     // `MockSource` user is unaffected. `with_gate` installs the mechanism, but DISARMED --
     // `gate_armed` (below) starts `false`, so every read still proceeds exactly as if no gate
     // existed at all until `arm_gate` is called. Split into install-then-arm, rather than armed
@@ -87,23 +180,35 @@ pub struct MockSource {
     // EARLIER, unrelated reads (a background index scan sharing the same cache/source) to
     // complete normally before the ONE read it actually wants to gate -- arming is a separate,
     // explicit, `&self` step a test takes whenever it chooses, not tied to construction.
-    // Once armed, every call parks (past its own `started` event, before returning data) until
+    // Once armed, every read parks (past its own `started` event, before returning data) until
     // `open_gate` releases it -- a deterministic barrier for a read that must sit genuinely,
     // provably in-flight, not merely likely still-running after a fixed latency sleep a
     // slow/loaded test runner could race past (a latency-based read completes and frees whatever
     // it holds on its own timeline, independent of when the test gets around to observing it).
     // `watch`, not `Notify`, for the identical reason `started_tx`/`cancelled_tx`/`released_tx`
-    // above are `watch`: a read that calls `read_block` AFTER `open_gate` already ran must see
-    // the gate already open, not miss a wakeup that already happened (`Notify::notify_waiters`
-    // only reaches waiters already parked at that instant).
+    // above are `watch`: a read that starts AFTER `open_gate` already ran must see the gate
+    // already open, not miss a wakeup that already happened (`Notify::notify_waiters` only
+    // reaches waiters already parked at that instant).
     gate_tx: Option<tokio::sync::watch::Sender<bool>>,
-    gate_armed: std::sync::atomic::AtomicBool,
-    // found in PR #44 pass 8: the bound `read_block`'s own gate-wait is timed out against (see
+    // `Arc`-wrapped (restructure R1): read and stored by `MockSource` itself (arm_gate/open_gate,
+    // both still plain `&self` methods) but also cloned into `admit`'s own ticket closure, which
+    // must check it live, at read time -- not a value snapshotted at admission -- so arming or
+    // releasing the gate after a ticket was minted but not yet spent still takes effect.
+    gate_armed: Arc<std::sync::atomic::AtomicBool>,
+    // found in PR #44 pass 8: the bound a read's own gate-wait is timed out against (see
     // `arm_gate`'s doc comment). Defaults to `DIAGNOSTIC_CEILING`; overridable, test-only, via
-    // `with_gate_safety_bound` -- exists so the ONE test that specifically exercises "the bound
-    // itself fires" (proving the mechanism works, not merely asserting it should) does not have
-    // to wait out the real, generous production value to do it.
+    // `with_gate_safety_bound` -- exists so a test that needs the bound to actually fire quickly
+    // does not have to wait out the real, generous production value to do it. Two callers today
+    // (fix round 1, F5 -- this doc used to claim exactly one): this file's own
+    // `forgetting_to_release_the_gate_fails_loud_within_the_bound`, proving the mechanism itself
+    // fires and panics; `cache.rs`'s own `a_panicking_detached_fetch_does_not_leak_its_
+    // registration`, reusing that same panic as a ready-made abnormal-teardown simulator (a
+    // detached fetch's own future torn down mid-read) rather than a bespoke panicking
+    // `BlockSource`.
     gate_bound: std::time::Duration,
+    // restructure R1 (2026-07-27): test-only cap on concurrent ADMISSION (not reads -- this
+    // source performs no real I/O to bound) -- see `with_admission_cap`'s own doc comment.
+    admission: Option<Arc<tokio::sync::Semaphore>>,
 }
 impl MockSource {
     pub fn new(data: impl Into<Bytes>) -> Self {
@@ -113,56 +218,77 @@ impl MockSource {
         let (gate_timeout_tx, _) = tokio::sync::watch::channel(0);
         Self {
             data: data.into(),
-            reads: AtomicU64::new(0),
-            cancelled: AtomicU64::new(0),
-            released: AtomicU64::new(0),
-            started_tx,
-            cancelled_tx,
-            released_tx,
-            gate_timeouts: AtomicU64::new(0),
-            gate_timeout_tx,
+            events: Arc::new(MockEvents {
+                reads: AtomicU64::new(0),
+                cancelled: AtomicU64::new(0),
+                released: AtomicU64::new(0),
+                gate_timeouts: AtomicU64::new(0),
+                started_tx,
+                cancelled_tx,
+                released_tx,
+                gate_timeout_tx,
+            }),
             gate_tx: None,
-            gate_armed: std::sync::atomic::AtomicBool::new(false),
+            gate_armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gate_bound: DIAGNOSTIC_CEILING,
+            admission: None,
         }
     }
-    /// Installs a gate, disarmed: every `read_block` call proceeds exactly as if no gate existed
-    /// at all until `arm_gate` is called. See this struct's own doc comment on `gate_tx` for why
-    /// arming is a separate step, and (this struct's own doc comment, above) why a test reaches
-    /// for this over a fixed sleep.
+    /// Installs a gate, disarmed: every read proceeds exactly as if no gate existed at all until
+    /// `arm_gate` is called. See this struct's own doc comment on `gate_tx` for why arming is a
+    /// separate step, and (this struct's own doc comment, above) why a test reaches for this over
+    /// a fixed sleep.
     pub fn with_gate(mut self) -> Self {
         let (tx, _) = tokio::sync::watch::channel(false);
         self.gate_tx = Some(tx);
         self
     }
+    /// Test-only: caps how many reads this source will ADMIT concurrently -- i.e. `admit`'s own
+    /// wait, not a per-read delay (this source performs no real I/O for a cap to bound). Defaults
+    /// to uncapped (every `admit` resolves immediately, the same trivial admission every other
+    /// test fake gets). Built ahead of its first caller (restructure R1, 2026-07-27): R2's
+    /// two-phase fetch needs a deterministic way to hold a fetch admitted-but-unread so its
+    /// waiterless-abort can race admission itself, not the read, and a real semaphore is the only
+    /// source-side mechanism that can gate CONCURRENT admission the way `--read-concurrency`
+    /// gates concurrent reads at `PreadSource`. See `ReadTicket`'s own doc comment for the
+    /// permit's exact lifetime across admit/mint/spend (fix round 1, F2: an earlier draft of
+    /// this comment claimed a dropped, unspent ticket never releases its permit -- backwards;
+    /// it releases promptly, which is exactly what R2's own design requires).
+    #[cfg(test)]
+    pub(crate) fn with_admission_cap(mut self, n: usize) -> Self {
+        self.admission = Some(Arc::new(tokio::sync::Semaphore::new(n)));
+        self
+    }
     /// Test-only: overrides the gate's own built-in safety bound (see `arm_gate`'s doc comment)
-    /// away from the generous, production-sized `DIAGNOSTIC_CEILING` default. Exists for exactly
-    /// one caller: the test that specifically proves the bound fires and panics, which needs a
-    /// SHORT override to do that quickly rather than actually waiting out the real value. Every
-    /// other test leaves this at its default -- a bound short enough to matter for THAT one test
-    /// would also be short enough to spuriously fire against a legitimately slow CI machine
-    /// everywhere else.
+    /// away from the generous, production-sized `DIAGNOSTIC_CEILING` default. Exists for callers
+    /// that need the bound to actually fire quickly -- either proving the mechanism itself (this
+    /// file's own `forgetting_to_release_the_gate_fails_loud_within_the_bound`) or reusing that
+    /// panic as a ready-made abnormal-teardown simulator one layer up (`cache.rs`'s own
+    /// `a_panicking_detached_fetch_does_not_leak_its_registration`, fix round 1, F5) -- rather
+    /// than actually waiting out the real value. Every other test leaves this at its default -- a
+    /// bound short enough to matter for either of those two would also be short enough to
+    /// spuriously fire against a legitimately slow CI machine everywhere else.
     #[cfg(test)]
     pub(crate) fn with_gate_safety_bound(mut self, bound: std::time::Duration) -> Self {
         self.gate_bound = bound;
         self
     }
-    /// Arms the gate installed by `with_gate`: every `read_block` call from this point onward
-    /// parks until `open_gate` releases it -- or until `gate_bound` (`DIAGNOSTIC_CEILING` by
-    /// default) elapses, whichever comes first. A silent no-op if no gate was installed. Every
-    /// test that uses this arms strictly BEFORE triggering the one read it wants gated, never
-    /// concurrently with it, so there is no call this needs to race.
+    /// Arms the gate installed by `with_gate`: every read from this point onward (a ticket's own
+    /// `read`, spent via `admit`) parks until `open_gate` releases it -- or until `gate_bound`
+    /// (`DIAGNOSTIC_CEILING` by default) elapses, whichever comes first. A silent no-op if no
+    /// gate was installed. Every test that uses this arms strictly BEFORE triggering the one read
+    /// it wants gated, never concurrently with it, so there is no call this needs to race.
     ///
     /// UN-HANGABLE by construction (pass 8: the class this closes recurred a 3rd time because the
     /// EARLIER, unbounded version of this gate made `with_latency` the path of least resistance --
     /// fix the trap, not just each site that fell into it). The original footgun: arming is
-    /// source-WIDE and sticky -- once armed, `read_block` parks EVERY later call on this source,
-    /// not just the one call a test had in mind, and a forgotten `open_gate` before a SECOND read
-    /// used to hang forever, silently, with no timeout to catch it (a real incident, not a
-    /// hypothetical one: a first draft of `status.rs`'s own fix did exactly this). Now, a
-    /// forgotten release does not hang -- the parked `read_block` call itself panics once
-    /// `gate_bound` elapses, a loud, attributable failure naming the mechanism ("forgotten
-    /// open_gate?") instead of a CI job that simply never finishes.
+    /// source-WIDE and sticky -- once armed, every later read on this source parks, not just the
+    /// one call a test had in mind, and a forgotten `open_gate` before a SECOND read used to hang
+    /// forever, silently, with no timeout to catch it (a real incident, not a hypothetical one: a
+    /// first draft of `status.rs`'s own fix did exactly this). Now, a forgotten release does not
+    /// hang -- the parked read itself panics once `gate_bound` elapses, a loud, attributable
+    /// failure naming the mechanism ("forgotten open_gate?") instead of a CI job that simply
+    /// never finishes.
     ///
     /// This does NOT break the OTHER legitimate shape -- a read parked forever, by design (e.g.
     /// proving a block is never read at all), that nothing in the test ever awaits: the bound
@@ -234,32 +360,47 @@ impl MockSource {
             });
         }
     }
-    /// Number of `read_block` calls so far.
+    /// Number of reads so far (a ticket spent via `read`, not merely minted by `admit`).
     pub fn read_count(&self) -> u64 {
-        self.reads.load(Ordering::Relaxed)
+        self.events.reads.load(Ordering::Relaxed)
     }
-    /// A receiver a test can `wait_for`/`changed()` on to observe how many `read_block` calls
-    /// have STARTED so far -- see this struct's own doc comment for why this exists at all (an
-    /// event-based alternative to sleeping and guessing).
+    /// A receiver a test can `wait_for`/`changed()` on to observe how many reads have STARTED so
+    /// far -- see `MockEvents`'s own doc comment for why this exists at all (an event-based
+    /// alternative to sleeping and guessing).
     pub fn started_events(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.started_tx.subscribe()
+        self.events.started_tx.subscribe()
     }
-    /// A receiver a test can `wait_for`/`changed()` on to observe how many `read_block` calls
-    /// have had their own future dropped WITHOUT reaching their own return -- see this struct's
-    /// own doc comment.
+    /// A receiver a test can `wait_for`/`changed()` on to observe how many reads have had their
+    /// own future dropped WITHOUT reaching their own return -- see `MockEvents`'s own doc
+    /// comment.
     pub fn cancelled_events(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.cancelled_tx.subscribe()
+        self.events.cancelled_tx.subscribe()
     }
-    /// A receiver a test can `wait_for`/`changed()` on to observe how many `read_block` calls
-    /// have run to their own completion (Ok or Err) -- see this struct's own doc comment.
+    /// A receiver a test can `wait_for`/`changed()` on to observe how many reads have run to
+    /// their own completion (Ok or Err) -- see `MockEvents`'s own doc comment.
     pub fn released_events(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.released_tx.subscribe()
+        self.events.released_tx.subscribe()
     }
     /// A receiver for how many reads' own gate-wait hit `gate_bound` and panicked -- distinct
     /// from `cancelled_events` so the gate's own diagnostic backstop can never counterfeit the
     /// positive cancellation proof ownership tests wait on. See the field's own doc comment.
     pub fn gate_timeout_events(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.gate_timeout_tx.subscribe()
+        self.events.gate_timeout_tx.subscribe()
+    }
+    /// Test-only: how many admission permits are currently free -- the `MockSource`-side sibling
+    /// of `BoundedBlockingReads::available_permits` (restructure R2, 2026-07-27: cache.rs's own
+    /// waiterless-abort tests need to observe the cap settle back to baseline once an admitted
+    /// read returns, the same "permits back to baseline" evidence `source.rs`'s own
+    /// `BoundedBlockingReads` suite already gives for `PreadSource`). Panics if this source was
+    /// never given a cap at all (`with_admission_cap`) -- calling it on an uncapped source is a
+    /// test-author mistake, not a legitimate zero, so this fails loud rather than returning a
+    /// number that would silently mean nothing.
+    #[cfg(test)]
+    pub(crate) fn admission_available_permits(&self) -> usize {
+        self.admission
+            .as_ref()
+            .expect("admission_available_permits called on a MockSource with no admission cap")
+            .available_permits()
     }
 }
 
@@ -285,29 +426,31 @@ impl Drop for GateReleaseGuard<'_> {
     }
 }
 
-// found in PR #44 pass 7 (P7-C): the scopeguard that turns a dropped `read_block` future into a
+// found in PR #44 pass 7 (P7-C): the scopeguard that turns a dropped read's future into a
 // positive `Cancelled`/`Released` event instead of leaving cancellation something only ever
-// inferred from silence. Constructed the instant a call enters `read_block` (folding the
+// inferred from silence. Constructed the instant a ticket's own read begins (folding the
 // existing `started` signal into construction, so a guard can never exist without one), it fires
-// `Released` from its own `Drop` if `complete()` was called first (the call reached its own
+// `Released` from its own `Drop` if `complete()` was called first (the read reached its own
 // return, regardless of Ok/Err); a third, distinct gate-timeout event if `mark_gate_timeout` was
-// called first instead (the gate's own safety-bound panicking path in `read_block`'s gate-wait
+// called first instead (the gate's own safety-bound panicking path in the read's own gate-wait
 // arm -- post-merge batch (2026-07-22), fix #6); or `Cancelled` otherwise (the future was torn
 // down early with neither mark set -- an abort mid-gate-park being the only remaining way that
 // happens in this crate's own tests).
-// Needs no new Send/Sync reasoning: it holds only `&'a MockSource`, and `BlockSource: Send + Sync`
-// already requires `MockSource: Sync`, so `&'a MockSource` is `Send` on its own.
-struct BlockEventGuard<'a> {
-    source: &'a MockSource,
+// Holds an owned `Arc<MockEvents>` rather than a borrow (restructure R1, 2026-07-27): the guard
+// now lives inside `admit`'s own `'static` ticket closure, spent long after `MockSource::admit`'s
+// own `&self` borrow has ended, so it needs a handle that outlives that borrow. Needs no new
+// Send/Sync reasoning: `Arc<MockEvents>` is `Send + Sync` because every field it wraps already is.
+struct BlockEventGuard {
+    events: Arc<MockEvents>,
     completed: bool,
     gate_timed_out: bool,
 }
-impl<'a> BlockEventGuard<'a> {
-    fn new(source: &'a MockSource) -> Self {
-        let started = source.reads.fetch_add(1, Ordering::Relaxed) + 1;
-        publish_high_water_mark(&source.started_tx, started);
+impl BlockEventGuard {
+    fn new(events: Arc<MockEvents>) -> Self {
+        let started = events.reads.fetch_add(1, Ordering::Relaxed) + 1;
+        publish_high_water_mark(&events.started_tx, started);
         Self {
-            source,
+            events,
             completed: false,
             gate_timed_out: false,
         }
@@ -319,17 +462,17 @@ impl<'a> BlockEventGuard<'a> {
         self.gate_timed_out = true;
     }
 }
-impl<'a> Drop for BlockEventGuard<'a> {
+impl Drop for BlockEventGuard {
     fn drop(&mut self) {
         if self.completed {
-            let n = self.source.released.fetch_add(1, Ordering::Relaxed) + 1;
-            publish_high_water_mark(&self.source.released_tx, n);
+            let n = self.events.released.fetch_add(1, Ordering::Relaxed) + 1;
+            publish_high_water_mark(&self.events.released_tx, n);
         } else if self.gate_timed_out {
-            let n = self.source.gate_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
-            publish_high_water_mark(&self.source.gate_timeout_tx, n);
+            let n = self.events.gate_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+            publish_high_water_mark(&self.events.gate_timeout_tx, n);
         } else {
-            let n = self.source.cancelled.fetch_add(1, Ordering::Relaxed) + 1;
-            publish_high_water_mark(&self.source.cancelled_tx, n);
+            let n = self.events.cancelled.fetch_add(1, Ordering::Relaxed) + 1;
+            publish_high_water_mark(&self.events.cancelled_tx, n);
         }
     }
 }
@@ -399,49 +542,97 @@ impl BlockSource for MockSource {
     fn size(&self) -> u64 {
         self.data.len() as u64
     }
-    async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
-        // `send_if_modified`, not `send`/`send_replace`, inside `BlockEventGuard` and here alike:
-        // a `watch` send errors when there are no receivers, which none of these three events
-        // must ever care about (most callers of a `MockSource` never subscribe to any of them,
-        // and that must stay a silent no-op, not a spurious failure inside a trait method with no
-        // way to report it upward) -- `send_if_modified`'s own return value (whether it actually
-        // updated) is equally fine to discard for the identical reason. See
-        // `publish_high_water_mark`'s own doc comment for why this must be a monotonic publish,
-        // not a bare replace.
-        let mut guard = BlockEventGuard::new(self);
-        if let Some(tx) = &self.gate_tx
-            && self.gate_armed.load(Ordering::Relaxed)
-        {
-            let mut rx = tx.subscribe();
-            // found in PR #44 pass 8: bounded, not the earlier unbounded wait -- see `arm_gate`'s
-            // own doc comment for why this exists (a forgotten `open_gate` must fail loud, never
-            // hang silently) and for why a legitimately-forever-parked read with no awaiter never
-            // reaches this bound at all (the test's own runtime tears down first).
-            match tokio::time::timeout(self.gate_bound, rx.wait_for(|open| *open)).await {
-                Ok(recv) => {
-                    recv.expect("the sender lives on this same MockSource, alongside the receiver");
+    // restructure R1 (2026-07-27): `admit` clones everything the ticket's own closure will need
+    // (an admission permit if capped, the data, the event/gate handles) off `&self` -- the ONLY
+    // moment this method touches `self` at all -- then hands all of it to a `'static` closure
+    // that reproduces this method's own former body (the pre-restructure `read_block`) verbatim,
+    // spent later, whenever the caller calls the ticket's own `read`. The event ordering this
+    // whole struct's own doc comments describe (started -> gate-wait -> released/cancelled) is
+    // unchanged: it is still one continuous, uninterrupted async body, just living inside the
+    // closure instead of directly inside this method.
+    async fn admit(&self) -> ReadTicket {
+        let permit = match &self.admission {
+            Some(sem) => Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .expect("MockSource's own admission semaphore is never closed"),
+            ),
+            None => None,
+        };
+        let data = self.data.clone();
+        let events = self.events.clone();
+        let gate_tx = self.gate_tx.clone();
+        // cloned live, not read here and snapshotted: `admit` and a ticket's own `read` can be
+        // arbitrarily far apart in time (R2's whole point), so arming or releasing the gate after
+        // a ticket was minted but before it was spent must still take effect at read time.
+        let gate_armed = self.gate_armed.clone();
+        let gate_bound = self.gate_bound;
+        ReadTicket::from_fn(move |offset, len| {
+            Box::pin(async move {
+                // the permit, if any, lives exactly as long as this FUTURE: released on return,
+                // and released just as promptly if a caller drops the future mid-read, since it
+                // is captured here and nowhere else. **That is NOT the contract
+                // `BoundedBlockingReads` gives `PreadSource`** -- batch 22 (2026-08-01) corrects a
+                // claim this comment made that it was ("held across a caller's own
+                // cancellation"), the same overreach batch 21 (2026-07-31) removed from
+                // `ReadTicket`'s own doc comment one level up and did not follow down to here.
+                // `PreadSource` moves its permit INTO `spawn_blocking`, so the OS read really does
+                // hold it to completion; a `MockSource` read is a plain async body, so it cannot,
+                // and `ReadTicket`'s doc comment names exactly this difference. Nothing depends on
+                // the stronger property: the trait's rule is for CALLERS ("past `read`, do not
+                // count on cancellation"), and a source that releases early only ever satisfies it
+                // more cheaply.
+                let _permit = permit;
+                // `send_if_modified`, not `send`/`send_replace`, inside `BlockEventGuard` and here
+                // alike: a `watch` send errors when there are no receivers, which none of these
+                // three events must ever care about (most callers of a `MockSource` never
+                // subscribe to any of them, and that must stay a silent no-op, not a spurious
+                // failure inside a read with no way to report it upward) -- `send_if_modified`'s
+                // own return value (whether it actually updated) is equally fine to discard for
+                // the identical reason. See `publish_high_water_mark`'s own doc comment for why
+                // this must be a monotonic publish, not a bare replace.
+                let mut guard = BlockEventGuard::new(events);
+                if let Some(tx) = &gate_tx
+                    && gate_armed.load(Ordering::Relaxed)
+                {
+                    let mut rx = tx.subscribe();
+                    // found in PR #44 pass 8: bounded, not the earlier unbounded wait -- see
+                    // `arm_gate`'s own doc comment for why this exists (a forgotten `open_gate`
+                    // must fail loud, never hang silently) and for why a legitimately-forever-
+                    // parked read with no awaiter never reaches this bound at all (the test's own
+                    // runtime tears down first).
+                    match tokio::time::timeout(gate_bound, rx.wait_for(|open| *open)).await {
+                        Ok(recv) => {
+                            recv.expect(
+                                "the sender lives on this same MockSource, alongside the receiver",
+                            );
+                        }
+                        Err(_elapsed) => {
+                            guard.mark_gate_timeout();
+                            panic!(
+                                "MockSource's gate parked longer than {:?} without being opened \
+                                 -- forgotten open_gate (or the `park` guard it returns)? This is \
+                                 a diagnostic backstop, not a coordination oracle: a legitimate \
+                                 park-then-release sequence should never come anywhere close to \
+                                 it.",
+                                gate_bound
+                            )
+                        }
+                    }
                 }
-                Err(_elapsed) => {
-                    guard.mark_gate_timeout();
-                    panic!(
-                        "MockSource's gate parked longer than {:?} without being opened -- \
-                         forgotten open_gate (or the `park` guard it returns)? This is a diagnostic \
-                         backstop, not a coordination oracle: a legitimate park-then-release \
-                         sequence should never come anywhere close to it.",
-                        self.gate_bound
-                    )
-                }
-            }
-        }
-        let size = self.data.len() as u64;
-        let start = offset.min(size) as usize;
-        let end = offset.saturating_add(len as u64).min(size) as usize;
-        // marked complete BEFORE the tail expression, not after: `guard` drops as this function
-        // returns, and only a completion reached HERE (never by a future torn down mid-`.await`
-        // above) may claim `Released` -- an early return added later, above this line, would
-        // correctly fall through to `Cancelled` instead by simply never reaching this call.
-        guard.complete();
-        Ok(self.data.slice(start..end))
+                let size = data.len() as u64;
+                let start = offset.min(size) as usize;
+                let end = offset.saturating_add(len as u64).min(size) as usize;
+                // marked complete BEFORE the tail expression, not after: `guard` drops as this
+                // async block returns, and only a completion reached HERE (never by a future torn
+                // down mid-`.await` above) may claim `Released` -- an early return added later,
+                // above this line, would correctly fall through to `Cancelled` instead by simply
+                // never reaching this call.
+                guard.complete();
+                Ok(data.slice(start..end))
+            })
+        })
     }
 }
 
@@ -479,16 +670,36 @@ impl BoundedBlockingReads {
             )),
         }
     }
-    pub async fn run<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> anyhow::Result<T> {
-        let permit = self
-            .sem
+    /// Waits for, then hands back, one owned permit -- the phase `BlockSource::admit` needs:
+    /// cheap and cancel-safe, since nothing has been read yet (restructure R1, 2026-07-27). Split
+    /// out of `run` (below), which still does exactly what it always did by calling this and then
+    /// spawning the blocking work, so `run`'s own suite (permit accounting, the mid-read-drop
+    /// permit test, the acquire-drop Waker probe) stays a regression net over the identical
+    /// acquire path `PreadSource::admit` now also goes through.
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.sem
             .clone()
             .acquire_owned()
             .await
-            .expect("this semaphore is never closed for the life of its source");
+            .expect("this semaphore is never closed for the life of its source")
+    }
+    /// Runs `work` on the blocking pool with `permit` already in hand -- moved into the closure,
+    /// released only when `work` returns, never by a dropped future. This is the ONE place that
+    /// invariant (post-merge fix #1) is coded (fix round 1, F1, restructure R1 review): before
+    /// this extraction, `run` and `PreadSource::admit`'s own ticket closure each hand-copied this
+    /// logic, which meant `run`'s own pinned mid-read-drop test
+    /// (`a_mid_read_drop_keeps_the_permit_until_the_os_read_returns`) covered ITS copy while
+    /// production ran ONLY `admit`'s copy -- proven by a mutation pair, not argued: the reviewer's
+    /// M1 (moving the permit out of `spawn_blocking` in `admit`'s own then-separate copy)
+    /// passed the full suite 456/456, while the identical mutation in `run` correctly failed the
+    /// pin. `run` and `admit` both call this now, so there is one implementation for the pin to
+    /// cover, not two that can drift apart -- re-run as a mutation against THIS function after
+    /// this fix, and it fails the pin again (this file's own module-level verification note has
+    /// the confirmed result).
+    async fn run_with<T: Send + 'static>(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> anyhow::Result<T> {
         let value = tokio::task::spawn_blocking(move || {
             // the permit lives exactly as long as the OS-level work: released on return,
             // held across a caller's own cancellation -- the entire point of this type.
@@ -497,6 +708,13 @@ impl BoundedBlockingReads {
         })
         .await?;
         Ok(value)
+    }
+    pub async fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let permit = self.acquire().await;
+        Self::run_with(permit, work).await
     }
     #[cfg(test)]
     fn available_permits(&self) -> usize {
@@ -541,30 +759,44 @@ impl BlockSource for PreadSource {
     fn size(&self) -> u64 {
         self.size
     }
-    async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
+    // restructure R1 (2026-07-27), corrected fix round 1 (F1): `admit` acquires the ONE permit
+    // for this read via `BoundedBlockingReads::acquire` -- cheap and cancel-safe, but NOT the
+    // commitment point (batch 19 (2026-07-31)): an admitted-but-unspent ticket can still be
+    // dropped for nothing, releasing this permit on the spot, and the block cache relies on that
+    // to take one last cancellation decision after admission resolves. Spending the ticket is
+    // where the read commits. `admit` then hands the permit, along with the file handle and size this closure needs,
+    // to a `'static` closure that spends it via `BoundedBlockingReads::run_with` when the caller
+    // reads the ticket. `run_with` is the SAME function `run` (this type's own test-facing
+    // method) calls, not a second, hand-copied implementation of the permit-into-`spawn_blocking`
+    // logic -- the earlier, hand-copied version left `run`'s own pinned mid-read-drop test
+    // covering a copy nothing in production ran; see `run_with`'s own doc comment for the
+    // mutation-pair evidence.
+    async fn admit(&self) -> ReadTicket {
+        let permit = self.reads.acquire().await;
         let file = self.file.clone();
         let size = self.size;
-        let bytes = self
-            .reads
-            .run(move || -> anyhow::Result<Bytes> {
-                use std::os::unix::fs::FileExt;
-                let start = offset.min(size);
-                let end = offset.saturating_add(len as u64).min(size);
-                let n = (end - start) as usize;
-                let mut buf = vec![0u8; n];
-                let mut filled = 0;
-                while filled < n {
-                    let read = file.read_at(&mut buf[filled..], start + filled as u64)?;
-                    if read == 0 {
-                        break;
+        ReadTicket::from_fn(move |offset, len| {
+            Box::pin(async move {
+                BoundedBlockingReads::run_with(permit, move || -> anyhow::Result<Bytes> {
+                    use std::os::unix::fs::FileExt;
+                    let start = offset.min(size);
+                    let end = offset.saturating_add(len as u64).min(size);
+                    let n = (end - start) as usize;
+                    let mut buf = vec![0u8; n];
+                    let mut filled = 0;
+                    while filled < n {
+                        let read = file.read_at(&mut buf[filled..], start + filled as u64)?;
+                        if read == 0 {
+                            break;
+                        }
+                        filled += read;
                     }
-                    filled += read;
-                }
-                buf.truncate(filled);
-                Ok(Bytes::from(buf))
+                    buf.truncate(filled);
+                    Ok(Bytes::from(buf))
+                })
+                .await?
             })
-            .await??;
-        Ok(bytes)
+        })
     }
 }
 
@@ -575,26 +807,26 @@ mod tests {
     async fn mock_returns_requested_bytes() {
         let src = MockSource::new(Bytes::from_static(b"0123456789"));
         assert_eq!(src.size(), 10);
-        let b = src.read_block(2, 4).await.unwrap();
+        let b = src.admit().await.read(2, 4).await.unwrap();
         assert_eq!(&b[..], b"2345");
     }
     #[tokio::test]
     async fn mock_short_read_at_eof() {
         let src = MockSource::new(Bytes::from_static(b"0123456789"));
-        let b = src.read_block(8, 100).await.unwrap();
+        let b = src.admit().await.read(8, 100).await.unwrap();
         assert_eq!(&b[..], b"89");
     }
     #[tokio::test]
     async fn mock_empty_past_eof() {
         let src = MockSource::new(Bytes::from_static(b"0123456789"));
-        let b = src.read_block(50, 4).await.unwrap();
+        let b = src.admit().await.read(50, 4).await.unwrap();
         assert!(b.is_empty());
     }
     #[tokio::test]
     async fn mock_counts_reads() {
         let src = MockSource::new(Bytes::from_static(b"0123456789"));
-        let _ = src.read_block(0, 4).await.unwrap();
-        let _ = src.read_block(4, 4).await.unwrap();
+        let _ = src.admit().await.read(0, 4).await.unwrap();
+        let _ = src.admit().await.read(4, 4).await.unwrap();
         assert_eq!(src.read_count(), 2);
     }
     // found in PR #44 pass 6 S3 (#4): pins `publish_high_water_mark`'s own contract directly,
@@ -632,7 +864,7 @@ mod tests {
         let guard = src.park();
         let read = tokio::spawn({
             let src = src.clone();
-            async move { src.read_block(0, 4).await }
+            async move { src.admit().await.read(0, 4).await }
         });
         let mut started = src.started_events();
         wait_for_count(&mut started, |n| n >= 1).await;
@@ -664,7 +896,7 @@ mod tests {
         src.arm_gate();
         let read = tokio::spawn({
             let src = src.clone();
-            async move { src.read_block(0, 4).await }
+            async move { src.admit().await.read(0, 4).await }
         });
         let joined = tokio::time::timeout(std::time::Duration::from_secs(5), read)
             .await
@@ -709,11 +941,65 @@ mod tests {
         let mut started = src.started_events();
         let _read = tokio::spawn({
             let src = src.clone();
-            async move { src.read_block(0, 4).await }
+            async move { src.admit().await.read(0, 4).await }
         });
         wait_for_count(&mut started, |n| n >= 1).await;
         // deliberately no `open_gate`, no `.await` on `_read`'s own join handle: the test ends
         // here, and the runtime drop that follows aborts `_read` while it still sits parked.
+    }
+    // restructure R1 (2026-07-27), structural-cache.md §3.1: proves `with_admission_cap`'s own
+    // contract directly, built ahead of R2's actual need for it (a deterministic way to hold a
+    // fetch admitted-but-unread, so R2's waiterless-abort can race admission itself, not the
+    // read). Mirrors `BoundedBlockingReads`'s own `dropping_a_run_parked_at_the_acquire_leaks_
+    // no_permit`: a second admit past the cap must genuinely PARK (proven by polling to
+    // `Pending`, not inferred from a yield or an elapsed duration), and it is spending the first
+    // ticket's own READ -- not merely having minted it -- that admits the second.
+    #[tokio::test]
+    async fn admission_cap_gates_a_second_admit_until_the_first_tickets_read_completes() {
+        let src =
+            Arc::new(MockSource::new(Bytes::from_static(b"0123456789")).with_admission_cap(1));
+        let first = src.admit().await;
+        {
+            let noop = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(noop);
+            let mut second_admit = src.admit();
+            assert!(
+                second_admit.as_mut().poll(&mut cx).is_pending(),
+                "with the sole admission permit held by the first, unread ticket, a second \
+                 admit must park rather than mint a ticket immediately"
+            );
+        } // <- the polled-but-pending second admit is dropped here, parked at the acquire.
+        let bytes = first.read(0, 4).await.unwrap();
+        assert_eq!(&bytes[..], b"0123");
+        // the permit only frees once the READ above completed, not when `first` was merely
+        // minted; a fresh admit now must succeed without parking.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), src.admit())
+            .await
+            .expect("admission never freed after the first ticket's read completed");
+        let bytes = second.read(4, 4).await.unwrap();
+        assert_eq!(&bytes[..], b"4567");
+    }
+    // fix round 1, F3 (restructure R1 review): the sibling case the test above never exercises --
+    // this one never spends its ticket at all. `ReadTicket`'s own doc comment (fix round 1, F2)
+    // states dropping a minted-but-unspent ticket releases its permit promptly; this is the
+    // property R2's phase-1 waiterless-abort is built on, so it gets its own pin rather than
+    // resting on the doc comment alone. Adopted per the review's own recommendation (probed
+    // directly there against both `MockSource` and a real `PreadSource`; this is the `MockSource`
+    // form, matching this file's own established idiom for admission-cap tests above).
+    #[tokio::test]
+    async fn dropping_an_unspent_ticket_releases_its_permit_promptly() {
+        let src =
+            Arc::new(MockSource::new(Bytes::from_static(b"0123456789")).with_admission_cap(1));
+        let first = src.admit().await;
+        drop(first); // never spent: no `.read()` call at all.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), src.admit())
+            .await
+            .expect(
+                "dropping an unspent ticket must release its permit promptly -- a merely-minted, \
+                 never-read ticket has nothing to lose by being dropped",
+            );
+        let bytes = second.read(0, 4).await.unwrap();
+        assert_eq!(&bytes[..], b"0123");
     }
     #[tokio::test]
     async fn pread_reads_file_bytes() {
@@ -722,7 +1008,7 @@ mod tests {
         std::fs::write(&path, b"hello world").unwrap();
         let src = PreadSource::open(&path).unwrap();
         assert_eq!(src.size(), 11);
-        let b = src.read_block(6, 5).await.unwrap();
+        let b = src.admit().await.read(6, 5).await.unwrap();
         assert_eq!(&b[..], b"world");
     }
     #[tokio::test]
@@ -731,7 +1017,7 @@ mod tests {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, b"abc").unwrap();
         let src = PreadSource::open(&path).unwrap();
-        let b = src.read_block(1, 100).await.unwrap();
+        let b = src.admit().await.read(1, 100).await.unwrap();
         assert_eq!(&b[..], b"bc");
     }
     #[tokio::test]
@@ -740,7 +1026,7 @@ mod tests {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, b"abc").unwrap();
         let src = PreadSource::open(&path).unwrap();
-        let b = src.read_block(99, 4).await.unwrap();
+        let b = src.admit().await.read(99, 4).await.unwrap();
         assert!(b.is_empty());
     }
     // post-merge batch (2026-07-22), fix #1 -- the P1. The bound's whole contract in one test,
@@ -947,10 +1233,14 @@ mod tests {
     // discriminating coverage for the bound itself lives above, in `BoundedBlockingReads`'s own
     // unit tests (`bound_admits_at_most_n_blocking_reads_and_releases_by_completion` and the
     // mutation-verified `a_mid_read_drop_keeps_the_permit_until_the_os_read_returns`), plus the
-    // fact that `read_block` routes through `self.reads.run(..)` in three directly inspectable
-    // lines. The stronger shape here -- proving "the second read cannot enter until the first
-    // releases" against a real file -- was considered and declined: it needs
-    // timeout-as-proof-of-blocking, the exact absence shape
+    // fact that `admit` routes through `self.reads.acquire()` for the permit and
+    // `BoundedBlockingReads::run_with` for the `spawn_blocking` -- the SAME `run_with` `run`
+    // itself calls (restructure R1, 2026-07-27; corrected in fix round 1, F1: an earlier draft
+    // had `admit` hand-copy `run`'s own body instead of sharing it, which let the pin above keep
+    // passing while covering a copy nothing in production ran any more -- see `run_with`'s own
+    // doc comment for the mutation-pair that caught it). The stronger shape here -- proving "the
+    // second read cannot enter until the first releases" against a real file -- was considered
+    // and declined: it needs timeout-as-proof-of-blocking, the exact absence shape
     // `ress-core/tests/no_timing_oracles.rs` check 2 bans.
     #[tokio::test]
     async fn pread_source_reads_complete_correctly_through_a_bound_of_one() {
@@ -958,7 +1248,9 @@ mod tests {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, b"0123456789").unwrap();
         let src = PreadSource::open_with_read_concurrency(&path, 1).unwrap();
-        let (a, b) = tokio::join!(src.read_block(0, 4), src.read_block(6, 4));
+        let (a, b) = tokio::join!(async { src.admit().await.read(0, 4).await }, async {
+            src.admit().await.read(6, 4).await
+        });
         assert_eq!(&a.unwrap()[..], b"0123");
         assert_eq!(&b.unwrap()[..], b"6789");
     }

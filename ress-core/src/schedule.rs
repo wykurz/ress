@@ -13,14 +13,18 @@
 /// used to hand-roll too, both now sharing the identical mechanism instead
 /// of two copies that could drift apart. The one exception (found in PR
 /// #44 round 10, auditing `Prefetcher`'s own identical exposure — this
-/// task reads through the same `cache.warm` → `PreadSource::read_block` path):
-/// a scan step already inside `read_block`'s `spawn_blocking` closure is not
-/// reachable by the abort at all, since tokio documents `spawn_blocking`
-/// tasks as uncancellable once running — that one blocking `pread` (at most
-/// one, this task never has two reads in flight at once) completes on its
-/// own, real-file sources only. A closed document never leaves a stray
-/// reader RUNNING AS A TRACKED TASK behind; it can leave at most that one
-/// syscall finishing alone.
+/// task reads through the same `cache.warm` path): the abort does not reach
+/// the block cache's own fetch, which is detached from every requester by
+/// design and for every source, not only real files (batch 4 (2026-07-24),
+/// finding #11 — batch 22 (2026-08-01) corrects this comment, which still
+/// described the older, `spawn_blocking`-only boundary). Dropping the step
+/// drops its `WaiterTicket`; the fetch behind it (at most one, this task
+/// never has two reads in flight at once) dies unstarted if one of its own
+/// abandon checks OBSERVES that it was the last waiter — each check is a
+/// linearization point, not a promise about the window around it — and
+/// otherwise completes and publishes into the cache. A closed document never leaves a stray reader
+/// RUNNING AS A TRACKED TASK behind; it can leave at most that one detached
+/// fetch finishing alone, and what it finishes is an ordinary cache fill.
 pub struct ScanScheduler {
     index: std::sync::Arc<std::sync::Mutex<crate::index::LineIndex>>,
     frontier: tokio::sync::watch::Receiver<crate::index::Frontier>,
@@ -44,9 +48,28 @@ impl ScanScheduler {
             let mut idx = 0u64;
             // stays true unless the loop breaks out on a read error below.
             let mut reached_eof = true;
+            // restructure R3 (design point 5, the driver regime): this pass keeps its own
+            // existing per-block structural bound (one `idx` per iteration, `size` decides when
+            // to stop), never a byte budget -- `read_at_unbounded` is charged but never refused,
+            // routed through the Reader purely so it is the ONLY read path in the codebase, not
+            // to gate this loop's own progress on it. No `begin_step()`/per-call boundary: unlike
+            // an interactive scan's own `step()`, this loop has no external caller resuming it
+            // across calls, so there is no "step" for `spent_this_step` to be scoped to, and
+            // nothing here ever reads it (`out_of_budget`/`progress_witness` are both budget/
+            // interactive-step concepts this driver-regime loop does not use).
+            let mut meter = crate::meter::Meter::background(cache.block_size());
+            let mut reader = crate::meter::Reader::new(&cache, &mut meter);
             while idx * bs < size {
-                let block = match cache.warm(idx).await {
-                    Ok(b) => b,
+                let fetched = match reader
+                    .read_at_unbounded(
+                        idx * bs,
+                        bs as usize,
+                        crate::meter::Access::Peek,
+                        crate::meter::Charge::Payload,
+                    )
+                    .await
+                {
+                    Ok(f) => f,
                     Err(e) => {
                         // a partial index still answers everything below
                         // its frontier; goto_line treats done as "no more
@@ -56,14 +79,25 @@ impl ScanScheduler {
                         break;
                     }
                 };
-                if block.is_empty() {
-                    // warm() returning empty means the offset is past EOF,
+                // an improvement over the old `warm()`-then-check-`is_empty()` dance, not a
+                // behavior change: `classify` (inside `read_at_unbounded`) can certify a short,
+                // truncated final block on its own FIRST touch (`Fetched::Short` with a non-empty
+                // `got`), where the old code needed a SECOND, now-redundant touch at the same
+                // `idx` (returning an empty block past EOF) to discover the identical fact --
+                // same bytes ingested, same `reached_eof`, one fewer physical read.
+                let got = match fetched {
+                    crate::meter::Fetched::Bytes { got, .. } => got,
+                    crate::meter::Fetched::Short { got, .. } => got,
+                    crate::meter::Fetched::Empty { .. } => bytes::Bytes::new(),
+                };
+                if got.is_empty() {
+                    // an empty result here means the offset is past EOF,
                     // not a read failure — the scan still reached the end.
                     break;
                 }
                 let f = {
                     let mut ix = ix.lock().unwrap();
-                    ix.ingest(&block);
+                    ix.ingest(&got);
                     ix.frontier()
                 };
                 let _ = tx.send(f);
@@ -202,12 +236,16 @@ mod tests {
             fn size(&self) -> u64 {
                 8
             }
-            async fn read_block(&self, offset: u64, _len: usize) -> anyhow::Result<bytes::Bytes> {
-                if offset == 0 {
-                    Ok(bytes::Bytes::from_static(b"a\nb\n"))
-                } else {
-                    Err(anyhow::anyhow!("boom"))
-                }
+            async fn admit(&self) -> crate::source::ReadTicket {
+                crate::source::ReadTicket::from_fn(|offset, _len| {
+                    Box::pin(async move {
+                        if offset == 0 {
+                            Ok(bytes::Bytes::from_static(b"a\nb\n"))
+                        } else {
+                            Err(anyhow::anyhow!("boom"))
+                        }
+                    })
+                })
             }
         }
         let c = Arc::new(crate::cache::BlockCache::new(
@@ -233,21 +271,53 @@ mod tests {
         // Armed immediately, unlike `status.rs`'s own use of the same mechanism: nothing here
         // needs an earlier read to go through normally first, since the scan's own FIRST read
         // is the one this test wants gated.
+        //
+        // REVISED, batch 4 (2026-07-24), finding #11: `cache.rs`'s own fetch path became a
+        // detached publisher (`BlockCache::get`'s own doc comment), so the block's physical read
+        // no longer dies with the scan that triggered it -- dropping `s` below no longer fires a
+        // `cancelled_events` on `src` at all (the detached fetch survives and completes once
+        // opened). What still, correctly, dies is the SCAN TASK itself: `frontier`'s own sender
+        // (`tx`, this file's own `spawn`) lives inside the scan's `async move` block, moved
+        // there, never cloned elsewhere -- so it closes if and only if that task's own future is
+        // torn down or returns, entirely independent of whatever the cache's own detached fetch
+        // does. `fr.changed()` erroring is therefore a POSITIVE, task-scoped proof the scan
+        // itself was aborted, the direct replacement for the read-scoped `cancelled_events` wait
+        // this test used to make. Not a silence/absence wait: a leaked, never-aborted scan (the
+        // regression this test exists to catch) would leave `tx` alive forever, so `fr.changed()`
+        // would simply never resolve, failing loud at `wait_for`'s own bound instead of passing
+        // vacuously -- the identical qualitative gap (resolves promptly vs. hangs to the bound)
+        // AGENTS.md's own timing-oracle carve-out already accepts.
         let src = Arc::new(MockSource::new(vec![b'x'; 1 << 20]).with_gate());
         src.arm_gate();
         let c = Arc::new(crate::cache::BlockCache::new(src.clone(), 4096, 1 << 20));
         let s = ScanScheduler::spawn(c);
-        let fr = s.frontier();
+        let mut fr = s.frontier();
+        // `borrow_and_update` immediately, defensively: `ScanScheduler`'s own `frontier` field is
+        // a stale template `frontier()` only ever `.clone()`s, never itself advanced, so a fresh
+        // clone's very first `changed()` would resolve against any accumulated backlog rather
+        // than a genuinely new event (see `status.rs`'s own identical fix, with the RED
+        // verification, for the sibling case where this matters in practice). Here it is a no-op
+        // in practice -- the gate holds the scan's very first read, before its first `tx.send` --
+        // but making the baseline explicit costs nothing and removes the coincidence.
+        fr.borrow_and_update();
         let mut started = src.started_events();
         wait_for_count(&mut started, |n| n > 0).await;
         // the task is now genuinely, and PERMANENTLY (until released, which never happens in
-        // this test), suspended on the gate armed above.
-        let mut cancelled = src.cancelled_events();
-        let cancelled_baseline = *cancelled.borrow();
+        // this test), suspended on the gate armed above -- not yet having sent a single
+        // frontier update (the gate holds the scan's very first read, before its first `tx.send`).
         drop(s);
-        // POSITIVE proof: the in-flight read's own future was torn down, not left running or
-        // let finish on its own.
-        wait_for_count(&mut cancelled, |n| n > cancelled_baseline).await;
+        // POSITIVE proof: the scan task's own future was torn down, not left running or let
+        // finish on its own -- `frontier`'s sender lives only inside that task (see this test's
+        // own comment above), so its channel can only close via the scan task itself ending.
+        // Bounded by the same diagnostic ceiling `wait_for_count` itself uses (source.rs): a
+        // leaked, never-aborted scan would leave this parked forever rather than pass silently.
+        let closed = tokio::time::timeout(crate::source::DIAGNOSTIC_CEILING, fr.changed())
+            .await
+            .expect("the scan's own frontier sender never closed -- was it genuinely aborted?");
+        assert!(
+            closed.is_err(),
+            "the scan task itself must have been torn down for its own frontier sender to close"
+        );
         // a watch receiver keeps the last value after its sender drops: an
         // abort mid-scan leaves the initial default frontier (done == false)
         // behind, while a natural finish would have sent one with done ==

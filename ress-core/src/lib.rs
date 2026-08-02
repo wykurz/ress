@@ -1,12 +1,16 @@
 //! The headless ress engine: file I/O and the document/viewport model.
+pub(crate) mod analyzer;
 pub(crate) mod cache;
 pub mod document;
 pub(crate) mod index;
 pub(crate) mod line;
+pub(crate) mod meter;
 pub(crate) mod prefetch;
+pub(crate) mod progress;
 pub mod resolve;
 pub(crate) mod scan;
 pub(crate) mod schedule;
+pub mod search;
 pub mod source;
 pub(crate) mod status;
 pub(crate) mod task_owner;

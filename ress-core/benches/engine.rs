@@ -27,8 +27,8 @@ fn fixture(mib: u64) -> bytes::Bytes {
 // A gotcha worth knowing before reaching for this SHAPE elsewhere (found reconciling a
 // status.rs comment, pass 8 U-guard sweep): this wrapper sleeps BEFORE delegating to the
 // inner source, so the inner source's own read-counting (`MockSource`'s own `reads` counter
-// increments inside `read_block` itself, via `BlockEventGuard::new`) only fires AFTER this
-// wrapper's own sleep completes. `with_latency`'s own deleted implementation counted BEFORE
+// increments inside its own spent ticket's read, via `BlockEventGuard::new`) only fires AFTER
+// this wrapper's own sleep completes. `with_latency`'s own deleted implementation counted BEFORE
 // its sleep (guard construction came first, in the SAME function) -- so an attempt aborted
 // mid-sleep (by, say, a `select!` racing a competing event) was still counted by the real
 // thing, but would be MISSED by a wrapper shaped like this one. Harmless here (this bench
@@ -44,11 +44,25 @@ impl ress_core::source::BlockSource for LatencySource {
     fn size(&self) -> u64 {
         self.inner.size()
     }
-    async fn read_block(&self, offset: u64, len: usize) -> anyhow::Result<bytes::Bytes> {
-        if !self.latency.is_zero() {
-            tokio::time::sleep(self.latency).await;
-        }
-        self.inner.read_block(offset, len).await
+    // restructure R1 (2026-07-27): `admit` delegates to the wrapped `MockSource`'s own `admit`
+    // immediately (this bench's latency is not an admission cap, so nothing here waits), then
+    // wraps the resulting ticket in one of its own that sleeps before spending it -- the ticket
+    // closure composes the same way a nested source would, one layer's `read` inside another's.
+    // The gotcha this struct's own doc comment already states (sleep-before-delegating vs.
+    // `with_latency`'s old count-before-sleep order) is unchanged by this restructuring: the
+    // inner `MockSource`'s own read-counting still only fires once ITS ticket is actually spent,
+    // i.e. after this wrapper's sleep completes.
+    async fn admit(&self) -> ress_core::source::ReadTicket {
+        let inner_ticket = self.inner.admit().await;
+        let latency = self.latency;
+        ress_core::source::ReadTicket::from_fn(move |offset, len| {
+            Box::pin(async move {
+                if !latency.is_zero() {
+                    tokio::time::sleep(latency).await;
+                }
+                inner_ticket.read(offset, len).await
+            })
+        })
     }
 }
 // builds a latency-injecting source over the shared fixture bytes; `Bytes::clone`
@@ -68,15 +82,23 @@ fn source(
 // equivalent, `Resolution::join`, is `#[cfg(test)]` and `pub(crate)`, so it is
 // invisible to this bench (a separate crate) regardless of feature gates;
 // this is built entirely from `Resolution`/`PendingNav`'s already-public
-// fields instead of widening that production-only helper.
+// fields instead of widening that production-only helper. every leg in this
+// file drives plain navigation only (scroll/goto_end/goto_percent/goto_line),
+// never search, so `NavOutcome::At` is the only variant a real run can ever
+// produce here -- the other arm exists so a future search benchmark cannot
+// silently start reporting a stale anchor instead of failing loudly.
 async fn resolve(r: ress_core::resolve::Resolution) -> ress_core::document::Anchor {
-    match r {
-        ress_core::resolve::Resolution::Ready(a) => a,
+    let outcome = match r {
+        ress_core::resolve::Resolution::Ready(o) => o,
         ress_core::resolve::Resolution::Pending(p) => p
             .handle
             .await
             .expect("scan task panicked")
             .expect("scan failed"),
+    };
+    match outcome {
+        ress_core::resolve::NavOutcome::At(a) => a,
+        other => panic!("this bench only exercises plain navigation, got {other:?}"),
     }
 }
 // latencies chosen so a full `just bench` stays in minutes: 0 = pure engine,
@@ -125,26 +147,30 @@ fn first_paint(c: &mut criterion::Criterion) {
                             ROWS,
                             COLS,
                             ress_core::document::HScroll::ZERO,
+                            None,
                         )
                         .await
                         .expect("first viewport fetch");
                         elapsed += start.elapsed();
                         // UNTIMED, deliberately outside the `elapsed` span above (U-bench, finding
-                        // 4): `doc`'s three background owners (prefetcher, index scan, status
-                        // worker) each abort on drop via their own `TaskOwner`/`JoinSet`, but a
-                        // plain `drop` only REQUESTS that abort — it does not wait for the teardown
-                        // to actually finish. On a multi-thread Runtime (this group's own `rt`,
-                        // above), that teardown can still be unwinding when the NEXT iteration's
-                        // `Document::new` starts, and the two would then contend for the same
-                        // worker threads: a source of measurement noise, not a correctness bug (see
-                        // `docs/concurrency.md` and this module's own `abort_background_and_join`).
-                        // Measured, not assumed: in this crate's own fixture, the index scan alone
-                        // (unthrottled, running since construction) can take hundreds of
-                        // microseconds to actually stop once aborted — many times this group's own
-                        // tens-of-microseconds timed span at latency_0ms — so leaving it unawaited
-                        // would make a fast iteration's own timing partly a measurement of the
-                        // PREVIOUS iteration's teardown instead. `abort_background_and_join` awaits
-                        // all three explicitly, right here, before the loop's next iteration starts.
+                        // 4): `doc`'s four background owners (prefetcher, index scan, status
+                        // worker, search sweep driver) each abort on drop via their own
+                        // `TaskOwner`/`JoinSet`, but a plain `drop` only REQUESTS that abort — it
+                        // does not wait for the teardown to actually finish. On a multi-thread
+                        // Runtime (this group's own `rt`, above), that teardown can still be
+                        // unwinding when the NEXT iteration's `Document::new` starts, and the two
+                        // would then contend for the same worker threads: a source of measurement
+                        // noise, not a correctness bug (see `docs/concurrency.md` and this module's
+                        // own `abort_background_and_join`). Measured, not assumed: in this crate's
+                        // own fixture, the index scan alone (unthrottled, running since
+                        // construction) can take hundreds of microseconds to actually stop once
+                        // aborted — many times this group's own tens-of-microseconds timed span at
+                        // latency_0ms — so leaving it unawaited would make a fast iteration's own
+                        // timing partly a measurement of the PREVIOUS iteration's teardown instead.
+                        // `abort_background_and_join` awaits all four explicitly, right here,
+                        // before the loop's next iteration starts (this group never starts a
+                        // search, so the fourth owner's own teardown is cheap/idle here, but it is
+                        // still an eagerly-spawned task `Document::new` leaves running).
                         doc.abort_background_and_join().await;
                     }
                     elapsed
@@ -233,6 +259,7 @@ fn scroll_warm(c: &mut criterion::Criterion) {
                         ROWS,
                         COLS,
                         ress_core::document::HScroll::ZERO,
+                        None,
                     )
                     .await
                     .expect("cache warm-up fetch");
@@ -248,7 +275,7 @@ fn scroll_warm(c: &mut criterion::Criterion) {
                             .expect("scroll"),
                     )
                     .await;
-                    doc.viewport(anchor, ROWS, COLS, ress_core::document::HScroll::ZERO)
+                    doc.viewport(anchor, ROWS, COLS, ress_core::document::HScroll::ZERO, None)
                         .await
                         .expect("warm viewport fetch");
                 });
@@ -302,7 +329,7 @@ fn goto_end_cold(c: &mut criterion::Criterion) {
                 },
                 |doc| async move {
                     let anchor = resolve(doc.goto_end(ROWS).await.expect("goto_end")).await;
-                    doc.viewport(anchor, ROWS, COLS, ress_core::document::HScroll::ZERO)
+                    doc.viewport(anchor, ROWS, COLS, ress_core::document::HScroll::ZERO, None)
                         .await
                         .expect("tail viewport fetch");
                 },

@@ -21,6 +21,13 @@ first reversed step.
 A jump (rather than a step) simply re-targets the window: prefetch fills are
 per-block tasks, so there is nothing heavyweight to cancel — outstanding
 single-block reads complete, land in the cache, and may still prove useful.
+That last clause became true only with batch 4 (2026-07-24)'s finding #11:
+before it, a cancelled fill's read could still complete at the OS level
+(the same uncancellable-pread reality below), but nothing was left to
+write the result into the cache — the async fn carrying that logic had
+already been dropped past the point of its own read. See [block
+cache](block_cache.md)'s "In-flight coalescing" for why the fetch now
+survives and publishes regardless.
 
 ## Bounded and best-effort
 
@@ -68,20 +75,46 @@ task::JoinSet::drop`'s doc, `spawn_blocking`'s own cancellation doc):
   started a read at all — dies outright.
 - A fill **suspended at an ordinary `.await`** (the semaphore acquire
   itself) dies the same way, at that await point.
-- A fill already **inside its own blocking read** — past `cache.warm` and
-  into `PreadSource::read_block`'s `spawn_blocking` closure — is a third
-  case, not a variant of the first two: tokio documents `spawn_blocking`
-  tasks as uncancellable once running, so the blocking positioned read
-  completes on its own (or, on a wedged network mount, hangs on its own)
-  regardless of the abort. Only the outer wrapper task, and whatever value
-  it would have produced, is gone.
+- A fill whose `cache.warm()` call has already become (or joined) an
+  in-flight [block cache](block_cache.md) fetch is a third case, not a
+  variant of the first two (fix round 1, F2, batch 4 (2026-07-24), finding
+  #11: the boundary moved) — and the boundary is that registration, not
+  entry into `PreadSource::admit`'s ticket, spent into its own
+  `spawn_blocking` closure: the fetch runs detached from the fill that
+  started it, so aborting the fill's own task no longer reaches it,
+  regardless of whether the underlying OS read has even begun. Dropping the
+  fill drops only its own `WaiterTicket` (restructure R2, 2026-07-27) — one
+  fewer thing interested in the block, never a signal reaching the fetch
+  itself directly. What happens to the fetch then depends on whether it has
+  spent its ticket yet, and either outcome is
+  correct, not merely tolerated: if the fetch has already **spent** it
+  (admission alone is one step short — it takes a final look at the waiter
+  count first), it still completes and publishes into the
+  cache regardless of who is left to receive it, so a later consumer of
+  that block gets a hit instead of a cold read — unchanged from before this
+  restructure. If instead the fill's own drop was the fetch's *last*
+  interested party and the read has not yet been admitted, the fetch now
+  recognizes that and dies unstarted — deregistering without reading at all
+  (batch 5, finding #4) — rather than the pre-R2 behavior of still queuing
+  and eventually performing a read nobody was left to want. This is the
+  point, not a regression: an abandoned fill that never got as far as an
+  actual OS read now costs nothing instead of one wasted read. Between
+  admission resolving and the spend there is one further look, and like the
+  first it is a **linearization point** rather than a promise about the
+  window around it: a departure it observes stops the read, one landing
+  while the ticket is being spent does not. [block cache](block_cache.md)'s
+  waiterless-abandon bullet is the authority on that contract; the other
+  descriptions of this in the tree defer to it rather than restating it.
 
 The third case is bounded, not open-ended: at most **`FILL_CONCURRENCY`**
-(4) fills can hold a semaphore permit — and so be actively reading — at
-once, so a drop leaves at most that many single-block reads outstanding,
-real-file sources only (`MockSource`'s own simulated latency is a plain
-async sleep, fully abortable — this residual is specific to a real
-`PreadSource`). The binary accounts for this at shutdown rather than
-assuming it away: the runtime itself is torn down with a short timeout
-after the event loop returns, so quitting abandons any stuck background
-fills rather than waiting for a filesystem that may never answer.
+(4) fills can hold a semaphore permit — and so have crossed into that
+third case — at once, so a drop leaves at most that many single-block
+fetches outstanding (fewer once any of them were still unadmitted at the
+moment of the drop), for any source (a `MockSource` fetch now survives a
+fill's abort exactly the same way a real `PreadSource` one does — both
+route through the identical detached-fetch path in the shared cache; this
+is no longer a real-files-only residual). The binary accounts for stuck
+real-file reads at shutdown rather than assuming them away: the runtime
+itself is torn down with a short timeout after the event loop returns, so
+quitting abandons any stuck background fills — cache-owned fetches
+included — rather than waiting for a filesystem that may never answer.
