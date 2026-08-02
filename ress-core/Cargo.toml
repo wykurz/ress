@@ -22,7 +22,7 @@ unicode-width.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = "3.13"
 proptest.workspace = true
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 ress-filegen = { workspace = true }
 
 [features]
