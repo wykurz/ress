@@ -115,5 +115,12 @@ jobs:
       run: nix flake check --all-systems -L --no-update-lock-file
     - name: Build the package
       run: nix build -L .#default
-    - name: Build the dev shell
-      run: nix develop -L --command true
+    - name: Build the dev shell and verify nextest self-update is disabled
+      # 93 is nextest's SELF_UPDATE_UNAVAILABLE exit code. The local URL keeps
+      # this check offline even if self-update is accidentally re-enabled.
+      run: |
+        nix develop -L --command bash -c '
+          nextest_status=0
+          cargo nextest self update --check --releases-url http://127.0.0.1:9/ || nextest_status=$?
+          test "$nextest_status" -eq 93
+        '

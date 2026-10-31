@@ -121,6 +121,10 @@ commands:
 
 A plain `cargo build` works too if you have a recent stable Rust.
 
+The Nix shell disables `cargo-nextest`'s self-updater, which otherwise uses a
+separate bundled TLS root store. Update nextest with `nix flake update nixpkgs`,
+then re-enter `nix develop` or reload direnv.
+
 Measuring performance
 ======================
 

@@ -36,6 +36,16 @@
           cargo = rustToolchain;
           rustc = rustToolchain;
         };
+
+        # keep nextest updates managed by Nix, without the self-updater's
+        # embedded TLS root bundle. Upstream recommends this feature set for
+        # distributor builds
+        cargoNextest = pkgs.cargo-nextest.overrideAttrs {
+          cargoBuildNoDefaultFeatures = true;
+          cargoCheckNoDefaultFeatures = true;
+          cargoBuildFeatures = [ "default-no-update" ];
+          cargoCheckFeatures = [ "default-no-update" ];
+        };
       in
       {
         # `nix build` produces the ress binary.
@@ -73,7 +83,7 @@
             rustToolchain
             pkgs.rust-analyzer
             pkgs.just
-            pkgs.cargo-nextest
+            cargoNextest
             pkgs.cargo-flamegraph
             pkgs.inferno
             pkgs.tokio-console
