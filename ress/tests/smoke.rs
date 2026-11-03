@@ -491,7 +491,11 @@ fn colon_command_typed_before_first_paint_still_jumps() {
     // on unrelated host speed.
     let paint_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let mut vt = vt100::Parser::new(24, 80, 0);
+        let mut vt = vt100::Parser::new(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(80).unwrap(),
+            0,
+        );
         vt.process(&pty_output.lock().unwrap());
         if vt.screen().contents().contains("0000003000") {
             break;
@@ -511,7 +515,11 @@ fn colon_command_typed_before_first_paint_still_jumps() {
     // contiguous run. Replaying the whole byte stream through a vt100 emulator reconstructs
     // the actual final screen contents regardless of how many diffed frames it took to get
     // there -- the same reason ress-perf's own Screen wrapper exists (see ress-perf/src/screen.rs).
-    let mut vt = vt100::Parser::new(24, 80, 0);
+    let mut vt = vt100::Parser::new(
+        std::num::NonZeroU16::new(24).unwrap(),
+        std::num::NonZeroU16::new(80).unwrap(),
+        0,
+    );
     vt.process(&pty_output.lock().unwrap());
     let screen_text = vt.screen().contents();
     assert!(
@@ -677,7 +685,11 @@ fn slash_search_jumps_and_reports() {
     // snapshot has already landed the instant the top row first settles.
     let match_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let mut vt = vt100::Parser::new(24, COLS, 0);
+        let mut vt = vt100::Parser::new(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(COLS).unwrap(),
+            0,
+        );
         vt.process(&pty_output.lock().unwrap());
         let top_row = vt.screen().rows(0, COLS).next().unwrap_or_default();
         let status_row = vt.screen().rows(0, COLS).nth(23).unwrap_or_default();
@@ -695,7 +707,11 @@ fn slash_search_jumps_and_reports() {
     // search on the captured bytes isn't used instead: ratatui only writes the cells that
     // actually changed between two similar-looking frames, so replaying the whole byte stream
     // through a fresh vt100 emulator is what reconstructs the real final screen.
-    let mut vt = vt100::Parser::new(24, COLS, 0);
+    let mut vt = vt100::Parser::new(
+        std::num::NonZeroU16::new(24).unwrap(),
+        std::num::NonZeroU16::new(COLS).unwrap(),
+        0,
+    );
     vt.process(&pty_output.lock().unwrap());
     let top_row = vt.screen().rows(0, COLS).next().unwrap_or_default();
     let status_row = vt.screen().rows(0, COLS).nth(23).unwrap_or_default();
