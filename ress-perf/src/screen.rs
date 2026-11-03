@@ -22,9 +22,16 @@ pub struct Screen {
 impl Screen {
     /// Creates a blank screen sized `rows` by `cols`. No scrollback is kept — only the current
     /// visible screen matters for perf.sh's settled row-content detection semantics.
+    ///
+    /// # Panics
+    /// Panics if either dimension is zero.
     pub fn new(rows: u16, cols: u16) -> Screen {
         Screen {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(
+                std::num::NonZeroU16::new(rows).expect("screen rows must be nonzero"),
+                std::num::NonZeroU16::new(cols).expect("screen columns must be nonzero"),
+                0,
+            ),
             top_row_generation: 0,
         }
     }
@@ -71,7 +78,7 @@ impl Screen {
         let (_, cols) = self.parser.screen().size();
         self.parser
             .screen()
-            .rows(0, cols)
+            .rows(0, cols.get())
             .nth(usize::from(row))
             .unwrap_or_default()
             .trim_end_matches(' ')
